@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ---- configurable defaults (can be overridden when running installer) ----
-IMAGE="${HULK_IMAGE:m13paiva/hulk:latest}"   # <- set HULK_IMAGE=... to customize
+IMAGE="${HULK_IMAGE=m13paiva/hulk:latest}"   # <- set HULK_IMAGE=... to customize
 APP_NAME="hulk"
 
 # ---- detect container engine ----
