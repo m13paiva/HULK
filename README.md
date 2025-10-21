@@ -176,9 +176,7 @@ MIT License © 2025 **Manuel Paiva de Almeida**
 ## Citation
 
 If you use HULK in your research, please cite:
-
-> Manuel Paiva de Almeida (2025).  
-> **HULK: A reproducible, scalable pipeline for high-volume bulk RNA-seq data processing.**
+>Almeida, M., & Barros, P. (2025). *HULK: A reproducible, scalable pipeline for high-volume bulk RNA-seq data processing (included in the Rice2B project)*. Instituto de Tecnologia Química e Biológica António Xavier, Universidade Nova de Lisboa (ITQB NOVA), GPlantS Lab.
 
 ---
 
