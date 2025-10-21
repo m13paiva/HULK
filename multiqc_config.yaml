@@ -1,0 +1,16 @@
+# multiqc_config.yaml
+
+# Force these modules to use the LOG / FILE NAME as the sample name
+# instead of pulling names from file contents.
+use_filename_as_sample_name:
+  - kallisto
+  - fastp
+
+# Keep only the SRR ID from each filename (e.g. "kallisto_SRR30141434.log" -> "SRR30141434")
+# Apply this to just the kallisto and fastp modules.
+extra_fn_clean_exts:
+  - type: regex_keep
+    pattern: "(SRR\\d+)"
+    module:
+      - kallisto
+      - fastp
