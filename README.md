@@ -3,7 +3,7 @@
 HULK is a fully automated, containerized pipeline for processing **bulk RNA-seq data directly from SRA accessions**.  
 It handles everything from **data fetching** to **quantification and report generation** — with just one command.
 
----
+
 
 ## Features
 
