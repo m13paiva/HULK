@@ -99,21 +99,21 @@ def build_transcriptome_index(transcriptome: Path, shared: Path, log_path: Path)
 # Tool commands
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fastp_single_cmd(run_dir: Path, run_id: str, r: Path, threads: int) -> list[str]:
+def fastp_single_cmd(run_dir: Path, run_id: str, r: Path, threads: int,window_size=4,mean_quality=20) -> list[str]:
     """fastp command (SINGLE-END)."""
     return [
         "fastp",
         "-i", r.name,
         "-o", f"{run_id}.trim.fastq.gz",
         "-w", str(threads),
-        "--cut_front", "--cut_front_window_size", "4", "--cut_front_mean_quality", "20",
-        "--cut_tail",  "--cut_tail_window_size",  "4", "--cut_tail_mean_quality",  "20",
+        "--cut_front", "--cut_front_window_size", str(window_size), "--cut_front_mean_quality", str(mean_quality),
+        "--cut_tail",  "--cut_tail_window_size",  str(window_size), "--cut_tail_mean_quality",  str(mean_quality),
         "-l", "50",
         "-j", f"{run_id}.fastp.json",
         "-h", f"{run_id}.fastp.html",
     ]
 
-def fastp_paired_cmd(run_dir: Path, run_id: str, r1: Path, r2: Path, threads: int) -> list[str]:
+def fastp_paired_cmd(run_dir: Path, run_id: str, r1: Path, r2: Path, threads: int,window_size=4,mean_quality=20) -> list[str]:
     """fastp command (PAIRED-END)."""
     return [
         "fastp",
@@ -121,8 +121,8 @@ def fastp_paired_cmd(run_dir: Path, run_id: str, r1: Path, r2: Path, threads: in
         "-o", f"{run_id}_1.trim.fastq.gz", "-O", f"{run_id}_2.trim.fastq.gz",
         "--detect_adapter_for_pe",
         "-w", str(threads),
-        "--cut_front", "--cut_front_window_size", "4", "--cut_front_mean_quality", "20",
-        "--cut_tail",  "--cut_tail_window_size",  "4", "--cut_tail_mean_quality",  "20",
+        "--cut_front", "--cut_front_window_size", str(window_size), "--cut_front_mean_quality", str(mean_quality),
+        "--cut_tail",  "--cut_tail_window_size",  str(window_size), "--cut_tail_mean_quality",  str(mean_quality),
         "-l", "50",
         "-j", f"{run_id}.fastp.json",
         "-h", f"{run_id}.fastp.html",
@@ -249,7 +249,8 @@ def run_multiqc(in_dir: Path, out_dir: Path, report_name: str, log_path: Path, m
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pipeline_one_sra(run, transcripts_index: Path, threads: int, outdir: Path,
-                     log_path: Path, overwrite: bool, keep_fastq: bool,error_warnings: list[str]) -> None:
+                     log_path: Path, overwrite: bool, keep_fastq: bool,error_warnings: list[str],
+                     trim_opts=None,tximport_opts=None) -> None:
     """
     Process one SRA:
       prefetch → fasterq-dump → fastp → kallisto → clean FASTQs
@@ -314,9 +315,11 @@ def pipeline_one_sra(run, transcripts_index: Path, threads: int, outdir: Path,
     log(f"✅ Finished downloading {run_id} in {outdir}", log_path)
 
     layout = detect_fastq_layout(run_id, outdir)
+    _opts = {k: v for k, v in (trim_opts or {}).items()
+             if k in {"window_size", "mean_quality"} and v is not None}
     if layout[0] == 'SINGLE':
         r = layout[1]
-        run_cmd(fastp_single_cmd(outdir, run_id, r, threads), outdir, log_path)
+        run_cmd(fastp_single_cmd(outdir, run_id, r, threads,**_opts), outdir, log_path)
         run_cmd_stream(
             kallisto_single_cmd(outdir, run_id, transcripts_index, threads, run_model, log_path, error_warnings),
             outdir, log_path, outdir / f"kallisto_{run_id}.log"
@@ -324,7 +327,7 @@ def pipeline_one_sra(run, transcripts_index: Path, threads: int, outdir: Path,
 
     elif layout[0] == 'PAIRED':
         r1, r2 = layout[1], layout[2]
-        run_cmd(fastp_paired_cmd(outdir, run_id, r1, r2, threads), outdir, log_path)
+        run_cmd(fastp_paired_cmd(outdir, run_id, r1, r2, threads,**_opts), outdir, log_path)
         run_cmd_stream(
             kallisto_paired_cmd(outdir, run_id, transcripts_index, threads, log_path, error_warnings),
             outdir, log_path, outdir / f"kallisto_{run_id}.log"
@@ -355,7 +358,9 @@ def pipeline_one_bioproject(
     keep_fastq: bool,
     tx2gene: Path | None,
     error_warnings: list[str],
-    all_bar, all_durations, disable_pb: bool
+    all_bar, all_durations, disable_pb: bool,
+    trim_opts=None,
+    tximport_opts=None
 ) -> None:
     """
     Run all SRAs in one BioProject with auto-scaling threads, then:
@@ -405,7 +410,17 @@ def pipeline_one_bioproject(
             run_id = run[0]
             run_dir = bioproject_dir / run_id
             start_times[run_id] = time.time()
-            fut = ex.submit(pipeline_one_sra, run, transcripts_index, threads_each, run_dir, log_path, overwrite, keep_fastq, error_warnings)
+            fut = ex.submit(pipeline_one_sra,
+                            run,
+                            transcripts_index,
+                            threads_each,
+                            run_dir,
+                            log_path,
+                            overwrite,
+                            keep_fastq,
+                            error_warnings,
+                            trim_opts,
+                            tximport_opts)
             fut2run[fut] = run_id
 
         for fut in as_completed(fut2run):
@@ -439,7 +454,7 @@ def pipeline_one_bioproject(
     # per-BP gene table or TPM merge
     if tx2gene is not None:
         sra_ids = [run[0] for run in sras]
-        bp_gene_counts(bioproject_dir, sra_ids, tx2gene, log_path, error_warnings)
+        bp_gene_counts(bioproject_dir, sra_ids, tx2gene, log_path, error_warnings,tximport_opts)
     else:
         merge_bioproject_tpm(bioproject_dir, log_path, error_warnings)
 
@@ -461,6 +476,8 @@ def pipeline(
     keep_fastq:bool,
     overall_table: bool,
     tx2gene: Path | None,
+    trim_opts=None,
+    tximport_opts=None,
 ) -> None:
     """
     Top-level runner:
@@ -507,7 +524,7 @@ def pipeline(
             bioproject, sras, outdir, log_path,
             min_threads, max_threads, transcripts_index,
             overwrite, keep_fastq,tx2gene, error_warnings,
-            all_bar, all_durations, disable_pb
+            all_bar, all_durations, disable_pb,trim_opts,tximport_opts
         )
 
     # global MultiQC (fastp + kallisto)
@@ -516,7 +533,7 @@ def pipeline(
     # overall tables
     if overall_table:
         if tx2gene is not None:
-            global_gene_counts(outdir, tx2gene, log_path, error_warnings, shared / "global_gene_counts.tsv")
+            global_gene_counts(outdir, tx2gene, log_path, error_warnings, shared / "global_gene_counts.tsv",tximport_opts)
         else:
             merge_all_bioprojects_tpm(outdir, log_path, error_warnings, shared / "overall_TPM.tsv")
 
