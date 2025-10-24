@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-import argparse
-import sys
 from pathlib import Path
+import sys
 import pandas as pd
+import click
+
 from .core import pipeline
 from .utils import transcriptome_suffixes, smash
 from .logo import LOGO
@@ -16,224 +17,210 @@ DEFAULT_MIN_THREADS = 4
 DEFAULT_MAX_THREADS = 10
 REQUIRED_TX2GENE_COLS = {"transcript_id", "gene_id"}
 
+# -------- Pretty options: aligned columns + blank line between options --------
+class SpacedCommand(click.Command):
+    def format_options(self, ctx, formatter):
+        rows = [p.get_help_record(ctx) for p in self.get_params(ctx)]
+        rows = [r for r in rows if r]
+        if not rows:
+            return
+        left_len = max(len(left) for left, _ in rows)
+        pad = max(28, min(44, left_len + 2))
+        width = formatter.width or 120
+        with formatter.section("Options"):
+            for i, (left, right) in enumerate(rows):
+                right = right or ""
+                formatter.write_text(f"  {left.ljust(pad)}{right}")
+                if i < len(rows) - 1:
+                    formatter.write_text("")
 
-def parse_args():
-    # --- lightweight pre-parser ONLY for --smash (doesn't steal -h/--help)
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--smash", action="store_true")
-    ns_pre, _ = pre.parse_known_args()
-    if ns_pre.smash:
-        smash()
-        sys.exit(0)
+class HulkCommand(SpacedCommand):
+    """Inject raw LOGO and raw HELP_BODY, preserving newlines exactly."""
+    def get_help(self, ctx):
+        base = super().get_help(ctx)
 
-    # --- full parser
-    parser = argparse.ArgumentParser(
-        prog="hulk",
-        description=(
-            LOGO
-            + "HULK is a H(igh-volume b)ulk RNA-seq data preprocessing pipeline for NCBI SRA accessions.\n\n"
-              "Given an input table (CSV/TSV/TXT) with columns 'Run', 'BioProject', and 'Model', "
-              "HULK will:\n"
-              "  • fetch SRA data (prefetch) with safe resume/overwrite,\n"
-              "  • convert to FASTQ (fasterq-dump),\n"
-              "  • perform QC/trimming with fastp,\n"
-              "  • quantify against a transcriptome using kallisto.\n\n"
-              "The transcriptome may be a compressed FASTA (.fa/.fasta/.fna.gz) or a \n"
-              "prebuilt kallisto index (.idx). If a FASTA is provided, HULK builds a \n"
-              "shared index once per run and reuses it.\n\n"
-              "Concurrency is automatic: available CPU cores are detected (Docker/CGroups-aware), \n"
-              "and work is split across SRAs with configurable per-job threading.\n"
-        ),
-        epilog=(
-            "Outputs are organized as <OUTPUT>/<BioProject>/<Run>/ ...\n"
-            "A master log is written to <OUTPUT>/shared/log.txt capturing all tool output.\n"
-            "Re-runs are safe: completed SRAs are skipped unless --force is given; \n"
-            "partial downloads are resumed/cleaned automatically.\n\n"
-            "Examples:\n"
-            "  hulk -i samples.tsv -r transcripts.fasta.gz -o results\n"
-            "  hulk -i samples.csv -r transcripts.idx --min-threads 2 --max-threads 8 -v\n"
-            "  hulk -i table.txt -r species.fa.gz -t 8 -f -a\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        allow_abbrev=False,
-    )
+        # 1) Inject the raw ASCII LOGO right after "Usage:" (once)
+        lines = base.splitlines()
+        if lines and lines[0].startswith("Usage:"):
+            rest = "\n".join(lines[1:])
+            base = f"{lines[0]}\n\n{LOGO.rstrip()}\n\n{rest}"
+        else:
+            base = f"{LOGO.rstrip()}\n\n{base}"
 
-    # Version
-    parser.add_argument(
-        "-V", "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
-        help="Show version and exit."
-    )
+        # 2) Insert raw HELP_BODY (verbatim) before "Options:"
+        marker = "\nOptions:\n"
+        if marker in base:
+            head, tail = base.split(marker, 1)
+            return f"{head}\n{HELP_BODY.rstrip()}\n\n{marker}{tail}"
+        else:  # fallback
+            return f"{base}\n\n{HELP_BODY.rstrip()}\n"
 
-    # Hidden easter egg remains available, but not parsed before help anymore
-    parser.add_argument("--smash", action="store_true", help=argparse.SUPPRESS)
+# Keep body text OUT of click's help (we inject it ourselves above)
+HELP_BODY = (
+    "HULK is a H(igh-volume b)ulk RNA-seq data preprocessing pipeline for NCBI SRA accessions.\n"
+    "\n"
+    "Given an input table (CSV/TSV/TXT) with columns 'Run', 'BioProject', and 'Model', HULK will:\n"
+    "  • fetch SRA data (prefetch) with safe resume/overwrite,\n"
+    "  • convert to FASTQ (fasterq-dump),\n"
+    "  • perform QC/trimming with fastp,\n"
+    "  • quantify against a transcriptome using kallisto.\n"
+    "\n"
+    "The transcriptome may be a compressed FASTA (.fa/.fasta/.fa.gz) or a prebuilt kallisto index (.idx).\n"
+    "If a FASTA is provided, HULK builds a shared index once and reuses it.\n"
+    "\n"
+    "Concurrency is automatic: available CPU cores are detected (Docker/CGroups-aware), and work is split\n"
+    "across SRAs with configurable per-job threading.\n"
+    "\n"
+    "Outputs are organized as <OUTPUT>/<BioProject>/<Run>/ ... A master log is written to <OUTPUT>/shared/log.txt.\n"
+    "Re-runs are safe: completed SRAs are skipped unless --force is given; partial downloads are resumed/cleaned.\n"
+    "\n"
+    "Examples:\n"
+    "  hulk -i samples.tsv -r transcripts.fasta.gz -o results\n"
+    "  hulk -i samples.csv -r transcripts.idx --min-threads 2 --max-threads 8 -v\n"
+    "  hulk -i table.txt -r species.fa.gz -t 8 -f -a\n"
+)
 
-    # Required I/O
-    parser.add_argument(
-        "-i", "--input",
-        required=True,
-        help="Input table (.csv, .tsv, or .txt) with columns: 'Run', 'BioProject', 'Model'."
-    )
-    parser.add_argument(
-        "-r", "--reference",
-        required=True,
-        help="Reference transcriptome (.fasta/.fa[.gz]) or kallisto index (.idx)."
-    )
+@click.command(
+    cls=HulkCommand,
+    context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 180},
+    help="",  # leave empty; we inject HELP_BODY verbatim ourselves
+)
+@click.version_option(__version__, "-V", "--version", prog_name="hulk")
+@click.option("--smash", is_flag=True, hidden=True, is_eager=True, expose_value=False,
+              callback=lambda ctx, p, v: (smash(), ctx.exit()) if v and not ctx.resilient_parsing else None)
+# Required I/O
+@click.option(
+    "-i", "--input", "input_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Input table (.csv, .tsv, or .txt) with columns: 'Run', 'BioProject', 'Model'.",
+)
+@click.option(
+    "-r", "--reference", "reference_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="Reference transcriptome (.fasta/.fa[.gz]) or kallisto index (.idx).",
+)
+# Optional outputs
+@click.option(
+    "-o", "--output", "output_dir",
+    type=click.Path(dir_okay=True, file_okay=False, path_type=Path),
+    default=DEFAULT_OUTDIR, show_default=True,
+    help="Output directory.",
+)
+# Performance
+@click.option("--min-threads", type=int, default=DEFAULT_MIN_THREADS, show_default=True,
+              help="Minimum number of threads per SRA.")
+@click.option("-t", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True,
+              help="Maximum total threads.")
+# Flags
+@click.option("-v", "--verbose", is_flag=True, help="Show live progress bars and console messages.")
+@click.option("-f", "--force", "--overwrite", is_flag=True,
+              help="Force re-run: overwrite totally/partially processed SRAs.")
+@click.option("-a", "--aggregate", "--overall-table", is_flag=True,
+              help="Create a merged TPM table across all BioProjects; if --gene-counts is set, also write a global gene-counts table.")
+@click.option("-n", "--dry-run", is_flag=True,
+              help="Validate inputs and configuration, print plan, and exit without running tools.")
+@click.option(
+    "-g", "--gene-counts", "tx2gene_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Enable gene counts using a tx2gene (.csv) with columns 'transcript_id','gene_id'.",
+)
+@click.option("--keep-fastq", is_flag=True, help="Keep FASTQ files.")
+def cli(
+    input_path: Path,
+    reference_path: Path,
+    output_dir: Path,
+    min_threads: int,
+    max_threads: int,
+    verbose: bool,
+    force: bool,
+    aggregate: bool,
+    dry_run: bool,
+    tx2gene_path: Path | None,
+    keep_fastq: bool,
+):
+    # Validate input extension
+    suf = input_path.suffix.lower()
+    if suf not in INPUT_FORMATS:
+        raise click.UsageError(f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))} (got: {input_path.name})")
 
-    # Optional outputs
-    parser.add_argument(
-        "-o", "--output",
-        default=Path(DEFAULT_OUTDIR),
-        help="Output directory (default: 'output')."
-    )
-
-    # Performance
-    parser.add_argument(
-        "--min-threads",
-        type=int,
-        default=DEFAULT_MIN_THREADS,
-        help=f"Minimum number of threads per SRA (default: {DEFAULT_MIN_THREADS})."
-    )
-    parser.add_argument(
-        "-t", "--max-threads",
-        type=int,
-        default=DEFAULT_MAX_THREADS,
-        help=f"Maximum total threads (default: {DEFAULT_MAX_THREADS})."
-    )
-
-    # Flags
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Show live progress bars and console messages."
-    )
-
-    parser.add_argument(
-        "-f", "--force",
-        action="store_true",
-        help="Force re-run: overwrite totally/partially processed SRAs."
-    )
-    parser.add_argument(
-        "--overwrite",
-        dest="force",
-        action="store_true",
-        help=argparse.SUPPRESS
-    )
-
-    parser.add_argument(
-        "-a", "--aggregate",
-        action="store_true",
-        help="Create a merged TPM table across all BioProjects; "
-             "if --gene-counts is set, also write a global gene-counts table."
-    )
-    parser.add_argument(
-        "--overall-table",
-        dest="aggregate",
-        action="store_true",
-        help=argparse.SUPPRESS
-    )
-    """to do
-    parser.add_argument(
-        "-n", "--dry-run",
-        action="store_true",
-        help="Plan and validate without executing external tools."
-    )
-    """
-
-    parser.add_argument(
-        "-g", "--gene-counts",
-        metavar="TX2GENE_FILE",
-        default=None,
-        help="Enable gene counts using a tx2gene (.csv) with columns 'transcript_id','gene_id'."
-    )
-    parser.add_argument(
-        "--keep-fastq",
-        action="store_true",
-        help="Keep FASTQ files."
-    )
-
-    args = parser.parse_args()
-
-    # --- validation: input file exists ---
-    input_path = Path(args.input)
-    if not input_path.is_file():
-        parser.error(f"Input file does not exist: {input_path}")
-
-    # --- validation: correct extension ---
-    if input_path.suffix.lower() not in INPUT_FORMATS:
-        parser.error(f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))}")
-
-    # --- validation: required columns ---
+    # Read table
     try:
-        if input_path.suffix.lower() == ".csv":
+        if suf == ".csv":
             df = pd.read_csv(input_path, low_memory=False)
-        elif input_path.suffix.lower() == ".tsv":
+        elif suf == ".tsv":
             df = pd.read_csv(input_path, sep="\t", low_memory=False)
         else:
             df = pd.read_table(input_path)
     except Exception as e:
-        parser.error(f"Could not read input file: {e}")
+        raise click.ClickException(f"Could not read input file '{input_path}': {e}")
 
     if not REQUIRED_INPUT_COLS.issubset(df.columns):
-        parser.error(f"Input file must contain columns: {', '.join(sorted(REQUIRED_INPUT_COLS))}")
-
+        missing = REQUIRED_INPUT_COLS.difference(df.columns)
+        raise click.UsageError(
+            "Input file must contain columns: " + ", ".join(sorted(REQUIRED_INPUT_COLS)) +
+            (f" (missing: {', '.join(sorted(missing))})" if missing else "")
+        )
     df = df[list(REQUIRED_INPUT_COLS)]
-    args.df = df
 
-    # --- transcriptome / index validation ---
-    reference_path = Path(args.reference).expanduser().resolve()
-    if not reference_path.is_file():
-        parser.error(f"reference file does not exist: {reference_path}")
-
+    # Reference validation
     trans_suff = transcriptome_suffixes(reference_path)
     if trans_suff not in TRANSCRIPTOME_FORMATS:
-        parser.error(f"Transcriptome file must be one of: {', '.join(sorted(TRANSCRIPTOME_FORMATS))}")
+        raise click.UsageError(
+            f"Transcriptome file must be one of: {', '.join(sorted(TRANSCRIPTOME_FORMATS))} (got: {reference_path.name})"
+        )
 
-    args.reference = reference_path
-
-    # --- tx2gene validation (optional) ---
-    if args.gene_counts is not None:
-        tx2gene_path = Path(args.gene_counts).expanduser().resolve()
-        if not tx2gene_path.is_file():
-            parser.error(f"tx2gene file does not exist: {tx2gene_path}")
+    # tx2gene validation (optional)
+    if tx2gene_path is not None:
         try:
             tx2gene_df = pd.read_csv(tx2gene_path, sep=None, engine="python")
         except Exception as e:
-            parser.error(f"Could not read tx2gene file: {tx2gene_path} ({e})")
+            raise click.ClickException(f"Could not read tx2gene file '{tx2gene_path}': {e}")
         if not REQUIRED_TX2GENE_COLS.issubset(tx2gene_df.columns):
-            parser.error(
-                "tx2gene file must contain columns: "
-                + ", ".join(sorted(REQUIRED_TX2GENE_COLS))
-                + f" (found: {', '.join(tx2gene_df.columns)})"
+            raise click.UsageError(
+                "tx2gene file must contain columns: " + ", ".join(sorted(REQUIRED_TX2GENE_COLS)) +
+                f" (found: {', '.join(tx2gene_df.columns)})"
             )
-        args.gene_counts = tx2gene_path
 
-    # --- output dir normalization ---
-    if args.output:
-        args.output = Path(args.output).expanduser().resolve()
-        if not args.output.is_dir():
-            args.output.mkdir(parents=True)
+    # Output dir
+    try:
+        output_dir = output_dir.expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise click.ClickException(f"Failed to prepare output directory '{output_dir}': {e}")
 
-    return args
+    # Dry-run
+    if dry_run:
+        click.secho("✅ Dry run: inputs and configuration validated.", fg="green")
+        click.echo(f"- Input:        {input_path}")
+        click.echo(f"- Reference:    {reference_path}")
+        click.echo(f"- Output dir:   {output_dir}")
+        click.echo(f"- Threads:      min={min_threads}, max={max_threads}")
+        click.echo(f"- Force:        {force}")
+        click.echo(f"- Aggregate:    {aggregate}")
+        click.echo(f"- tx2gene:      {tx2gene_path if tx2gene_path else 'None'}")
+        click.echo(f"- Keep FASTQ:   {keep_fastq}")
+        sys.exit(0)
 
+    # Run pipeline
+    pipeline(
+        df,
+        output_dir,
+        reference_path.expanduser().resolve(),
+        min_threads,
+        max_threads,
+        verbose,
+        force,
+        keep_fastq,
+        aggregate,
+        tx2gene_path.expanduser().resolve() if tx2gene_path else None,
+    )
+    sys.exit(0)
 
 def main():
-    args = parse_args()
-    pipeline(
-        args.df,
-        args.output,
-        args.reference,
-        args.min_threads,
-        args.max_threads,
-        args.verbose,
-        args.force,
-        args.keep_fastq,
-        args.aggregate,
-        args.gene_counts,
-        # NOTE: args.dry_run is parsed; wire it into pipeline when implemented
-    )
-
+    cli(standalone_mode=True)
 
 if __name__ == "__main__":
     main()

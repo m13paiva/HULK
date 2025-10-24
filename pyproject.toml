@@ -7,11 +7,12 @@ name = "hulk"
 version = "1.0.0"                      # ← bump me to change `hulk -V`
 description = "HULK: RNA-seq pipeline CLI"
 readme = "README.md"
-authors = [{ name = "Manuel Paiva de Almeida" }]
+authors = [{ name = "Manuel Almeida" },{ name = "Pedro Barros" }]
 requires-python = ">=3.9"
 dependencies = [
   "pandas>=2.0",
-  "numpy>=1.24"
+  "numpy>=1.24",
+  "click>=8.1"
 ]
 
 # Entry point: installs the `hulk` command that calls app/cli.py:main

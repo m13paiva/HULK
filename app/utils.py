@@ -537,7 +537,9 @@ def merge_all_bioprojects_tpm(output_root: Path, log_path: Path, error_warnings:
     merged.to_csv(output_file, sep="\t", index=False)
 
 
-def _gene_counts(abundance_files: list[Path], sample_names: list[str], tx2gene_path: Path, mode='length_scaled_tpm') -> pd.DataFrame:
+def _gene_counts(abundance_files: list[Path], sample_names: list[str], tx2gene_path: Path,
+                #mode='length_scaled_tpm'
+                 mode=None) -> pd.DataFrame:
     """Compute gene-level counts from kallisto outputs with pytximport (quiet mode)."""
     prev_tqdm = os.environ.get("TQDM_DISABLE")
     os.environ["TQDM_DISABLE"] = "1"
@@ -570,6 +572,7 @@ def _gene_counts(abundance_files: list[Path], sample_names: list[str], tx2gene_p
     df.columns = sample_names
     return df
 
+
 def bp_gene_counts(bioproject_dir: Path, sra_ids: list[str], tx2gene: Path, log_path: Path, error_warnings: list[str]) -> Path | None:
     """Write <bioproject_dir>/gene_counts.tsv (genes × samples). Logs missing SRAs but proceeds."""
     files, names = [], []
@@ -584,7 +587,7 @@ def bp_gene_counts(bioproject_dir: Path, sra_ids: list[str], tx2gene: Path, log_
         log_err(error_warnings, log_path, f"[tximport] No abundance.tsv found in {bioproject_dir}, skipping gene table")
         return None
 
-    gdf = _gene_counts(files, names, tx2gene)
+    gdf = _gene_counts_cli(files, names, tx2gene)
     out = bioproject_dir / "gene_counts.tsv"
     gdf.to_csv(out, sep="\t")
     log(f"🧬 Gene counts (pytximport) written: {out}", log_path)
@@ -599,7 +602,7 @@ def global_gene_counts(output_root: Path, tx2gene: Path, log_path: Path, error_w
         log_err(error_warnings, log_path, f"[tximport] No abundance.tsv found under {output_root}")
         return
     names = [p.parent.name for p in files]
-    gdf = _gene_counts(files, names, tx2gene)
+    gdf = _gene_counts_cli(files, names, tx2gene)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     gdf.to_csv(output_file, sep="\t")
     log(f"🧬 Global gene counts (pytximport) written: {output_file}", log_path)
