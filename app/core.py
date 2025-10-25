@@ -167,7 +167,7 @@ def run_multiqc_sanitized_bp(
     modules=('kallisto', 'fastp'),
 ) -> Path | None:
     """
-    Build _mqc_inputs/<SRA>/ and invoke MultiQC on those *directories*,
+    Build _mqc_inputs/<SRR>/ and invoke MultiQC on those *directories*,
     explicitly ignoring HDF5 files so the kallisto module keys off
     run_info.json + abundance.tsv reliably.
     """
@@ -176,7 +176,7 @@ def run_multiqc_sanitized_bp(
     if inputs_root is None:
         return None
 
-    # Pick SRA dirs that contain run_info.json and abundance.tsv
+    # Pick SRR dirs that contain run_info.json and abundance.tsv
     sra_dirs = []
     missing_msgs = []
     for d in sorted(p for p in inputs_root.iterdir() if p.is_dir()):
@@ -192,11 +192,11 @@ def run_multiqc_sanitized_bp(
 
     if not sra_dirs:
         log_err(error_warnings, log_path,
-                f"[MultiQC sanitize] No complete SRA dirs under {inputs_root}.\n" +
+                f"[MultiQC sanitize] No complete SRR dirs under {inputs_root}.\n" +
                 ("\n".join(missing_msgs) if missing_msgs else ""))
         return None
 
-    log(f"[MultiQC sanitize] Using {len(sra_dirs)} SRA dirs for parsing", log_path)
+    log(f"[MultiQC sanitize] Using {len(sra_dirs)} SRR dirs for parsing", log_path)
 
     report_name = f"multiqc_{bioproject_dir.name}"
     cmd = [
@@ -245,14 +245,14 @@ def run_multiqc(in_dir: Path, out_dir: Path, report_name: str, log_path: Path, m
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-SRA worker
+# Per-SRR worker
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pipeline_one_sra(run, transcripts_index: Path, threads: int, outdir: Path,
                      log_path: Path, overwrite: bool, keep_fastq: bool,error_warnings: list[str],
                      trim_opts=None,tximport_opts=None) -> None:
     """
-    Process one SRA:
+    Process one SRR:
       prefetch → fasterq-dump → fastp → kallisto → clean FASTQs
     """
     outdir = outdir.expanduser().resolve()
@@ -363,7 +363,7 @@ def pipeline_one_bioproject(
     tximport_opts=None
 ) -> None:
     """
-    Run all SRAs in one BioProject with auto-scaling threads, then:
+    Run all SRRs in one BioProject with auto-scaling threads, then:
       • per-BP MultiQC (sanitized inputs)
       • per-BP read metrics
       • per-BP TPM merge or gene counts (if tx2gene)
@@ -378,8 +378,8 @@ def pipeline_one_bioproject(
         todo_in_bp = [r for r in sras if r not in done_in_bp]
 
     # progress for this BP
-    bp_bar_inner = tqdm(total=len(sras), desc=f"{bioproject} SRAs", position=2, leave=False,
-                        disable=disable_pb, unit="SRA", initial=len(done_in_bp))
+    bp_bar_inner = tqdm(total=len(sras), desc=f"{bioproject} SRRs", position=2, leave=False,
+                        disable=disable_pb, unit="SRR", initial=len(done_in_bp))
 
     # If nothing to run, still regenerate per-BP artifacts
     if not todo_in_bp:
@@ -508,8 +508,8 @@ def pipeline(
         1 for bp, runs in data.items() for run in runs if is_sra_done(outdir / bp / run[0])
     )
     disable_pb = (not verbose) or (not sys.stdout.isatty())
-    all_bar = tqdm(total=total_sras, desc="All SRAs", position=1, leave=True,
-                   disable=disable_pb, unit="SRA", initial=already_done)
+    all_bar = tqdm(total=total_sras, desc="All SRRs", position=1, leave=True,
+                   disable=disable_pb, unit="SRR", initial=already_done)
     all_durations: list[float] = []
 
     # index

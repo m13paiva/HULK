@@ -32,7 +32,7 @@ HELP_BODY = (
     "HULK is a H(igh-volume b)ulk RNA-seq data preprocessing pipeline for NCBI SRA accessions.\n"
     "\n"
     "Given an input table (CSV/TSV/TXT) with columns 'Run', 'BioProject', and 'Model', HULK will:\n"
-    "  • fetch SRA data (prefetch) with safe resume/overwrite,\n"
+    "  • fetch SRR data (prefetch) with safe resume/overwrite,\n"
     "  • convert to FASTQ (fasterq-dump),\n"
     "  • perform QC/trimming with fastp,\n"
     "  • quantify against a transcriptome using kallisto.\n"
@@ -41,10 +41,10 @@ HELP_BODY = (
     "If a FASTA is provided, HULK builds a shared index once and reuses it.\n"
     "\n"
     "Concurrency is automatic: available CPU cores are detected (Docker/CGroups-aware), and work is split\n"
-    "across SRAs with configurable per-job threading.\n"
+    "across SRRs with configurable per-job threading.\n"
     "\n"
     "Outputs are organized as <OUTPUT>/<BioProject>/<Run>/ ... A master log is written to <OUTPUT>/shared/log.txt.\n"
-    "Re-runs are safe: completed SRAs are skipped unless --force is given; partial downloads are resumed/cleaned.\n"
+    "Re-runs are safe: completed SRRs are skipped unless --force is given; partial downloads are resumed/cleaned.\n"
     "\n"
     "Examples:\n"
     "  hulk -i samples.tsv -r transcripts.fasta.gz -o results\n"
@@ -68,20 +68,21 @@ class SpacedFormatterMixin:
 
 class HulkGroup(SpacedFormatterMixin, click.Group):
     """Custom Group to inject LOGO, body text, and pretty sections."""
+
     def format_help(self, ctx, formatter):
         # Print "Usage:" line first (Click default)
         self.format_usage(ctx, formatter)
-        formatter.write_text("")  # blank line
 
-        # Inject raw LOGO exactly once
-        formatter.write_text(LOGO.rstrip())
-        formatter.write_text("")  # blank line
+        # Blank line
+        formatter.write("\n")
 
-        # Inject the body paragraphs verbatim
-        formatter.write_text(HELP_BODY.rstrip())
-        formatter.write_text("")  # blank line
+        # Inject the LOGO verbatim (NO wrapping)
+        formatter.write(LOGO.rstrip() + "\n\n")
 
-        # Then show commands and options in our pretty formatters
+        # Inject the body text verbatim (NO wrapping)
+        formatter.write(HELP_BODY.rstrip() + "\n\n")
+
+        # Then show commands and options using our pretty formatters (these can wrap)
         self.format_commands(ctx, formatter)
         self.format_options(ctx, formatter)
 
@@ -108,14 +109,18 @@ class HulkGroup(SpacedFormatterMixin, click.Group):
 
 class HulkCommand(SpacedFormatterMixin, click.Command):
     """For subcommands to inherit our option spacing (logo/body only on group)."""
+
     def format_help(self, ctx, formatter):
         # Standard Click header for subcommands
         self.format_usage(ctx, formatter)
-        formatter.write_text("")  # blank line
-        # One-liner description if present
+
+        # Blank line
+        formatter.write("\n")
+
+        # One-liner description if present (keep verbatim just in case)
         if self.help:
-            formatter.write_text(self.help.strip())
-            formatter.write_text("")
+            formatter.write(self.help.strip() + "\n\n")
+
         # Options in spaced style
         self.format_options(ctx, formatter)
 
@@ -166,7 +171,7 @@ def _cfg_update(section: str, payload: dict[str, Any], explicit: Path | None = N
 # ---------------------------- Root CLI (Group) ----------------------------
 @click.group(
     cls=HulkGroup,
-    context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 180},
+    context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 360},
 )
 @click.version_option(__version__, "-V", "--version", prog_name="hulk")
 @click.option("--smash", is_flag=True, hidden=True, is_eager=True, expose_value=False,
@@ -193,13 +198,13 @@ def _cfg_update(section: str, payload: dict[str, Any], explicit: Path | None = N
 )
 # Performance
 @click.option("--min-threads", type=int, default=DEFAULT_MIN_THREADS, show_default=True,
-              help="Minimum number of threads per SRA.")
+              help="Minimum number of threads per SRR.")
 @click.option("-t", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True,
               help="Maximum total threads.")
 # Flags
 @click.option("-v", "--verbose", is_flag=True, help="Show live progress bars and console messages.")
 @click.option("-f", "--force", "--overwrite", is_flag=True,
-              help="Force re-run: overwrite totally/partially processed SRAs.")
+              help="Force re-run: overwrite totally/partially processed SRRs.")
 @click.option("-a", "--aggregate", "--overall-table", is_flag=True,
               help="Create a merged TPM table across all BioProjects; if --gene-counts is set, also write a global gene-counts table.")
 @click.option("-n", "--dry-run", is_flag=True,
