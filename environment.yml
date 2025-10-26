@@ -15,4 +15,4 @@ dependencies:
   - pyarrow
   - fastp
   - multiqc
-
+  - click

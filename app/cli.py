@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
-import argparse
+from __future__ import annotations
+
+import os
 import sys
+import json
 from pathlib import Path
+from typing import Any
+
+import click
 import pandas as pd
+from click.core import ParameterSource  
 from .core import pipeline
 from .utils import transcriptome_suffixes, smash
 from .logo import LOGO
 from . import __version__
 
+# ---------------------------- Constants ----------------------------
 DEFAULT_OUTDIR = Path("output")
 INPUT_FORMATS = {".csv", ".tsv", ".txt"}
 REQUIRED_INPUT_COLS = {"Run", "BioProject", "Model"}
@@ -16,224 +24,405 @@ DEFAULT_MIN_THREADS = 4
 DEFAULT_MAX_THREADS = 10
 REQUIRED_TX2GENE_COLS = {"transcript_id", "gene_id"}
 
+CFG_ENV = "HULK_CONFIG"          # env var to point to a custom config path
+CFG_DEFAULT_NAME = ".hulk.json"  # default config file in CWD
+WIDE_HELP = 200                   # force very wide help for main + subcommands
+RIGHT_COL = 50
+LOGO_PAD = 20
+# ---------------------------- Pretty help text (verbatim) ----------------------------
+HELP_BODY = (
+    "HULK is a H(igh-volume b)ulk RNA-seq data preprocessing pipeline for NCBI SRA accessions.\n"
+    "\n"
+    "Given an input table (CSV/TSV/TXT) with columns 'Run', 'BioProject', and 'Model', HULK will:\n"
+    "  • fetch SRR data (prefetch) with safe resume/overwrite,\n"
+    "  • convert to FASTQ (fasterq-dump),\n"
+    "  • perform QC/trimming with fastp,\n"
+    "  • quantify against a transcriptome using kallisto.\n"
+    "\n"
+    "The transcriptome may be a compressed FASTA (.fa/.fasta/.fa.gz) or a prebuilt kallisto index (.idx).\n"
+    "If a FASTA is provided, HULK builds a shared index once and reuses it.\n"
+    "\n"
+    "Concurrency is automatic: available CPU cores are detected (Docker/CGroups-aware), and work is split\n"
+    "across SRRs with configurable per-job threading.\n"
+    "\n"
+    "Outputs are organized as <OUTPUT>/<BioProject>/<Run>/ ... A master log is written to <OUTPUT>/shared/log.txt.\n"
+    "Re-runs are safe: completed SRRs are skipped unless --force is given; partial downloads are resumed/cleaned.\n"
+    "\n"
+    "Examples:\n"
+    "  hulk -i samples.tsv -r transcripts.fasta.gz -o results\n"
+    "  hulk -i samples.csv -r transcripts.idx --min-threads 2 --max-threads 8 -v\n"
+    "  hulk -i table.txt -r species.fa.gz -t 8 -f -a\n"
+)
 
-def parse_args():
-    # --- lightweight pre-parser ONLY for --smash (doesn't steal -h/--help)
-    pre = argparse.ArgumentParser(add_help=False)
-    pre.add_argument("--smash", action="store_true")
-    ns_pre, _ = pre.parse_known_args()
-    if ns_pre.smash:
-        smash()
-        sys.exit(0)
+# ---------------------------- Config helpers ----------------------------
+def _cfg_path(explicit: Path | None = None) -> Path:
+    if explicit is not None:
+        return explicit
+    p_env = os.environ.get(CFG_ENV)
+    if p_env:
+        return Path(p_env).expanduser().resolve()
+    # default to local file (works inside containers w/out $HOME perms)
+    return Path.cwd() / CFG_DEFAULT_NAME
 
-    # --- full parser
-    parser = argparse.ArgumentParser(
-        prog="hulk",
-        description=(
-            LOGO
-            + "HULK is a H(igh-volume b)ulk RNA-seq data preprocessing pipeline for NCBI SRA accessions.\n\n"
-              "Given an input table (CSV/TSV/TXT) with columns 'Run', 'BioProject', and 'Model', "
-              "HULK will:\n"
-              "  • fetch SRA data (prefetch) with safe resume/overwrite,\n"
-              "  • convert to FASTQ (fasterq-dump),\n"
-              "  • perform QC/trimming with fastp,\n"
-              "  • quantify against a transcriptome using kallisto.\n\n"
-              "The transcriptome may be a compressed FASTA (.fa/.fasta/.fna.gz) or a \n"
-              "prebuilt kallisto index (.idx). If a FASTA is provided, HULK builds a \n"
-              "shared index once per run and reuses it.\n\n"
-              "Concurrency is automatic: available CPU cores are detected (Docker/CGroups-aware), \n"
-              "and work is split across SRAs with configurable per-job threading.\n"
-        ),
-        epilog=(
-            "Outputs are organized as <OUTPUT>/<BioProject>/<Run>/ ...\n"
-            "A master log is written to <OUTPUT>/shared/log.txt capturing all tool output.\n"
-            "Re-runs are safe: completed SRAs are skipped unless --force is given; \n"
-            "partial downloads are resumed/cleaned automatically.\n\n"
-            "Examples:\n"
-            "  hulk -i samples.tsv -r transcripts.fasta.gz -o results\n"
-            "  hulk -i samples.csv -r transcripts.idx --min-threads 2 --max-threads 8 -v\n"
-            "  hulk -i table.txt -r species.fa.gz -t 8 -f -a\n"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        allow_abbrev=False,
-    )
-
-    # Version
-    parser.add_argument(
-        "-V", "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
-        help="Show version and exit."
-    )
-
-    # Hidden easter egg remains available, but not parsed before help anymore
-    parser.add_argument("--smash", action="store_true", help=argparse.SUPPRESS)
-
-    # Required I/O
-    parser.add_argument(
-        "-i", "--input",
-        required=True,
-        help="Input table (.csv, .tsv, or .txt) with columns: 'Run', 'BioProject', 'Model'."
-    )
-    parser.add_argument(
-        "-r", "--reference",
-        required=True,
-        help="Reference transcriptome (.fasta/.fa[.gz]) or kallisto index (.idx)."
-    )
-
-    # Optional outputs
-    parser.add_argument(
-        "-o", "--output",
-        default=Path(DEFAULT_OUTDIR),
-        help="Output directory (default: 'output')."
-    )
-
-    # Performance
-    parser.add_argument(
-        "--min-threads",
-        type=int,
-        default=DEFAULT_MIN_THREADS,
-        help=f"Minimum number of threads per SRA (default: {DEFAULT_MIN_THREADS})."
-    )
-    parser.add_argument(
-        "-t", "--max-threads",
-        type=int,
-        default=DEFAULT_MAX_THREADS,
-        help=f"Maximum total threads (default: {DEFAULT_MAX_THREADS})."
-    )
-
-    # Flags
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Show live progress bars and console messages."
-    )
-
-    parser.add_argument(
-        "-f", "--force",
-        action="store_true",
-        help="Force re-run: overwrite totally/partially processed SRAs."
-    )
-    parser.add_argument(
-        "--overwrite",
-        dest="force",
-        action="store_true",
-        help=argparse.SUPPRESS
-    )
-
-    parser.add_argument(
-        "-a", "--aggregate",
-        action="store_true",
-        help="Create a merged TPM table across all BioProjects; "
-             "if --gene-counts is set, also write a global gene-counts table."
-    )
-    parser.add_argument(
-        "--overall-table",
-        dest="aggregate",
-        action="store_true",
-        help=argparse.SUPPRESS
-    )
-    """to do
-    parser.add_argument(
-        "-n", "--dry-run",
-        action="store_true",
-        help="Plan and validate without executing external tools."
-    )
-    """
-
-    parser.add_argument(
-        "-g", "--gene-counts",
-        metavar="TX2GENE_FILE",
-        default=None,
-        help="Enable gene counts using a tx2gene (.csv) with columns 'transcript_id','gene_id'."
-    )
-    parser.add_argument(
-        "--keep-fastq",
-        action="store_true",
-        help="Keep FASTQ files."
-    )
-
-    args = parser.parse_args()
-
-    # --- validation: input file exists ---
-    input_path = Path(args.input)
-    if not input_path.is_file():
-        parser.error(f"Input file does not exist: {input_path}")
-
-    # --- validation: correct extension ---
-    if input_path.suffix.lower() not in INPUT_FORMATS:
-        parser.error(f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))}")
-
-    # --- validation: required columns ---
+def _cfg_load(explicit: Path | None = None) -> dict[str, Any]:
+    p = _cfg_path(explicit)
+    if not p.exists():
+        return {}
     try:
-        if input_path.suffix.lower() == ".csv":
+        with open(p, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return {}
+
+def _cfg_save(cfg: dict[str, Any], explicit: Path | None = None) -> Path:
+    p = _cfg_path(explicit)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(cfg, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+    tmp.replace(p)
+    return p
+
+def _cfg_update(section: str, payload: dict[str, Any], explicit: Path | None = None) -> Path:
+    cfg = _cfg_load(explicit)
+    sect = cfg.get(section, {})
+    for k, v in payload.items():
+        if v is not None:
+            sect[k] = v
+    cfg[section] = sect
+    return _cfg_save(cfg, explicit)
+
+# ---------------------------- Pretty formatting mixin ----------------------------
+def _pad_block(text: str, n: int) -> str:
+    lines = text.rstrip("\n").splitlines()
+    return "\n".join((" " * n) + line for line in lines)
+
+class SpacedFormatterMixin:
+    """Align left/right columns and insert blank lines between rows, preserving text verbatim."""
+    def _fmt_rows_with_spacing(self, formatter: click.HelpFormatter, title: str, rows: list[tuple[str, str | None]]) -> None:
+        rows = [r for r in rows if r]
+        if not rows:
+            return
+
+        formatter.write(f"{title}:\n")
+
+        for i, (left, right) in enumerate(rows):
+            left = left or ""
+            right = right or ""
+
+            # Compute a fixed wide gap: start right column at RIGHT_COL (relative to line start after the two spaces)
+            # If the left part is already longer than RIGHT_COL, still put at least 2 spaces.
+            visible_left_len = len(left)
+            gap = (RIGHT_COL - visible_left_len)
+            if gap < 2:
+                gap = 2
+
+            # Use write() (NOT write_text()) to avoid wrapping; respect all original newlines.
+            formatter.write(f"  {left}{' ' * gap}{right}\n")
+
+            # Blank line between options/rows
+            if i < len(rows) - 1:
+                formatter.write("\n")
+
+# ---------------------------- Custom Group & Command ----------------------------
+class HulkGroup(SpacedFormatterMixin, click.Group):
+    """Custom Group that prints LOGO + HELP_BODY verbatim and formats sections."""
+    def make_context(self, info_name, args, parent=None, **extra):
+        ctx = super().make_context(info_name, args, parent=parent, **extra)
+        # Force a very wide help
+        ctx.max_content_width = WIDE_HELP
+        return ctx
+
+    def format_help(self, ctx, formatter):
+        # Usage
+        self.format_usage(ctx, formatter)
+        formatter.write_text("\n")  # blank line
+
+        # Logo (respect exact newlines + manual left padding)
+        formatter.write(_pad_block(LOGO, LOGO_PAD) + "\n\n")
+
+        # Body (verbatim; use write to avoid wrapping)
+        formatter.write(HELP_BODY.rstrip() + "\n\n")
+
+        # Commands & Options
+        self.format_commands(ctx, formatter)
+        formatter.write("\n")
+        self.format_options(ctx, formatter)
+
+
+    def format_options(self, ctx, formatter):
+        opts = [p.get_help_record(ctx) for p in self.get_params(ctx)]
+        opts = [o for o in opts if o]
+        self._fmt_rows_with_spacing(formatter, "Options", opts)
+
+    def format_commands(self, ctx, formatter):
+        commands: list[tuple[str, str]] = []
+        for name in self.list_commands(ctx):
+            cmd = self.get_command(ctx, name)
+            if not cmd or cmd.hidden:
+                continue
+            one_liner = (cmd.help or "").strip().splitlines()[0]
+            commands.append((name, one_liner))
+        if commands:
+            self._fmt_rows_with_spacing(formatter, "Commands", commands)
+
+class HulkCommand(SpacedFormatterMixin, click.Command):
+    """Subcommands use wide help + our spaced option formatting."""
+    def make_context(self, info_name, args, parent=None, **extra):
+        ctx = super().make_context(info_name, args, parent=parent, **extra)
+        ctx.max_content_width = WIDE_HELP
+        return ctx
+
+    def format_help(self, ctx, formatter):
+        # Usage
+        self.format_usage(ctx, formatter)
+        formatter.write("\n")
+        # One-liner description (if provided)
+        if self.help:
+            formatter.write(self.help.strip() + "\n\n")
+        # Options (pretty)
+        self.format_options(ctx, formatter)
+
+    def format_options(self, ctx, formatter):
+        opts = [p.get_help_record(ctx) for p in self.get_params(ctx)]
+        opts = [o for o in opts if o]
+        self._fmt_rows_with_spacing(formatter, "Options", opts)
+
+# ---------------------------- Root CLI (Group) ----------------------------
+@click.group(
+    cls=HulkGroup,
+    context_settings={"help_option_names": ["-h", "--help"], "max_content_width": WIDE_HELP},
+)
+@click.version_option(__version__, "-V", "--version", prog_name="hulk")
+@click.option("--smash", is_flag=True, hidden=True, is_eager=True, expose_value=False,
+              callback=lambda ctx, p, v: (smash(), ctx.exit()) if v and not ctx.resilient_parsing else None)
+# Required I/O (optional here so subcommands can run alone)
+@click.option(
+    "-i", "--input", "input_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=False,
+    help="Input table (.csv, .tsv, or .txt) with columns: 'Run', 'BioProject', 'Model'.",
+)
+@click.option(
+    "-r", "--reference", "reference_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=False,
+    help="Reference transcriptome (.fasta/.fa[.gz]) or kallisto index (.idx).",
+)
+# Optional outputs
+@click.option(
+    "-o", "--output", "output_dir",
+    type=click.Path(dir_okay=True, file_okay=False, path_type=Path),
+    default=DEFAULT_OUTDIR, show_default=True,
+    help="Output directory.",
+)
+# Performance
+@click.option("--min-threads", type=int, default=DEFAULT_MIN_THREADS, show_default=True,
+              help="Minimum number of threads per SRR.")
+@click.option("-t", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True,
+              help="Maximum total threads.")
+# Flags
+@click.option("-v", "--verbose", is_flag=True, help="Show live progress bars and console messages.")
+@click.option("-f", "--force", "--overwrite", is_flag=True,
+              help="Force re-run: overwrite totally/partially processed SRRs.")
+@click.option("-a", "--aggregate", "--overall-table", is_flag=True,
+              help="Create a merged TPM table across all BioProjects; if --gene-counts is set, also write a global gene-counts table.")
+@click.option("-n", "--dry-run", is_flag=True,
+              help="Validate inputs and configuration, print plan, and exit without running tools.")
+@click.option(
+    "-g", "--gene-counts", "tx2gene_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Enable gene counts using a tx2gene (.csv) with columns 'transcript_id','gene_id'.",
+)
+@click.option("--keep-fastq", is_flag=True, help="Keep FASTQ files.")
+@click.pass_context
+def cli(
+    ctx: click.Context,
+    input_path: Path | None,
+    reference_path: Path | None,
+    output_dir: Path,
+    min_threads: int,
+    max_threads: int,
+    verbose: bool,
+    force: bool,
+    aggregate: bool,
+    dry_run: bool,
+    tx2gene_path: Path | None,
+    keep_fastq: bool,
+):
+    """
+    Root group: run the pipeline when called directly; subcommands store defaults.
+    """
+    # If a subcommand is invoked, don't run pipeline.
+    if ctx.invoked_subcommand is not None:
+        ctx.obj = {"output_dir": output_dir}
+        return
+
+    # Require inputs when running pipeline directly.
+    if input_path is None or reference_path is None:
+        raise click.UsageError("Missing required options: -i/--input and -r/--reference. See 'hulk -h'.")
+
+    # Validate input table
+    suf = input_path.suffix.lower()
+    if suf not in INPUT_FORMATS:
+        raise click.UsageError(f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))} (got: {input_path.name})")
+    try:
+        if suf == ".csv":
             df = pd.read_csv(input_path, low_memory=False)
-        elif input_path.suffix.lower() == ".tsv":
+        elif suf == ".tsv":
             df = pd.read_csv(input_path, sep="\t", low_memory=False)
         else:
             df = pd.read_table(input_path)
     except Exception as e:
-        parser.error(f"Could not read input file: {e}")
+        raise click.ClickException(f"Could not read input file '{input_path}': {e}")
 
     if not REQUIRED_INPUT_COLS.issubset(df.columns):
-        parser.error(f"Input file must contain columns: {', '.join(sorted(REQUIRED_INPUT_COLS))}")
-
+        missing = REQUIRED_INPUT_COLS.difference(df.columns)
+        raise click.UsageError(
+            "Input file must contain columns: " + ", ".join(sorted(REQUIRED_INPUT_COLS)) +
+            (f" (missing: {', '.join(sorted(missing))})" if missing else "")
+        )
     df = df[list(REQUIRED_INPUT_COLS)]
-    args.df = df
 
-    # --- transcriptome / index validation ---
-    reference_path = Path(args.reference).expanduser().resolve()
-    if not reference_path.is_file():
-        parser.error(f"reference file does not exist: {reference_path}")
-
+    # Reference validation
     trans_suff = transcriptome_suffixes(reference_path)
     if trans_suff not in TRANSCRIPTOME_FORMATS:
-        parser.error(f"Transcriptome file must be one of: {', '.join(sorted(TRANSCRIPTOME_FORMATS))}")
+        raise click.UsageError(
+            f"Transcriptome file must be one of: {', '.join(sorted(TRANSCRIPTOME_FORMATS))} (got: {reference_path.name})"
+        )
 
-    args.reference = reference_path
-
-    # --- tx2gene validation (optional) ---
-    if args.gene_counts is not None:
-        tx2gene_path = Path(args.gene_counts).expanduser().resolve()
-        if not tx2gene_path.is_file():
-            parser.error(f"tx2gene file does not exist: {tx2gene_path}")
+    # tx2gene validation
+    if tx2gene_path is not None:
         try:
             tx2gene_df = pd.read_csv(tx2gene_path, sep=None, engine="python")
         except Exception as e:
-            parser.error(f"Could not read tx2gene file: {tx2gene_path} ({e})")
+            raise click.ClickException(f"Could not read tx2gene file '{tx2gene_path}': {e}")
         if not REQUIRED_TX2GENE_COLS.issubset(tx2gene_df.columns):
-            parser.error(
-                "tx2gene file must contain columns: "
-                + ", ".join(sorted(REQUIRED_TX2GENE_COLS))
-                + f" (found: {', '.join(tx2gene_df.columns)})"
+            raise click.UsageError(
+                "tx2gene file must contain columns: " + ", ".join(sorted(REQUIRED_TX2GENE_COLS)) +
+                f" (found: {', '.join(tx2gene_df.columns)})"
             )
-        args.gene_counts = tx2gene_path
 
-    # --- output dir normalization ---
-    if args.output:
-        args.output = Path(args.output).expanduser().resolve()
-        if not args.output.is_dir():
-            args.output.mkdir(parents=True)
+    # Output dir
+    try:
+        output_dir = output_dir.expanduser().resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        raise click.ClickException(f"Failed to prepare output directory '{output_dir}': {e}")
 
-    return args
+    # Load saved subcommand settings
+    cfg = _cfg_load()
+    trim_opts = cfg.get("trim") or {}
+    tximport_opts = cfg.get("tximport") or {}
 
+    # Dry run
+    if dry_run:
+        click.secho("\n✅ Dry run: inputs and configuration validated.\n", fg="green")
+        click.echo(f"- Input:        {input_path}\n")
+        click.echo(f"- Reference:    {reference_path}\n")
+        click.echo(f"- Output dir:   {output_dir}\n")
+        click.echo(f"- Threads:      min={min_threads}, max={max_threads}\n")
+        click.echo(f"- Force:        {force}\n")
+        click.echo(f"- Aggregate:    {aggregate}\n")
+        click.echo(f"- tx2gene:      {tx2gene_path if tx2gene_path else 'None'}\n")
+        click.echo(f"- Keep FASTQ:   {keep_fastq}\n")
+        if trim_opts:
+            click.echo(f"- Trim opts:    {trim_opts}")
+        if tximport_opts:
+            click.echo(f"- Tximport:     {tximport_opts}")
+        sys.exit(0)
 
-def main():
-    args = parse_args()
+    # Run pipeline (ensure it accepts trim_opts / tximport_opts)
     pipeline(
-        args.df,
-        args.output,
-        args.reference,
-        args.min_threads,
-        args.max_threads,
-        args.verbose,
-        args.force,
-        args.keep_fastq,
-        args.aggregate,
-        args.gene_counts,
-        # NOTE: args.dry_run is parsed; wire it into pipeline when implemented
+        df,
+        output_dir,
+        reference_path.expanduser().resolve(),
+        min_threads,
+        max_threads,
+        verbose,
+        force,
+        keep_fastq,
+        aggregate,
+        tx2gene_path.expanduser().resolve() if tx2gene_path else None,
+        trim_opts=trim_opts or None,
+        tximport_opts=tximport_opts or None,
+    )
+    sys.exit(0)
+
+# ---------------------------- Subcommands ----------------------------
+@cli.command("trim", cls=HulkCommand, help="Configure fastp trimming defaults.")
+@click.option("-ws", "--window-size", type=int, default=None,
+              help="fastp sliding window size (integer).")
+@click.option("-mq", "--mean-quality", type=int, default=None,
+              help="fastp mean quality threshold (integer).")
+@click.option("--config", "config_path", type=click.Path(dir_okay=False, path_type=Path),
+              default=None,
+              help=f"Path to settings JSON (default: ${CFG_ENV} or ./{CFG_DEFAULT_NAME}).")
+def trim(window_size: int | None, mean_quality: int | None, config_path: Path | None):
+    """Save trimming defaults (used automatically by `hulk ...`)."""
+    if window_size is None and mean_quality is None:
+        click.echo("Try: hulk trim -h   (to see options)")
+        return
+    p = _cfg_update("trim",
+                    {"window_size": window_size, "mean_quality": mean_quality},
+                    explicit=config_path)
+    click.secho(f"Saved trim settings to {p}", fg="green")
+
+
+@cli.command("tximport", cls=HulkCommand, help="Configure tximport aggregation/normalization.")
+@click.option(
+    "-m", "--mode",
+    type=click.Choice(
+        ["raw_counts", "length_scaled_tpm", "scaled_tpm", "dtu_scaled_tpm"],
+        case_sensitive=False
+    ),
+    default=None,
+    help="tximport aggregation/normalization mode.",
+)
+@click.option(
+    "--ignore-tx-version",
+    "ignore_tx_version",
+    is_flag=True,
+    default=False,
+    help="If set, strip transcript version suffixes before matching (default: off).",
+)
+@click.option(
+    "--config", "config_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help=f"Path to settings JSON (default: ${CFG_ENV} or ./{CFG_DEFAULT_NAME})."
+)
+def tximport(mode: str | None, ignore_tx_version: bool, config_path: Path | None):
+    """Save tximport defaults (used automatically by `hulk ...`)."""
+    # Only persist the flag if the user actually passed it on the command line
+    ctx = click.get_current_context()
+    flag_provided = (
+        ctx.get_parameter_source("ignore_tx_version") == ParameterSource.COMMANDLINE
     )
 
+    if mode is None and not flag_provided:
+        click.echo("Try: hulk tximport -h   (to see options)")
+        return
+
+    payload = {}
+    if mode is not None:
+        payload["mode"] = mode
+    if flag_provided:
+        payload["ignore_tx_version"] = ignore_tx_version  # True if flag used
+
+    p = _cfg_update("tximport", payload, explicit=config_path)
+    click.secho(f"Saved tximport settings to {p}", fg="green")
+
+# ---------------------------- Entry point ----------------------------
+def main():
+    # Ensure wide formatter even if Click detects a narrow terminal
+    os.environ.setdefault("COLUMNS", str(WIDE_HELP))
+    cli(standalone_mode=True)
 
 if __name__ == "__main__":
     main()
