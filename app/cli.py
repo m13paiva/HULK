@@ -9,7 +9,7 @@ from typing import Any
 
 import click
 import pandas as pd
-
+from click.core import ParameterSource  
 from .core import pipeline
 from .utils import transcriptome_suffixes, smash
 from .logo import LOGO
@@ -24,10 +24,12 @@ DEFAULT_MIN_THREADS = 4
 DEFAULT_MAX_THREADS = 10
 REQUIRED_TX2GENE_COLS = {"transcript_id", "gene_id"}
 
-CFG_ENV = "HULK_CONFIG"  # env var to point to a custom config path
-CFG_DEFAULT_NAME = ".hulk.json"
-
-# ---------------------------- Pretty help ----------------------------
+CFG_ENV = "HULK_CONFIG"          # env var to point to a custom config path
+CFG_DEFAULT_NAME = ".hulk.json"  # default config file in CWD
+WIDE_HELP = 200                   # force very wide help for main + subcommands
+RIGHT_COL = 50
+LOGO_PAD = 20
+# ---------------------------- Pretty help text (verbatim) ----------------------------
 HELP_BODY = (
     "HULK is a H(igh-volume b)ulk RNA-seq data preprocessing pipeline for NCBI SRA accessions.\n"
     "\n"
@@ -52,78 +54,6 @@ HELP_BODY = (
     "  hulk -i table.txt -r species.fa.gz -t 8 -f -a\n"
 )
 
-class SpacedFormatterMixin:
-    """Mix-in to format options/commands with aligned columns + blank lines."""
-    def _fmt_rows_with_spacing(self, formatter, title: str, rows: list[tuple[str, str | None]]) -> None:
-        rows = [r for r in rows if r]
-        if not rows:
-            return
-        left_len = max(len(left) for left, _ in rows)
-        pad = max(28, min(44, left_len + 2))
-        with formatter.section(title):
-            for i, (left, right) in enumerate(rows):
-                formatter.write_text(f"  {left.ljust(pad)}{(right or '')}")
-                if i < len(rows) - 1:
-                    formatter.write_text("")
-
-class HulkGroup(SpacedFormatterMixin, click.Group):
-    """Custom Group to inject LOGO, body text, and pretty sections."""
-
-    def format_help(self, ctx, formatter):
-        # Print "Usage:" line first (Click default)
-        self.format_usage(ctx, formatter)
-
-        # Blank line
-        formatter.write("\n")
-
-        # Inject the LOGO verbatim (NO wrapping)
-        formatter.write(LOGO.rstrip() + "\n\n")
-
-        # Inject the body text verbatim (NO wrapping)
-        formatter.write(HELP_BODY.rstrip() + "\n\n")
-
-        # Then show commands and options using our pretty formatters (these can wrap)
-        self.format_commands(ctx, formatter)
-        self.format_options(ctx, formatter)
-
-    def format_options(self, ctx, formatter):
-        # Collect normal options for this group (not subcommands)
-        opts = [p.get_help_record(ctx) for p in self.get_params(ctx)]
-        opts = [o for o in opts if o]
-        self._fmt_rows_with_spacing(formatter, "Options", opts)
-
-    def format_commands(self, ctx, formatter):
-        # Show subcommands (+ a one-line description each)
-        cmds: dict[str, click.Command] = self.list_commands(ctx)
-        if not cmds:
-            return
-        rows: list[tuple[str, str]] = []
-        for name in cmds:
-            cmd = self.get_command(ctx, name)
-            if cmd is None or cmd.hidden:
-                continue
-            help_line = (cmd.help or "").strip().splitlines()[0]
-            rows.append((name, help_line))
-        if rows:
-            self._fmt_rows_with_spacing(formatter, "Commands", rows)
-
-class HulkCommand(SpacedFormatterMixin, click.Command):
-    """For subcommands to inherit our option spacing (logo/body only on group)."""
-
-    def format_help(self, ctx, formatter):
-        # Standard Click header for subcommands
-        self.format_usage(ctx, formatter)
-
-        # Blank line
-        formatter.write("\n")
-
-        # One-liner description if present (keep verbatim just in case)
-        if self.help:
-            formatter.write(self.help.strip() + "\n\n")
-
-        # Options in spaced style
-        self.format_options(ctx, formatter)
-
 # ---------------------------- Config helpers ----------------------------
 def _cfg_path(explicit: Path | None = None) -> Path:
     if explicit is not None:
@@ -131,7 +61,7 @@ def _cfg_path(explicit: Path | None = None) -> Path:
     p_env = os.environ.get(CFG_ENV)
     if p_env:
         return Path(p_env).expanduser().resolve()
-    # default to a local file in CWD (works in containers without $HOME perms)
+    # default to local file (works inside containers w/out $HOME perms)
     return Path.cwd() / CFG_DEFAULT_NAME
 
 def _cfg_load(explicit: Path | None = None) -> dict[str, Any]:
@@ -149,7 +79,6 @@ def _cfg_save(cfg: dict[str, Any], explicit: Path | None = None) -> Path:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
     except Exception:
-        # If parent can't be created (e.g., CWD), we still try to write the file
         pass
     tmp = p.with_suffix(p.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -161,26 +90,121 @@ def _cfg_save(cfg: dict[str, Any], explicit: Path | None = None) -> Path:
 def _cfg_update(section: str, payload: dict[str, Any], explicit: Path | None = None) -> Path:
     cfg = _cfg_load(explicit)
     sect = cfg.get(section, {})
-    # only set provided (non-None) keys
     for k, v in payload.items():
         if v is not None:
             sect[k] = v
     cfg[section] = sect
     return _cfg_save(cfg, explicit)
 
+# ---------------------------- Pretty formatting mixin ----------------------------
+def _pad_block(text: str, n: int) -> str:
+    lines = text.rstrip("\n").splitlines()
+    return "\n".join((" " * n) + line for line in lines)
+
+class SpacedFormatterMixin:
+    """Align left/right columns and insert blank lines between rows, preserving text verbatim."""
+    def _fmt_rows_with_spacing(self, formatter: click.HelpFormatter, title: str, rows: list[tuple[str, str | None]]) -> None:
+        rows = [r for r in rows if r]
+        if not rows:
+            return
+
+        formatter.write(f"{title}:\n")
+
+        for i, (left, right) in enumerate(rows):
+            left = left or ""
+            right = right or ""
+
+            # Compute a fixed wide gap: start right column at RIGHT_COL (relative to line start after the two spaces)
+            # If the left part is already longer than RIGHT_COL, still put at least 2 spaces.
+            visible_left_len = len(left)
+            gap = (RIGHT_COL - visible_left_len)
+            if gap < 2:
+                gap = 2
+
+            # Use write() (NOT write_text()) to avoid wrapping; respect all original newlines.
+            formatter.write(f"  {left}{' ' * gap}{right}\n")
+
+            # Blank line between options/rows
+            if i < len(rows) - 1:
+                formatter.write("\n")
+
+# ---------------------------- Custom Group & Command ----------------------------
+class HulkGroup(SpacedFormatterMixin, click.Group):
+    """Custom Group that prints LOGO + HELP_BODY verbatim and formats sections."""
+    def make_context(self, info_name, args, parent=None, **extra):
+        ctx = super().make_context(info_name, args, parent=parent, **extra)
+        # Force a very wide help
+        ctx.max_content_width = WIDE_HELP
+        return ctx
+
+    def format_help(self, ctx, formatter):
+        # Usage
+        self.format_usage(ctx, formatter)
+        formatter.write_text("\n")  # blank line
+
+        # Logo (respect exact newlines + manual left padding)
+        formatter.write(_pad_block(LOGO, LOGO_PAD) + "\n\n")
+
+        # Body (verbatim; use write to avoid wrapping)
+        formatter.write(HELP_BODY.rstrip() + "\n\n")
+
+        # Commands & Options
+        self.format_commands(ctx, formatter)
+        formatter.write("\n")
+        self.format_options(ctx, formatter)
+
+
+    def format_options(self, ctx, formatter):
+        opts = [p.get_help_record(ctx) for p in self.get_params(ctx)]
+        opts = [o for o in opts if o]
+        self._fmt_rows_with_spacing(formatter, "Options", opts)
+
+    def format_commands(self, ctx, formatter):
+        commands: list[tuple[str, str]] = []
+        for name in self.list_commands(ctx):
+            cmd = self.get_command(ctx, name)
+            if not cmd or cmd.hidden:
+                continue
+            one_liner = (cmd.help or "").strip().splitlines()[0]
+            commands.append((name, one_liner))
+        if commands:
+            self._fmt_rows_with_spacing(formatter, "Commands", commands)
+
+class HulkCommand(SpacedFormatterMixin, click.Command):
+    """Subcommands use wide help + our spaced option formatting."""
+    def make_context(self, info_name, args, parent=None, **extra):
+        ctx = super().make_context(info_name, args, parent=parent, **extra)
+        ctx.max_content_width = WIDE_HELP
+        return ctx
+
+    def format_help(self, ctx, formatter):
+        # Usage
+        self.format_usage(ctx, formatter)
+        formatter.write("\n")
+        # One-liner description (if provided)
+        if self.help:
+            formatter.write(self.help.strip() + "\n\n")
+        # Options (pretty)
+        self.format_options(ctx, formatter)
+
+    def format_options(self, ctx, formatter):
+        opts = [p.get_help_record(ctx) for p in self.get_params(ctx)]
+        opts = [o for o in opts if o]
+        self._fmt_rows_with_spacing(formatter, "Options", opts)
+
 # ---------------------------- Root CLI (Group) ----------------------------
 @click.group(
     cls=HulkGroup,
-    context_settings={"help_option_names": ["-h", "--help"], "max_content_width": 360},
+    context_settings={"help_option_names": ["-h", "--help"], "max_content_width": WIDE_HELP},
 )
 @click.version_option(__version__, "-V", "--version", prog_name="hulk")
 @click.option("--smash", is_flag=True, hidden=True, is_eager=True, expose_value=False,
               callback=lambda ctx, p, v: (smash(), ctx.exit()) if v and not ctx.resilient_parsing else None)
-# Required I/O
+# Required I/O (optional here so subcommands can run alone)
 @click.option(
     "-i", "--input", "input_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    required=False,  # allow calling subcommands without these
+    required=False,
     help="Input table (.csv, .tsv, or .txt) with columns: 'Run', 'BioProject', 'Model'.",
 )
 @click.option(
@@ -232,29 +256,21 @@ def cli(
     keep_fastq: bool,
 ):
     """
-    Root group: if called with options (and not a subcommand), run the pipeline.
-    Subcommands (e.g. `trim`, `tximport`) configure defaults saved to a JSON file.
+    Root group: run the pipeline when called directly; subcommands store defaults.
     """
-    # If a subcommand was invoked, just stash the common options and return.
+    # If a subcommand is invoked, don't run pipeline.
     if ctx.invoked_subcommand is not None:
-        # Stash for subcommand usage if needed
-        ctx.obj = {
-            "output_dir": output_dir,
-        }
+        ctx.obj = {"output_dir": output_dir}
         return
 
-    # If no subcommand: we expect the pipeline arguments to be present.
+    # Require inputs when running pipeline directly.
     if input_path is None or reference_path is None:
         raise click.UsageError("Missing required options: -i/--input and -r/--reference. See 'hulk -h'.")
 
-    # Validate input table extension
+    # Validate input table
     suf = input_path.suffix.lower()
     if suf not in INPUT_FORMATS:
-        raise click.UsageError(
-            f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))} (got: {input_path.name})"
-        )
-
-    # Read sample table
+        raise click.UsageError(f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))} (got: {input_path.name})")
     try:
         if suf == ".csv":
             df = pd.read_csv(input_path, low_memory=False)
@@ -280,7 +296,7 @@ def cli(
             f"Transcriptome file must be one of: {', '.join(sorted(TRANSCRIPTOME_FORMATS))} (got: {reference_path.name})"
         )
 
-    # tx2gene validation (optional)
+    # tx2gene validation
     if tx2gene_path is not None:
         try:
             tx2gene_df = pd.read_csv(tx2gene_path, sep=None, engine="python")
@@ -299,12 +315,12 @@ def cli(
     except Exception as e:
         raise click.ClickException(f"Failed to prepare output directory '{output_dir}': {e}")
 
-    # Load saved subcommand settings and merge into kwargs for pipeline
+    # Load saved subcommand settings
     cfg = _cfg_load()
     trim_opts = cfg.get("trim") or {}
     tximport_opts = cfg.get("tximport") or {}
 
-    # Dry-run summary
+    # Dry run
     if dry_run:
         click.secho("\n✅ Dry run: inputs and configuration validated.\n", fg="green")
         click.echo(f"- Input:        {input_path}\n")
@@ -321,7 +337,7 @@ def cli(
             click.echo(f"- Tximport:     {tximport_opts}")
         sys.exit(0)
 
-    # Run pipeline — ensure it accepts trim_opts / tximport_opts (add in core if needed)
+    # Run pipeline (ensure it accepts trim_opts / tximport_opts)
     pipeline(
         df,
         output_dir,
@@ -357,6 +373,7 @@ def trim(window_size: int | None, mean_quality: int | None, config_path: Path | 
                     explicit=config_path)
     click.secho(f"Saved trim settings to {p}", fg="green")
 
+
 @cli.command("tximport", cls=HulkCommand, help="Configure tximport aggregation/normalization.")
 @click.option(
     "-m", "--mode",
@@ -368,25 +385,43 @@ def trim(window_size: int | None, mean_quality: int | None, config_path: Path | 
     help="tximport aggregation/normalization mode.",
 )
 @click.option(
-    "--ignore_tx_version/--no-ignore_tx_version",
-    default=None,
-    help="Strip transcript version suffixes before matching (default: false).",
+    "--ignore-tx-version",
+    "ignore_tx_version",
+    is_flag=True,
+    default=False,
+    help="If set, strip transcript version suffixes before matching (default: off).",
 )
-@click.option("--config", "config_path", type=click.Path(dir_okay=False, path_type=Path),
-              default=None,
-              help=f"Path to settings JSON (default: ${CFG_ENV} or ./{CFG_DEFAULT_NAME}).")
-def tximport(mode: str | None, ignore_tx_version: bool | None, config_path: Path | None):
+@click.option(
+    "--config", "config_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help=f"Path to settings JSON (default: ${CFG_ENV} or ./{CFG_DEFAULT_NAME})."
+)
+def tximport(mode: str | None, ignore_tx_version: bool, config_path: Path | None):
     """Save tximport defaults (used automatically by `hulk ...`)."""
-    if mode is None and ignore_tx_version is None:
+    # Only persist the flag if the user actually passed it on the command line
+    ctx = click.get_current_context()
+    flag_provided = (
+        ctx.get_parameter_source("ignore_tx_version") == ParameterSource.COMMANDLINE
+    )
+
+    if mode is None and not flag_provided:
         click.echo("Try: hulk tximport -h   (to see options)")
         return
-    p = _cfg_update("tximport",
-                    {"mode": mode, "ignore_tx_version": ignore_tx_version},
-                    explicit=config_path)
+
+    payload = {}
+    if mode is not None:
+        payload["mode"] = mode
+    if flag_provided:
+        payload["ignore_tx_version"] = ignore_tx_version  # True if flag used
+
+    p = _cfg_update("tximport", payload, explicit=config_path)
     click.secho(f"Saved tximport settings to {p}", fg="green")
 
 # ---------------------------- Entry point ----------------------------
 def main():
+    # Ensure wide formatter even if Click detects a narrow terminal
+    os.environ.setdefault("COLUMNS", str(WIDE_HELP))
     cli(standalone_mode=True)
 
 if __name__ == "__main__":
