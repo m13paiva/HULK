@@ -50,6 +50,13 @@
 | **Legacy Illumina**    | Genome Analyzer II / IIX                                               |
 
 ---
+## Requirements
+
+- **OS:** Linux  
+- **Container:** Docker installed and usable  
+- **Network:** Outbound HTTPS to pull the image and to NCBI/ENA for `prefetch`/`fasterq-dump`  
+- **Compute:** Ideally run on a server/HPC due to long runtimes with high-volume data
+
 
 ## Installation
 
