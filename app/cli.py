@@ -195,6 +195,7 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
 # ---------------------------- Root CLI (Group) ----------------------------
 @click.group(
     cls=HulkGroup,
+    invoke_without_command=True,  # <-- add this
     context_settings={"help_option_names": ["-h", "--help"], "max_content_width": WIDE_HELP},
 )
 @click.version_option(__version__, "-V", "--version", prog_name="hulk")
@@ -241,6 +242,7 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
 )
 @click.option("--keep-fastq", is_flag=True, help="Keep FASTQ files.")
 @click.pass_context
+
 def cli(
     ctx: click.Context,
     input_path: Path | None,
@@ -258,11 +260,39 @@ def cli(
     """
     Root group: run the pipeline when called directly; subcommands store defaults.
     """
-    # If a subcommand is invoked, don't run pipeline.
+    # If a subcommand (other than "run") is invoked, don't run pipeline.
     if ctx.invoked_subcommand is not None:
-        ctx.obj = {"output_dir": output_dir}
         return
 
+    _run_pipeline(
+        input_path=input_path,
+        reference_path=reference_path,
+        output_dir=output_dir,
+        min_threads=min_threads,
+        max_threads=max_threads,
+        verbose=verbose,
+        force=force,
+        aggregate=aggregate,
+        dry_run=dry_run,
+        tx2gene_path=tx2gene_path,
+        keep_fastq=keep_fastq,
+    )
+
+# --- Factor the actual execution into a helper used by both entry paths ---
+def _run_pipeline(
+    *,
+    input_path: Path | None,
+    reference_path: Path | None,
+    output_dir: Path,
+    min_threads: int,
+    max_threads: int,
+    verbose: bool,
+    force: bool,
+    aggregate: bool,
+    dry_run: bool,
+    tx2gene_path: Path | None,
+    keep_fastq: bool,
+) -> None:
     # Require inputs when running pipeline directly.
     if input_path is None or reference_path is None:
         raise click.UsageError("Missing required options: -i/--input and -r/--reference. See 'hulk -h'.")
@@ -337,7 +367,7 @@ def cli(
             click.echo(f"- Tximport:     {tximport_opts}")
         sys.exit(0)
 
-    # Run pipeline (ensure it accepts trim_opts / tximport_opts)
+    # Run pipeline
     pipeline(
         df,
         output_dir,
@@ -353,8 +383,62 @@ def cli(
         tximport_opts=tximport_opts or None,
     )
     sys.exit(0)
-
 # ---------------------------- Subcommands ----------------------------
+@click.option("-i", "--input", "input_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=False,
+    help="Input table (.csv, .tsv, or .txt) with columns: 'Run', 'BioProject', 'Model'.")
+@click.option("-r", "--reference", "reference_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=False,
+    help="Reference transcriptome (.fasta/.fa[.gz]) or kallisto index (.idx).")
+@click.option("-o", "--output", "output_dir",
+    type=click.Path(dir_okay=True, file_okay=False, path_type=Path),
+    default=DEFAULT_OUTDIR, show_default=True,
+    help="Output directory.")
+@click.option("--min-threads", type=int, default=DEFAULT_MIN_THREADS, show_default=True,
+              help="Minimum number of threads per SRR.")
+@click.option("-t", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True,
+              help="Maximum total threads.")
+@click.option("-v", "--verbose", is_flag=True, help="Show live progress bars and console messages.")
+@click.option("-f", "--force", "--overwrite", is_flag=True,
+              help="Force re-run: overwrite totally/partially processed SRRs.")
+@click.option("-a", "--aggregate", "--overall-table", is_flag=True,
+              help="Create a merged TPM table; with --gene-counts, also a global gene-counts table.")
+@click.option("-n", "--dry-run", is_flag=True,
+              help="Validate inputs and configuration, print plan, and exit without running tools.")
+@click.option("-g", "--gene-counts", "tx2gene_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Enable gene counts using a tx2gene (.csv) with columns 'transcript_id','gene_id'.")
+@click.option("--keep-fastq", is_flag=True, help="Keep FASTQ files.")
+def run_cmd(
+    input_path: Path | None,
+    reference_path: Path | None,
+    output_dir: Path,
+    min_threads: int,
+    max_threads: int,
+    verbose: bool,
+    force: bool,
+    aggregate: bool,
+    dry_run: bool,
+    tx2gene_path: Path | None,
+    keep_fastq: bool,
+):
+    """Entry-point that mirrors the root options."""
+    _run_pipeline(
+        input_path=input_path,
+        reference_path=reference_path,
+        output_dir=output_dir,
+        min_threads=min_threads,
+        max_threads=max_threads,
+        verbose=verbose,
+        force=force,
+        aggregate=aggregate,
+        dry_run=dry_run,
+        tx2gene_path=tx2gene_path,
+        keep_fastq=keep_fastq,
+    )
 @cli.command("trim", cls=HulkCommand, help="Configure fastp trimming defaults.")
 @click.option("-ws", "--window-size", type=int, default=None,
               help="fastp sliding window size (integer).")
