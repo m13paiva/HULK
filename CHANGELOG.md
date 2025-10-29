@@ -30,6 +30,7 @@ In this patched version, `_detect_fastq_layout_` now recognizes a single FASTQ f
 
 ---
 
+[1.1.1]: https://github.com/m13paiva/hulk/releases/tag/v1.1.1
 [1.1.0]: https://github.com/m13paiva/hulk/releases/tag/v1.1.0
 [1.0.0]: https://github.com/m13paiva/hulk/releases/tag/v1.0.0
 
