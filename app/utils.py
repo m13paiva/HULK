@@ -163,21 +163,36 @@ def is_sra_done(run_dir: Path) -> bool:
     #return False
     return (run_dir / "abundance.tsv").exists()
 
+
 def detect_fastq_layout(run_id: str, outdir: Path):
     """
     Detect SINGLE vs PAIRED FASTQs produced by fasterq-dump.
     Checks both .fastq and .fastq.gz.
+    Renames _1.fastq files to .fastq for single-end data.
     """
     cands = [
         (outdir / f"{run_id}_1.fastq", outdir / f"{run_id}_2.fastq"),
         (outdir / f"{run_id}_1.fastq.gz", outdir / f"{run_id}_2.fastq.gz"),
     ]
+
+    # First check for paired-end
     for r1, r2 in cands:
         if r1.exists() and r2.exists():
             return "PAIRED", r1, r2
-    for se in (outdir / f"{run_id}.fastq", outdir / f"{run_id}.fastq.gz"):
+
+    # Then check for single-end files
+    for se in (outdir / f"{run_id}.fastq", outdir / f"{run_id}.fastq.gz",
+               outdir / f"{run_id}_1.fastq", outdir / f"{run_id}_1.fastq.gz"):
         if se.exists():
-            return "SINGLE", se, None
+            # If file has _1 suffix, rename it to remove the suffix
+            if "_1.fastq" in se.name:
+                new_name = se.name.replace("_1.fastq", ".fastq")
+                new_path = outdir / new_name
+                se.rename(new_path)
+                return "SINGLE", new_path, None
+            else:
+                return "SINGLE", se, None
+
     return "MISSING", None, None
 
 def pick_fastq(run_dir: Path, stem: str, log_path: Path, error_warnings: list[str]) -> Path | None:
