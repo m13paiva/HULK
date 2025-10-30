@@ -1,11 +1,8 @@
 # core.py
 import sys
-import re
 import time
 import shutil
 import subprocess
-from dataclasses import dataclass
-from types import MappingProxyType
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,238 +14,35 @@ from .utils import (
     log, log_err,
     run_cmd, run_cmd_stream,
     df_to_dict, get_available_threads, plan_workers,
-    is_sra_done, detect_fastq_layout, pick_fastq, clean_fastq_files,
-    prepare_mqc_inputs_for_bp, build_bp_metrics,
+    is_sra_done, detect_fastq_layout, clean_fastq_files,
     merge_bioproject_tpm, merge_all_bioprojects_tpm,
-    bp_gene_counts, global_gene_counts
+)
+from .trim import (
+    fastp_single_cmd,
+    fastp_paired_cmd
 )
 
+from .align import (
+    build_transcriptome_index,
+    kallisto_single_cmd,
+    kallisto_paired_cmd
+)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Kallisto fragment length presets by sequencer model
-# ─────────────────────────────────────────────────────────────────────────────
+from .qc import (
+    run_multiqc,
+    build_bp_metrics
+)
 
-@dataclass(frozen=True)
-class FragParams:
-    mean: int
-    sd:   int
-
-_MODEL_PARAMS = MappingProxyType({
-    # NovaSeq
-    "ILLUMINA NOVASEQ 6000": FragParams(200, 20),
-    "ILLUMINA NOVASEQ X":    FragParams(200, 20),
-    "ILLUMINA NOVASEQ X PLUS": FragParams(200, 20),
-    # HiSeq family
-    "HISEQ X TEN":           FragParams(200, 20),
-    "ILLUMINA HISEQ X":      FragParams(200, 20),
-    "ILLUMINA HISEQ X TEN":  FragParams(200, 20),
-    "ILLUMINA HISEQ 4000":   FragParams(200, 20),
-    "ILLUMINA HISEQ 3000":   FragParams(200, 20),
-    "ILLUMINA HISEQ 2500":   FragParams(200, 20),
-    "ILLUMINA HISEQ 2000":   FragParams(200, 20),
-    "ILLUMINA HISEQ 1500":   FragParams(200, 20),
-    "ILLUMINA HISEQ 1000":   FragParams(200, 20),
-    # NextSeq
-    "NEXTSEQ 1000":          FragParams(200, 20),
-    "NEXTSEQ 500":           FragParams(200, 20),
-    "NEXTSEQ 550":           FragParams(200, 20),
-    # BGI/MGI
-    "DNBSEQ-G400":           FragParams(170, 15),
-    "DNBSEQ-T7":             FragParams(170, 15),
-    "BGISEQ-500":            FragParams(170, 15),
-    "MGISEQ-2000RS":         FragParams(170, 15),
-    # Older Illumina GA
-    "ILLUMINA GENOME ANALYZER II":  FragParams(160, 20),
-    "ILLUMINA GENOME ANALYZER IIX": FragParams(160, 20),
-})
-
-_FALLBACK_RULES = [
-    (re.compile(r"\bNOVASEQ\b", re.I),                 FragParams(200, 20)),
-    (re.compile(r"\bHISEQ\b", re.I),                   FragParams(200, 20)),
-    (re.compile(r"\bNEXTSEQ\b", re.I),                 FragParams(200, 20)),
-    (re.compile(r"\b(DNBSEQ|BGISEQ|MGISEQ)\b", re.I),  FragParams(170, 15)),
-    (re.compile(r"\b(GENOME ANALYZER|GAII)\b", re.I),  FragParams(160, 20)),
-]
-_DEFAULT_PARAMS = FragParams(200, 20)
-
-def get_frag_params(platform: str | None) -> FragParams:
-    """Return suggested fragment length params for kallisto --single based on sequencer model."""
-    if not platform:
-        return _DEFAULT_PARAMS
-    key = platform.strip().upper()
-    if key in _MODEL_PARAMS:
-        return _MODEL_PARAMS[key]
-    for rx, params in _FALLBACK_RULES:
-        if rx.search(platform):
-            return params
-    return _DEFAULT_PARAMS
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Reference
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_transcriptome_index(transcriptome: Path, shared: Path, log_path: Path) -> Path:
-    """Build (or rebuild) a kallisto index at <shared>/transcripts.idx."""
-    idx = shared / 'transcripts.idx'
-    run_cmd(["kallisto", "index", "-i", str(idx), str(transcriptome)], shared, log_path)
-    return idx
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tool commands
-# ─────────────────────────────────────────────────────────────────────────────
-
-def fastp_single_cmd(run_dir: Path, run_id: str, r: Path, threads: int,window_size=4,mean_quality=20) -> list[str]:
-    """fastp command (SINGLE-END)."""
-    return [
-        "fastp",
-        "-i", r.name,
-        "-o", f"{run_id}.trim.fastq.gz",
-        "-w", str(threads),
-        "--cut_front", "--cut_front_window_size", str(window_size), "--cut_front_mean_quality", str(mean_quality),
-        "--cut_tail",  "--cut_tail_window_size",  str(window_size), "--cut_tail_mean_quality",  str(mean_quality),
-        "-l", "50",
-        "-j", f"{run_id}.fastp.json",
-        "-h", f"{run_id}.fastp.html",
-    ]
-
-def fastp_paired_cmd(run_dir: Path, run_id: str, r1: Path, r2: Path, threads: int,window_size=4,mean_quality=20) -> list[str]:
-    """fastp command (PAIRED-END)."""
-    return [
-        "fastp",
-        "-i", r1.name, "-I", r2.name,
-        "-o", f"{run_id}_1.trim.fastq.gz", "-O", f"{run_id}_2.trim.fastq.gz",
-        "--detect_adapter_for_pe",
-        "-w", str(threads),
-        "--cut_front", "--cut_front_window_size", str(window_size), "--cut_front_mean_quality", str(mean_quality),
-        "--cut_tail",  "--cut_tail_window_size",  str(window_size), "--cut_tail_mean_quality",  str(mean_quality),
-        "-l", "50",
-        "-j", f"{run_id}.fastp.json",
-        "-h", f"{run_id}.fastp.html",
-    ]
-
-def kallisto_single_cmd(run_dir: Path, run_id: str, index_path: Path, threads: int,
-                        platform: str | None, log_path, error_warnings) -> list[str]:
-    fq = pick_fastq(run_dir, run_id, log_path, error_warnings)
-    fl = get_frag_params(platform)
-    return [
-        "kallisto", "quant",
-        "--plaintext",                 # ← ensure abundance.tsv is written
-        "-i", str(Path(index_path).resolve()),
-        "-o", str(run_dir.resolve()),
-        "-t", str(threads),
-        "--single", "-l", str(fl.mean), "-s", str(fl.sd),
-        str(fq.resolve()),
-    ]
-
-def kallisto_paired_cmd(run_dir: Path, run_id: str, index_path: Path, threads: int,
-                        log_path, error_warnings) -> list[str]:
-    r1 = pick_fastq(run_dir, f"{run_id}_1", log_path, error_warnings)
-    r2 = pick_fastq(run_dir, f"{run_id}_2", log_path, error_warnings)
-    return [
-        "kallisto", "quant",
-        "--plaintext",                 # ← ensure abundance.tsv is written
-        "-i", str(Path(index_path).resolve()),
-        "-o", str(run_dir.resolve()),
-        "-t", str(threads),
-        str(r1.resolve()), str(r2.resolve()),
-    ]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MultiQC runners
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_multiqc_sanitized_bp(
-    bioproject_dir: Path,
-    log_path: Path,
-    error_warnings: list[str],
-    modules=('kallisto', 'fastp'),
-) -> Path | None:
-    """
-    Build _mqc_inputs/<SRR>/ and invoke MultiQC on those *directories*,
-    explicitly ignoring HDF5 files so the kallisto module keys off
-    run_info.json + abundance.tsv reliably.
-    """
-    bioproject_dir = bioproject_dir.resolve()
-    inputs_root = prepare_mqc_inputs_for_bp(bioproject_dir, log_path, error_warnings)
-    if inputs_root is None:
-        return None
-
-    # Pick SRR dirs that contain run_info.json and abundance.tsv
-    sra_dirs = []
-    missing_msgs = []
-    for d in sorted(p for p in inputs_root.iterdir() if p.is_dir()):
-        has_runinfo = (d / "run_info.json").exists()
-        has_tsv     = (d / "abundance.tsv").exists()
-        if has_runinfo and has_tsv:
-            sra_dirs.append(d)
-        else:
-            reasons = []
-            if not has_runinfo: reasons.append("run_info.json")
-            if not has_tsv:     reasons.append("abundance.tsv")
-            missing_msgs.append(f"{d.name}: missing {', '.join(reasons)}")
-
-    if not sra_dirs:
-        log_err(error_warnings, log_path,
-                f"[MultiQC sanitize] No complete SRR dirs under {inputs_root}.\n" +
-                ("\n".join(missing_msgs) if missing_msgs else ""))
-        return None
-
-    log(f"[MultiQC sanitize] Using {len(sra_dirs)} SRR dirs for parsing", log_path)
-
-    report_name = f"multiqc_{bioproject_dir.name}"
-    cmd = [
-        "multiqc",
-        *map(str, sra_dirs),          # ← pass directories, not individual files
-        "-o", str(bioproject_dir),
-        "-n", report_name,
-        "--force",
-        "--ignore", "multiqc_*",
-        "--ignore", "*/multiqc_*",
-        "--ignore", "*.h5",           # ← stop kallisto module from touching HDF5
-        "-v",                         # helpful verbosity in your log
-    ]
-    for m in modules:
-        cmd += ["-m", m]
-
-    # Run from _mqc_inputs (not strictly required, but keeps paths short)
-    run_cmd(cmd, cwd=inputs_root, log_path=log_path)
-
-    out = bioproject_dir / f"{report_name}_data"
-    if not out.exists():
-        log_err(error_warnings, log_path, f"[MultiQC] Expected data dir not found: {out}")
-        return None
-    return out
-
-
-
-def run_multiqc(in_dir: Path, out_dir: Path, report_name: str, log_path: Path, modules=('kallisto', 'fastp')) -> None:
-    """Generic MultiQC runner (used for the global/shared report)."""
-    in_dir = in_dir.resolve()
-    if not out_dir.is_absolute():
-        out_dir = (in_dir / out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        "multiqc", ".",
-        "-o", str(out_dir),
-        "-n", report_name,
-        "--force",
-        "--ignore", "multiqc_*",
-        "--ignore", "*/multiqc_*",
-    ]
-    for m in modules:
-        cmd += ["-m", m]
-    run_cmd(cmd, cwd=in_dir, log_path=log_path)
-
+from .tx2gene import (
+    bp_gene_counts,
+    global_gene_counts
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Per-SRR worker
 # ─────────────────────────────────────────────────────────────────────────────
 
-def pipeline_one_sra(run, transcripts_index: Path, threads: int, outdir: Path,
+def pipeline_one_srr(run, transcripts_index: Path, threads: int, outdir: Path,
                      log_path: Path, overwrite: bool, keep_fastq: bool,error_warnings: list[str],
                      trim_opts=None,tximport_opts=None) -> None:
     """
@@ -383,7 +177,7 @@ def pipeline_one_bioproject(
 
     # If nothing to run, still regenerate per-BP artifacts
     if not todo_in_bp:
-        mqc_data = run_multiqc_sanitized_bp(bioproject_dir, log_path, error_warnings)
+        mqc_data = run_multiqc(bioproject_dir, log_path, error_warnings)
         if mqc_data is not None:
             _ = build_bp_metrics(bioproject, bioproject_dir, log_path, error_warnings, out_tsv=bioproject_dir / "read_metrics.tsv")
         if tx2gene is not None:
@@ -410,7 +204,7 @@ def pipeline_one_bioproject(
             run_id = run[0]
             run_dir = bioproject_dir / run_id
             start_times[run_id] = time.time()
-            fut = ex.submit(pipeline_one_sra,
+            fut = ex.submit(pipeline_one_srr,
                             run,
                             transcripts_index,
                             threads_each,
@@ -447,7 +241,7 @@ def pipeline_one_bioproject(
                 continue
 
     # per-BP MultiQC (sanitized) + metrics
-    mqc_data = run_multiqc_sanitized_bp(bioproject_dir, log_path, error_warnings)
+    mqc_data = run_multiqc(bioproject_dir, log_path, error_warnings)
     if mqc_data is not None:
         _ = build_bp_metrics(bioproject, bioproject_dir, log_path, error_warnings, out_tsv=bioproject_dir / "read_metrics.tsv")
 
