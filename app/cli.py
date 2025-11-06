@@ -9,8 +9,10 @@ from typing import Any
 
 import click
 import pandas as pd
-from click.core import ParameterSource  
+from click.core import ParameterSource
+
 from .core import pipeline
+from .entities import Config  # <-- use the Config class
 from .utils import transcriptome_suffixes, smash
 from .logo import LOGO
 from . import __version__
@@ -29,6 +31,7 @@ CFG_DEFAULT_NAME = ".hulk.json"  # default config file in CWD
 WIDE_HELP = 200                   # force very wide help for main + subcommands
 RIGHT_COL = 50
 LOGO_PAD = 20
+
 # ---------------------------- Pretty help text (verbatim) ----------------------------
 HELP_BODY = (
     "HULK is a H(igh-volume b)ulk RNA-seq data preprocessing pipeline for NCBI SRA accessions.\n"
@@ -54,7 +57,7 @@ HELP_BODY = (
     "  hulk -i table.txt -r species.fa.gz -t 8 -f -a\n"
 )
 
-# ---------------------------- Config helpers ----------------------------
+# ---------------------------- Config helpers (persisted JSON for subcommands) ----------------------------
 def _cfg_path(explicit: Path | None = None) -> Path:
     if explicit is not None:
         return explicit
@@ -114,17 +117,14 @@ class SpacedFormatterMixin:
             left = left or ""
             right = right or ""
 
-            # Compute a fixed wide gap: start right column at RIGHT_COL (relative to line start after the two spaces)
-            # If the left part is already longer than RIGHT_COL, still put at least 2 spaces.
+            # fixed gap with minimum 2 spaces
             visible_left_len = len(left)
             gap = (RIGHT_COL - visible_left_len)
             if gap < 2:
                 gap = 2
 
-            # Use write() (NOT write_text()) to avoid wrapping; respect all original newlines.
             formatter.write(f"  {left}{' ' * gap}{right}\n")
 
-            # Blank line between options/rows
             if i < len(rows) - 1:
                 formatter.write("\n")
 
@@ -133,26 +133,17 @@ class HulkGroup(SpacedFormatterMixin, click.Group):
     """Custom Group that prints LOGO + HELP_BODY verbatim and formats sections."""
     def make_context(self, info_name, args, parent=None, **extra):
         ctx = super().make_context(info_name, args, parent=parent, **extra)
-        # Force a very wide help
         ctx.max_content_width = WIDE_HELP
         return ctx
 
     def format_help(self, ctx, formatter):
-        # Usage
         self.format_usage(ctx, formatter)
-        formatter.write_text("\n")  # blank line
-
-        # Logo (respect exact newlines + manual left padding)
+        formatter.write_text("\n")
         formatter.write(_pad_block(LOGO, LOGO_PAD) + "\n\n")
-
-        # Body (verbatim; use write to avoid wrapping)
         formatter.write(HELP_BODY.rstrip() + "\n\n")
-
-        # Commands & Options
         self.format_commands(ctx, formatter)
         formatter.write("\n")
         self.format_options(ctx, formatter)
-
 
     def format_options(self, ctx, formatter):
         opts = [p.get_help_record(ctx) for p in self.get_params(ctx)]
@@ -178,13 +169,10 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
         return ctx
 
     def format_help(self, ctx, formatter):
-        # Usage
         self.format_usage(ctx, formatter)
         formatter.write("\n")
-        # One-liner description (if provided)
         if self.help:
             formatter.write(self.help.strip() + "\n\n")
-        # Options (pretty)
         self.format_options(ctx, formatter)
 
     def format_options(self, ctx, formatter):
@@ -195,7 +183,7 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
 # ---------------------------- Root CLI (Group) ----------------------------
 @click.group(
     cls=HulkGroup,
-    invoke_without_command=True,  # <-- add this
+    invoke_without_command=True,
     context_settings={"help_option_names": ["-h", "--help"], "max_content_width": WIDE_HELP},
 )
 @click.version_option(__version__, "-V", "--version", prog_name="hulk")
@@ -242,7 +230,6 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
 )
 @click.option("--keep-fastq", is_flag=True, help="Keep FASTQ files.")
 @click.pass_context
-
 def cli(
     ctx: click.Context,
     input_path: Path | None,
@@ -338,64 +325,74 @@ def _run_pipeline(
                 f" (found: {', '.join(tx2gene_df.columns)})"
             )
 
-    # Output dir
-    try:
-        output_dir = output_dir.expanduser().resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        raise click.ClickException(f"Failed to prepare output directory '{output_dir}': {e}")
-
-    # Load saved subcommand settings
-    cfg = _cfg_load()
-    trim_opts = cfg.get("trim") or {}
-    tximport_opts = cfg.get("tximport") or {}
+    # Build a Config object (this also creates <outdir>/shared and log.txt)
+    cfg = Config(
+        input_path=input_path,
+        reference_path=reference_path,
+        output_dir=output_dir,
+        min_threads=min_threads,
+        max_threads=max_threads,
+        verbose=verbose,
+        force=force,
+        aggregate=aggregate,
+        dry_run=dry_run,
+        tx2gene_path=tx2gene_path,
+        keep_fastq=keep_fastq,
+    )
 
     # Dry run
     if dry_run:
         click.secho("\n✅ Dry run: inputs and configuration validated.\n", fg="green")
-        click.echo(f"- Input:        {input_path}\n")
-        click.echo(f"- Reference:    {reference_path}\n")
-        click.echo(f"- Output dir:   {output_dir}\n")
-        click.echo(f"- Threads:      min={min_threads}, max={max_threads}\n")
-        click.echo(f"- Force:        {force}\n")
-        click.echo(f"- Aggregate:    {aggregate}\n")
-        click.echo(f"- tx2gene:      {tx2gene_path if tx2gene_path else 'None'}\n")
-        click.echo(f"- Keep FASTQ:   {keep_fastq}\n")
-        if trim_opts:
-            click.echo(f"- Trim opts:    {trim_opts}")
-        if tximport_opts:
-            click.echo(f"- Tximport:     {tximport_opts}")
+        click.echo(f"- Input:        {cfg.input_path}\n")
+        click.echo(f"- Reference:    {cfg.reference_path}\n")
+        click.echo(f"- Output dir:   {cfg.output_dir}\n")
+        click.echo(f"- Threads:      min={cfg.min_threads}, max={cfg.max_threads}\n")
+        click.echo(f"- Force:        {cfg.force}\n")
+        click.echo(f"- Aggregate:    {cfg.aggregate}\n")
+        click.echo(f"- tx2gene:      {cfg.tx2gene_path if cfg.tx2gene_path else 'None'}\n")
+        click.echo(f"- Keep FASTQ:   {cfg.keep_fastq}\n")
+        if cfg.trim_opts:
+            click.echo(f"- Trim opts:    {cfg.trim_opts}")
+        if cfg.tximport_opts:
+            click.echo(f"- Tximport:     {cfg.tximport_opts}")
         sys.exit(0)
 
-    # Run pipeline
+    # Run pipeline (keep current signature; supply params from cfg)
     pipeline(
         df,
-        output_dir,
-        reference_path.expanduser().resolve(),
-        min_threads,
-        max_threads,
-        verbose,
-        force,
-        keep_fastq,
-        aggregate,
-        tx2gene_path.expanduser().resolve() if tx2gene_path else None,
-        trim_opts=trim_opts or None,
-        tximport_opts=tximport_opts or None,
+        cfg.output_dir,
+        cfg.reference_path.expanduser().resolve(),
+        cfg.min_threads,
+        cfg.max_threads,
+        cfg.verbose,
+        cfg.force,
+        cfg.keep_fastq,
+        cfg.aggregate,
+        cfg.tx2gene_path.expanduser().resolve() if cfg.tx2gene_path else None,
+        trim_opts=cfg.trim_opts or None,
+        tximport_opts=cfg.tximport_opts or None,
     )
     sys.exit(0)
+
 # ---------------------------- Subcommands ----------------------------
-@click.option("-i", "--input", "input_path",
+@click.option(
+    "-i", "--input", "input_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=False,
-    help="Input table (.csv, .tsv, or .txt) with columns: 'Run', 'BioProject', 'Model'.")
-@click.option("-r", "--reference", "reference_path",
+    help="Input table (.csv, .tsv, or .txt) with columns: 'Run', 'BioProject', 'Model'."
+)
+@click.option(
+    "-r", "--reference", "reference_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=False,
-    help="Reference transcriptome (.fasta/.fa[.gz]) or kallisto index (.idx).")
-@click.option("-o", "--output", "output_dir",
+    help="Reference transcriptome (.fasta/.fa[.gz]) or kallisto index (.idx)."
+)
+@click.option(
+    "-o", "--output", "output_dir",
     type=click.Path(dir_okay=True, file_okay=False, path_type=Path),
     default=DEFAULT_OUTDIR, show_default=True,
-    help="Output directory.")
+    help="Output directory."
+)
 @click.option("--min-threads", type=int, default=DEFAULT_MIN_THREADS, show_default=True,
               help="Minimum number of threads per SRR.")
 @click.option("-t", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True,
@@ -407,10 +404,12 @@ def _run_pipeline(
               help="Create a merged TPM table; with --gene-counts, also a global gene-counts table.")
 @click.option("-n", "--dry-run", is_flag=True,
               help="Validate inputs and configuration, print plan, and exit without running tools.")
-@click.option("-g", "--gene-counts", "tx2gene_path",
+@click.option(
+    "-g", "--gene-counts", "tx2gene_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     default=None,
-    help="Enable gene counts using a tx2gene (.csv) with columns 'transcript_id','gene_id'.")
+    help="Enable gene counts using a tx2gene (.csv) with columns 'transcript_id','gene_id'."
+)
 @click.option("--keep-fastq", is_flag=True, help="Keep FASTQ files.")
 def run_cmd(
     input_path: Path | None,
@@ -439,6 +438,7 @@ def run_cmd(
         tx2gene_path=tx2gene_path,
         keep_fastq=keep_fastq,
     )
+
 @cli.command("trim", cls=HulkCommand, help="Configure fastp trimming defaults.")
 @click.option("-ws", "--window-size", type=int, default=None,
               help="fastp sliding window size (integer).")
@@ -456,7 +456,6 @@ def trim(window_size: int | None, mean_quality: int | None, config_path: Path | 
                     {"window_size": window_size, "mean_quality": mean_quality},
                     explicit=config_path)
     click.secho(f"Saved trim settings to {p}", fg="green")
-
 
 @cli.command("tximport", cls=HulkCommand, help="Configure tximport aggregation/normalization.")
 @click.option(
@@ -483,11 +482,8 @@ def trim(window_size: int | None, mean_quality: int | None, config_path: Path | 
 )
 def tximport(mode: str | None, ignore_tx_version: bool, config_path: Path | None):
     """Save tximport defaults (used automatically by `hulk ...`)."""
-    # Only persist the flag if the user actually passed it on the command line
     ctx = click.get_current_context()
-    flag_provided = (
-        ctx.get_parameter_source("ignore_tx_version") == ParameterSource.COMMANDLINE
-    )
+    flag_provided = (ctx.get_parameter_source("ignore_tx_version") == ParameterSource.COMMANDLINE)
 
     if mode is None and not flag_provided:
         click.echo("Try: hulk tximport -h   (to see options)")
