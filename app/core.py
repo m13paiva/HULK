@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List
 
 import pandas as pd
 from tqdm.auto import tqdm
@@ -30,12 +31,18 @@ from .align import (
 
 from .qc import (
     run_multiqc,
+    run_multiqc_global,
     build_bp_metrics
 )
 
 from .tx2gene import (
     bp_gene_counts,
     global_gene_counts
+)
+
+from .entities import (
+    Config,
+    Dataset
 )
 
 
@@ -260,81 +267,94 @@ def pipeline_one_bioproject(
 # Whole-run orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 
-def pipeline(
-    data_df: pd.DataFrame,
-    outdir: Path,
-    transcriptome: Path,
-    min_threads: int,
-    max_threads: int,
-    verbose: bool,
-    overwrite: bool,
-    keep_fastq:bool,
-    overall_table: bool,
-    tx2gene: Path | None,
-    trim_opts=None,
-    tximport_opts=None,
-) -> None:
+def pipeline(data: "Dataset", cfg: "Config") -> None:
     """
-    Top-level runner:
+    Top-level runner (planning + global steps):
       • build index if needed
-      • iterate BioProjects
-      • per-BP pipeline + per-BP MultiQC + metrics
-      • global MultiQC + optional overall tables
+      • log per-BioProject / per-sample plans
+      • run global MultiQC
+      • optional overall tables (TPM / gene counts)
     """
-    outdir = outdir.expanduser().resolve()
-    error_warnings: list[str] = []
+    # --- Shortcuts ---
+    outdir: Path = cfg.outdir
+    shared: Path = cfg.shared
+    log_path: Path = cfg.log
+    reference: Path = cfg.reference_path
+    tximport_opts = cfg.tximport_opts
 
-    data = df_to_dict(data_df)
+    # --- Header ---
+    log(f"Output directory: {outdir}", log_path)
+    log(f"Mode: {data.mode}", log_path)
 
-    shared = (outdir / 'shared').expanduser().resolve()
-    shared.mkdir(parents=True, exist_ok=True)
-    log_path = (shared / "log.txt").expanduser().resolve()
+    total_samples = len(data)
+    total_done = 0 if cfg.force else len(data.done())
+    log(f"Total samples: {total_samples} | done: {total_done}", log_path)
 
-    with open(log_path, "w", buffering=1) as f:
-        f.write(f"\n===== HULK start {datetime.now().isoformat()} =====\n")
+    if data.mode == "SRR":
+        bp_total = len(data.bioprojects)
+        bp_done = len(data.bp_done())
+        bp_ids = [bp.id for bp in data.bioprojects]
+        log(f"BioProjects ({bp_total}, done {bp_done}): {', '.join(sorted(bp_ids))}", log_path)
 
-    log(f"Loaded {len(data_df)} entries", log_path)
-    log(f"First few rows:\n{data_df.head()}", log_path)
-    log(f"Output directory: {str(outdir)}", log_path)
-
-    # global progress bar
-    total_sras = sum(len(v) for v in data.values())
-    already_done = 0 if overwrite else sum(
-        1 for bp, runs in data.items() for run in runs if is_sra_done(outdir / bp / run[0])
+    # --- Progress bar ---
+    unit = "SRR" if data.mode == "SRR" else "sample"
+    disable_pb = (not cfg.verbose) or (not sys.stdout.isatty())
+    all_bar = tqdm(
+        total=total_samples,
+        desc="All samples",
+        position=1,
+        leave=True,
+        disable=disable_pb,
+        unit=unit,
+        initial=(0 if cfg.force else total_done),
     )
-    disable_pb = (not verbose) or (not sys.stdout.isatty())
-    all_bar = tqdm(total=total_sras, desc="All SRRs", position=1, leave=True,
-                   disable=disable_pb, unit="SRR", initial=already_done)
-    all_durations: list[float] = []
+    all_durations: List[float] = []
 
-    # index
-    if transcriptome.suffix.lower() != '.idx':
-        transcripts_index = build_transcriptome_index(transcriptome, shared, log_path)
+    # --- Build or reuse index ---
+    transcripts_index = (
+        build_transcriptome_index(reference, shared, log_path)
+        if reference.suffix.lower() != ".idx"
+        else reference
+    )
+    log(f"Using index: {transcripts_index}", log_path)
+
+    # --- Plan only (no execution yet) ---
+    if data.mode == "SRR":
+        for bp_id, samples in data.iter_bioprojects():
+            log(f"[PLAN] BioProject {bp_id}: {len(samples)} SRR(s) scheduled.", log_path)
+            # future: pipeline_one_bioproject(bp_id, samples, transcripts_index, ...)
     else:
-        transcripts_index = transcriptome
+        for s in data.samples:
+            log(f"[PLAN] FASTQ sample {s.id} -> {s.outdir}", log_path)
+            # future: process_fastq_sample(s, transcripts_index, ...)
 
-    # per-BP
-    for bioproject, sras in data.items():
-        pipeline_one_bioproject(
-            bioproject, sras, outdir, log_path,
-            min_threads, max_threads, transcripts_index,
-            overwrite, keep_fastq,tx2gene, error_warnings,
-            all_bar, all_durations, disable_pb,trim_opts,tximport_opts
-        )
+    # --- Global MultiQC (fastp + kallisto) ---
+    run_multiqc_global(outdir, shared, "multiqc_shared", log_path, modules=("kallisto", "fastp"))
 
-    # global MultiQC (fastp + kallisto)
-    run_multiqc(outdir, shared, "multiqc_shared", log_path, modules=('kallisto','fastp'))
-
-    # overall tables
-    if overall_table:
-        if tx2gene is not None:
-            global_gene_counts(outdir, tx2gene, log_path, error_warnings, shared / "global_gene_counts.tsv",tximport_opts)
+    # --- Overall tables (optional) ---
+    if cfg.aggregate:
+        if cfg.tx2gene is not None:
+            global_gene_counts(
+                outdir,
+                cfg.tx2gene,
+                log_path,
+                cfg.error_warnings,
+                shared / "global_gene_counts.tsv",
+                tximport_opts,
+            )
         else:
-            merge_all_bioprojects_tpm(outdir, log_path, error_warnings, shared / "overall_TPM.tsv")
+            merge_all_bioprojects_tpm(
+                outdir,
+                log_path,
+                cfg.error_warnings,
+                shared / "overall_TPM.tsv",
+            )
 
-    if error_warnings:
-        log('\n\n===================WARNINGS===================\n', log_path)
-        for m in error_warnings:
+    # --- Warnings (if any) ---
+    if cfg.error_warnings:
+        log("\n\n=================== WARNINGS ===================\n", log_path)
+        for m in cfg.error_warnings:
             log(m, log_path)
 
     all_bar.close()
+

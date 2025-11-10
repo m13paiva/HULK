@@ -76,6 +76,25 @@ def run_multiqc(
         return None
     return out
 
+def run_multiqc_global(in_dir: Path, out_dir: Path, report_name: str, log_path: Path, modules=('kallisto', 'fastp')) -> None:
+    """Generic MultiQC runner (used for the global/shared report)."""
+    in_dir = in_dir.resolve()
+    if not out_dir.is_absolute():
+        out_dir = (in_dir / out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "multiqc", ".",
+        "-o", str(out_dir),
+        "-n", report_name,
+        "--force",
+        "--ignore", "multiqc_*",
+        "--ignore", "*/multiqc_*",
+    ]
+    for m in modules:
+        cmd += ["-m", m]
+    run_cmd(cmd, cwd=in_dir, log_path=log_path)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MultiQC preparation (sanitized inputs so sample IDs are clean)
 # ─────────────────────────────────────────────────────────────────────────────
