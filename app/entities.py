@@ -4,7 +4,7 @@ import json
 import shutil
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 
 FASTQ_EXTS = {".fastq", ".fq", ".fastq.gz", ".fq.gz"}
 
@@ -231,16 +231,31 @@ class BioProject:
         self.samples.append(s)
         return s
 
-    def is_done(self) -> bool:
-        for s in self.samples:
-            status=s.is_done()
-            if status != "done":
-                return False
-        self.status="done"
-        return True
+    def total(self) -> int:
+        """Total number of samples in this bioproject."""
+        return len(self.samples)
 
-    def __repr__(self) -> str:
-        return f"<BioProject id={self.id} n_samples={len(self.samples)}>"
+    def done(self) -> int:
+        """Number of completed samples."""
+        return sum(1 for s in self.samples if s.status == "done")
+
+    def remaining(self) -> int:
+        """Number of unfinished samples."""
+        return sum(1 for s in self.samples if s.status not in {"done", "failed"})
+
+    def update_status(self) -> None:
+        """Refresh project status based on contained samples."""
+        rem = self.remaining()
+        if rem == 0:
+            self.status = "done"
+        elif self.done() > 0:
+            self.status = "active"
+        else:
+            self.status = "pending"
+
+    def __repr__(self):
+        return f"<BioProject id={self.id} status={self.status} samples={len(self.samples)}>"
+
 
 # ------------------------------- Dataset ------------------------------
 
@@ -282,8 +297,6 @@ class Dataset:
         return None
 
     def get_or_create_bioproject(self, bioproject_id: str) -> BioProject:
-        if self.mode != "SRR":
-            raise RuntimeError("BioProjects are only available in SRR mode.")
         bp = self._find_bioproject(bioproject_id)
         if bp is None:
             bp = BioProject(bioproject_id, base_outdir=self.path)
@@ -298,8 +311,7 @@ class Dataset:
         metadata: Optional[Dict[str, Any]] = None,
         status: str = "pending",
     ) -> Sample:
-        if self.mode != "SRR":
-            raise RuntimeError("add_srr() is only valid when Dataset.mode == 'SRR'.")
+
         bp = self.get_or_create_bioproject(bioproject_id)
         s = bp.add_srr(srr_id, metadata=metadata, status=status)
         self.samples.append(s)
@@ -315,8 +327,7 @@ class Dataset:
         metadata: Optional[Dict[str, Any]] = None,
         status: str = "pending",
     ) -> Sample:
-        if self.mode != "FASTQ":
-            raise RuntimeError("add_fastq() is only valid when Dataset.mode == 'FASTQ'.")
+
         target_outdir = Path(outdir) if outdir else self.fastq_root
         target_outdir.mkdir(parents=True, exist_ok=True)
         s = Sample(
@@ -334,10 +345,47 @@ class Dataset:
     def update_status(self):
         if self.mode == "FASTQ":
             for s in self.samples:
-                s.is_done()
-        elif self.mode == "SRR":
+                if s.is_done():
+                    s.status = "done"
+        else:  # SRR
             for bp in self.bioprojects:
-                bp.is_done()
+                for s in bp.samples:
+                    if s.is_done():
+                        s.status = "done"
+                bp.update_status()
+
+    def to_do_pairs(self) -> List[Tuple["BioProject", "Sample"]]:
+        """
+        SRR mode: priority-ordered (bp, sample) needing work.
+        FASTQ mode: not used (call .to_do() instead).
+        """
+        if self.mode != "SRR":
+            return []
+        # keep BP statuses fresh
+        for bp in self.bioprojects:
+            bp.update_status()
+        # fewest remaining first (closes BPs sooner)
+        ordered_bps = sorted(
+            (bp for bp in self.bioprojects if bp.remaining() > 0),
+            key=lambda b: (b.remaining(), b.total(), b.id)
+        )
+        pairs: List[Tuple["BioProject", "Sample"]] = []
+        for bp in ordered_bps:
+            for s in bp.samples:
+                if s.status not in {"done", "failed"}:
+                    pairs.append((bp, s))
+        return pairs
+
+    def to_do(self) -> List["Sample"]:
+        """
+        Unified pending samples list (no tuples).
+        - SRR: returns samples in BP-prioritized order
+        - FASTQ: returns pending FASTQ samples
+        """
+        if self.mode == "SRR":
+            return [s for (_bp, s) in self.to_do_pairs()]
+        # FASTQ
+        return [s for s in self.samples if s.status not in {"done", "failed"}]
 
     def bp_done(self):
         return [bp for bp in self.bioprojects if bp.status == "done"]
@@ -346,13 +394,20 @@ class Dataset:
         return [s for s in self.samples if s.status == "done"]
 
     def to_do(self):
-        return [
-            sample
-            for bp in self.bioprojects
-            if bp.status != "done"
-            for sample in bp.samples
-            if sample.status != "done"
-        ]
+        if self.mode=="SRR":
+            return [
+                sample
+                for bp in self.bioprojects
+                if bp.status != "done"
+                for sample in bp.samples
+                if sample.status != "done"
+                ]
+        if self.mode=="FASTQ":
+            return [
+                sample
+                for sample in self.samples
+                if sample.status != "done"
+                ]
 
 
     # ------------------- Constructors -------------------
