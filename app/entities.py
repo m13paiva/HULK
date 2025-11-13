@@ -196,30 +196,45 @@ class Config:
 
 class Sample:
     def __init__(
-        self,
-        sample_id: str,
-        sample_type: str,                   # "SRR" or "FASTQ"
-        fastq_paths: Optional[List[Path]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        bioproject: Optional["BioProject"] = None,
-        outdir: Optional[Path] = None,
-        status: str = "pending",            # "pending" | "ready" | "processing" | "done" | "failed"
+            self,
+            sample_id: str,
+            sample_type: str,  # "SRR" or "FASTQ"
+            fastq_paths: Optional[List[Path]] = None,
+            metadata: Optional[Dict[str, Any]] = None,
+            bioproject: Optional["BioProject"] = None,
+            outdir: Optional[Path] = None,
+            status: str = "pending",  # "pending" | "ready" | "processing" | "done" | "failed"
     ):
         self.id = str(sample_id)
         self.type = sample_type.upper()
         if self.type not in {"SRR", "FASTQ"}:
             raise ValueError(f"Unsupported sample_type: {sample_type}")
+
+        self.bioproject = bioproject
+
         if self.type == "SRR":
             if bioproject is None:
                 raise ValueError("SRR sample requires a BioProject.")
+            # BP path is already <outdir>/<BP>
             self.outdir = bioproject.path / self.id
         else:
             if outdir is None:
                 raise ValueError("FASTQ sample requires an outdir.")
+            # outdir here is the base for FASTQ mode
             self.outdir = outdir / self.id
+
+        self.outdir.mkdir(parents=True, exist_ok=True)
+
+        # per-sample log
+        self.log_path = self.outdir / f"{self.id}_log.txt"
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.log_path, "w") as f:
+            f.write(f"# Log for Sample {self.id}\n")
+
         self.fastq_paths: List[Path] = list(fastq_paths or [])
         self.metadata: Dict[str, Any] = dict(metadata or {})
         self.status = status
+
         # dynamically set during prefetch if applicable
         self.sra_path: Optional[Path] = None
 
@@ -243,11 +258,21 @@ class Sample:
 
 class BioProject:
     def __init__(self, bioproject_id: str, base_outdir: Optional[Path] = None):
+        if base_outdir is None:
+            raise ValueError("BioProject requires a base_outdir.")
         self.id = str(bioproject_id)
         self.path = base_outdir / self.id
         self.path.mkdir(parents=True, exist_ok=True)
+
         self.status: str = "pending"
         self.samples: List["Sample"] = []
+
+        # per-BioProject log
+        self.log_path = self.path / f"{self.id}_log.txt"
+
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.log_path, "w") as f:
+            f.write(f"# Log for BioProject {self.id}\n")
 
     def add_srr(self, srr_id: str, *, metadata: Optional[Dict[str, Any]] = None, status: str = "pending") -> "Sample":
         s = Sample(
@@ -288,13 +313,13 @@ class BioProject:
           3. tximport gene counts (only if user provided -g)
           4. Read metrics table
         """
-        from .utils import log, log_err
+        from .utils import log, log_err, merge_bioproject_tpm
         from .qc import run_multiqc, build_bp_metrics
-        from .tx2gene import merge_bioproject_tpm, bp_gene_counts
+        from .tx2gene import bp_gene_counts
 
         bp_id = self.id
-        bp_dir = cfg.outdir / bp_id
-        log_path = cfg.log
+        bp_dir = self.path
+        log_path = self.log_path
 
         errors: list[str] = []
 

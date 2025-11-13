@@ -42,7 +42,6 @@ def _bundle_srr(
     cache_dir: Path,
     work_root: Path,
     temp_dir: Path,
-    log_path: Path,
     dump_threads: int = 1,
     fastp_threads: int = 4,
     kallisto_threads: int = 12,
@@ -75,7 +74,7 @@ def _bundle_srr(
             pre_res = prefetch_one(
                 sample,
                 outdir,       # use SRR directory as "cache_dir" → SRR.sra lives here
-                log_path,
+                sample.log_path,
                 overwrite=True,
             )
             if pre_res.get("status") != "prefetched":
@@ -108,7 +107,7 @@ def _bundle_srr(
                 str(tmp),
             ],
             outdir,
-            log_path,
+            sample.log_path,
         )
 
         # detect FASTQs
@@ -140,7 +139,7 @@ def _bundle_srr(
                 "-i", str(fqs[0]),
                 "-o", str(trimmed[0]),
             ]
-        run_cmd(cmd, outdir, log_path)
+        run_cmd(cmd, outdir, sample.log_path)
 
         # CLEANUP STEP 1 — remove *raw* FASTQs immediately after fastp
         for p in fqs:
@@ -164,7 +163,7 @@ def _bundle_srr(
                     str(trimmed[0]), str(trimmed[1]),
                 ],
                 outdir,
-                log_path,
+                sample.log_path,
             )
         else:
             # single-end; generic fragment params; platform-aware presets live in align.py if needed
@@ -180,7 +179,7 @@ def _bundle_srr(
                     str(trimmed[0]),
                 ],
                 outdir,
-                log_path,
+                sample.log_path,
             )
 
         # CLEANUP STEP 2 — remove trimmed FASTQs now that kallisto is done
@@ -196,11 +195,11 @@ def _bundle_srr(
             _rm(sra)
 
         sample.status = "done"
-        log(f"✅ [{srr}] bundle done", log_path)
+        log(f"✅ [{srr}] bundle done", sample.log_path)
         return {"run_id": srr, "status": "done"}
     except Exception as e:
         sample.status = "failed"
-        log(f"❌ [{srr}] failed: {e}", log_path)
+        log(f"❌ [{srr}] failed: {e}", sample.log_path)
         return {"run_id": srr, "status": "failed"}
 
 
@@ -209,7 +208,6 @@ def _process_fastq(
     *,
     cfg: "Config",
     work_root: Path,
-    log_path: Path,
     fastp_threads: int = 4,
     kallisto_threads: int = 12,
 ) -> Dict[str, str]:
@@ -224,7 +222,7 @@ def _process_fastq(
         return {"run_id": sid, "status": "done"}
     except Exception as e:
         sample.status = "failed"
-        log(f"❌ [{sid}] failed: {e}", log_path)
+        log(f"❌ [{sid}] failed: {e}", sample.log_path)
         return {"run_id": sid, "status": "failed"}
 
 
@@ -292,7 +290,6 @@ def run_processing_daemon(
                 cache_dir=cache_dir,
                 work_root=work_root,
                 temp_dir=temp_dir,
-                log_path=log_path,
                 dump_threads=dump_threads,
                 fastp_threads=fastp_threads,
                 kallisto_threads=kallisto_threads,
@@ -302,7 +299,6 @@ def run_processing_daemon(
             kwargs = dict(
                 cfg=cfg,
                 work_root=work_root,
-                log_path=log_path,
                 fastp_threads=fastp_threads,
                 kallisto_threads=kallisto_threads,
             )

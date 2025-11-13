@@ -4,23 +4,45 @@ import os
 import math
 import subprocess
 from pathlib import Path
-from typing import List
+from typing import List, Union, Iterable
 import pandas as pd
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
+LogPathLike = Union[str, Path, Iterable[Union[str, Path]]]
 
-def log(msg: str, log_path: Path) -> None:
-    """Append a single line to the shared log file."""
-    with open(log_path, "a", buffering=1) as f:
-        f.write(str(msg).rstrip() + "\n")
+def _normalize_log_paths(log_path: LogPathLike | None) -> list[Path]:
+    if log_path is None:
+        return []
+    if isinstance(log_path, (str, Path)):
+        return [Path(log_path)]
+    # assume iterable of paths
+    try:
+        return [Path(p) for p in log_path]
+    except TypeError:
+        return [Path(log_path)]
 
-def log_err(error_warnings: list[str], log_path: Path, msg: str) -> None:
-    """Log an error/warning and also append it to `error_warnings`."""
-    log(msg, log_path)
+def log(msg: str, log_path: LogPathLike | None) -> None:
+    """Append a line to one or more log files."""
+    paths = _normalize_log_paths(log_path)
+    if not paths:
+        return
+    line = str(msg).rstrip() + "\n"
+    for p in paths:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "a", buffering=1) as f:
+                f.write(line)
+        except OSError:
+            # disk full / permission errors: nothing else we can do safely
+            continue
+
+def log_err(error_warnings: list[str], log_path: LogPathLike | None, msg: str) -> None:
+    """Record an error message in memory and logs."""
     error_warnings.append(str(msg))
+    log(msg, log_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

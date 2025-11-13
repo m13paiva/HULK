@@ -33,7 +33,7 @@ def _normalize_sra_layout(cache_dir: Path, run_id: str) -> Path:
         shutil.rmtree(alt_dir, ignore_errors=True)
     return sra_file
 
-def prefetch_one(sample: "Sample", cache_dir: Path, log_path: Path, *,
+def prefetch_one(sample: "Sample", cache_dir: Path, *,
                      overwrite=False, retries=3, prefetch_max=PREFETCH_MAX_DEFAULT,
                      cache_high_gb=300, cache_low_gb=250, poll_secs=POLL_SECS_DEFAULT,
                      mode: str = "cache") -> Dict[str, str]:
@@ -50,7 +50,7 @@ def prefetch_one(sample: "Sample", cache_dir: Path, log_path: Path, *,
             cache_high_gb * (1024 ** 3),
             cache_low_gb * (1024 ** 3),
             poll_secs,
-        ).wait_for_window(lambda m: log(m, log_path), run_id)
+        ).wait_for_window(lambda m: log(m, sample.log_path), run_id)
 
     if mode == "cache":
         sra_file = cache_dir / f"{run_id}.sra"
@@ -63,7 +63,7 @@ def prefetch_one(sample: "Sample", cache_dir: Path, log_path: Path, *,
     if mode == "cache" and sra_file.exists() and not overwrite:
         sample.sra_path = sra_file
         sample.status = "prefetched"
-        log(f"[{run_id}] SKIP prefetch: already cached.", log_path)
+        log(f"[{run_id}] SKIP prefetch: already cached.", sample.log_path)
         return {"run_id": run_id, "status": "prefetched", "sra_path": str(sra_file)}
 
     if overwrite:
@@ -86,29 +86,29 @@ def prefetch_one(sample: "Sample", cache_dir: Path, log_path: Path, *,
         attempt += 1
         for i, cmd in enumerate(strategies, 1):
             try:
-                log(f"[{run_id}] prefetch attempt {attempt}.{i} …", log_path)
-                run_cmd(cmd, cache_dir, log_path)
+                log(f"[{run_id}] prefetch attempt {attempt}.{i} …", sample.log_path)
+                run_cmd(cmd, cache_dir, sample.log_path)
                 sra_file = _normalize_sra_layout(cache_dir, run_id)
                 if not sra_file.exists():
                     raise FileNotFoundError(sra_file)
                 sample.sra_path = sra_file
                 sample.status = "prefetched"
-                log(f"✅ Prefetched [{run_id}] → {sra_file.name}", log_path)
+                log(f"✅ Prefetched [{run_id}] → {sra_file.name}", sample.log_path)
                 return {"run_id": run_id, "status": "prefetched", "sra_path": str(sra_file)}
             except subprocess.CalledProcessError as e:
                 last_err = f"prefetch exit {e.returncode}"
-                log(f"[{run_id}] strategy {i} failed: {last_err}", log_path)
+                log(f"[{run_id}] strategy {i} failed: {last_err}", sample.log_path)
             except Exception as e:
                 last_err = str(e)
-                log(f"[{run_id}] strategy {i} error: {last_err}", log_path)
+                log(f"[{run_id}] strategy {i} error: {last_err}", sample.log_path)
 
         if attempt < retries:
             delay = min(60, 2**attempt + random.random())
-            log(f"[{run_id}] retrying in {delay:.1f}s …", log_path)
+            log(f"[{run_id}] retrying in {delay:.1f}s …", sample.log_path)
             time.sleep(delay)
 
     sample.status = "failed"
-    log(f"❌ Prefetch FAILED [{run_id}]: {last_err or 'unknown error'}", log_path)
+    log(f"❌ Prefetch FAILED [{run_id}]: {last_err or 'unknown error'}", sample.log_path)
     return {"run_id": run_id, "status": "failed", "sra_path": str(sra_file)}
 
 def prefetch(dataset: "Dataset", cache_dir: Path, log_path: Path, *,
@@ -129,7 +129,7 @@ def prefetch(dataset: "Dataset", cache_dir: Path, log_path: Path, *,
 
     def task(s: "Sample"):
         return prefetch_one(
-            s, cache_dir, log_path,
+            s, cache_dir,
             overwrite=overwrite, retries=retries,
             prefetch_max=prefetch_max,
             cache_high_gb=cache_high_gb, cache_low_gb=cache_low_gb,
