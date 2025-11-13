@@ -4,7 +4,7 @@ import os
 import math
 import subprocess
 from pathlib import Path
-
+from typing import List
 import pandas as pd
 
 
@@ -141,6 +141,11 @@ def is_sra_done(run_dir: Path) -> bool:
     #return False
     return (run_dir / "abundance.tsv").exists()
 
+def scan_fastqs(directory: Path) -> List[Path]:
+    exts = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
+    files = sorted(p for p in Path(directory).iterdir() if p.is_file() and p.name.lower().endswith(exts))
+    return files
+
 
 def detect_fastq_layout(run_id: str, outdir: Path):
     """
@@ -232,7 +237,9 @@ def merge_all_bioprojects_tpm(output_root: Path, log_path: Path, error_warnings:
         output_file = output_root / "all_bioprojects_TPM.tsv"
     merged.to_csv(output_file, sep="\t", index=False)
 
-
+def pad_desc(name: str, width: int = 14) -> str:
+    """Pad tqdm descriptions so bars line up neatly."""
+    return name.ljust(width)
 
 
 

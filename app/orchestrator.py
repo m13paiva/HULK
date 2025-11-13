@@ -1,116 +1,243 @@
-# orchestrator.py
 from __future__ import annotations
-import os, math
+
+import math
+import os
+import time
 from dataclasses import dataclass
 from threading import Thread
 from pathlib import Path
+from typing import Optional
 
-from .utils import log
+from tqdm.auto import tqdm
+
+from .utils import log, pad_desc
 from .prefetcher import prefetch
-from .processor_daemon import run_processing_daemon
+from .processor import run_processing_daemon
+from .cache_manager import CacheGate
 
-def _cfg(cfg, name, default):
+
+
+def _start_bp_progress(bioprojects,cfg, *, start_position: int = 2, poll_secs: float = 0.5):
+    """Create one tqdm bar per BioProject and return a monitor thread."""
+    bp_bars = {}
+    last_done = {}
+    pos = start_position
+    for bp in bioprojects:
+        total = len(bp.samples)
+        bar = tqdm(total=total, desc=pad_desc(bp.id), unit="SRR", position=pos, leave=True)
+        bp_bars[bp.id] = bar
+        last_done[bp.id] = 0
+        pos += 1
+
+    def _monitor():
+        terminal = {"done", "failed", "skipped"}
+        while True:
+            all_finished = True
+            for bp in bioprojects:
+                done_now = sum(1 for s in bp.samples if getattr(s, "status", None) in terminal)
+                delta = done_now - last_done[bp.id]
+                if delta > 0:
+                    bp_bars[bp.id].update(delta)
+                    last_done[bp.id] = done_now
+                if done_now == len(bp.samples) and getattr(bp, "status", None) != "done":
+                    bp.status = "done"
+                    try:
+                        bp.run_postprocessing(cfg)
+                    except Exception as e:
+                        log(f"[{bp.id}] Postprocessing failed: {e}", cfg.log)
+
+                if done_now < len(bp.samples):
+                    all_finished = False
+            if all_finished:
+                break
+            time.sleep(poll_secs)
+        for bar in bp_bars.values():
+            bar.close()
+
+    t = Thread(target=_monitor, daemon=True)
+    t.start()
+    return bp_bars, t
+
+
+def _cfg(cfg, name, default=None):
     return getattr(cfg, name, default)
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
 
 @dataclass
 class ThreadPlan:
     bundle_concurrency: int
     bundle_threads: int
+    dump_cap: Optional[int]
+    fastp_cap: Optional[int]
+    kallisto_cap: Optional[int]
     prefetch_workers: int
-    total_threads: int
-    reserved_threads: int
-    dump_cap: int | None
-    fastp_cap: int | None
-    kallisto_cap: int | None
+    logical_cpus: int
+    user_max_threads: Optional[int]
+    reserved_for_os: int
+    usable_threads: int
+
 
 def _plan_threads(cfg) -> ThreadPlan:
-    total = int(_cfg(cfg, "threads", _cfg(cfg, "max_threads", os.cpu_count() or 8)))
-    reserve = min(4, max(1, math.floor(total * 0.10)))
-    avail = max(1, total - reserve)
-
-    # how many bundles in parallel
-    bundles = max(1, int(_cfg(cfg, "max_bundles", 2)))
-
-    # threads per active tool inside the bundle
-    forced_bt = _cfg(cfg, "bundle_threads", None)
-    if forced_bt is not None:
-        bundle_threads = max(1, int(forced_bt))
+    logical = os.cpu_count() or 8
+    reserve_default = _clamp(math.floor(logical * 0.10), 1, min(4, max(1, logical - 1)))
+    user_max = _cfg(cfg, "max_threads", _cfg(cfg, "threads", None))
+    if user_max is not None:
+        user_max = _clamp(int(user_max), 1, logical)
+        usable = logical - reserve_default if user_max > logical - reserve_default else user_max
     else:
-        bundle_threads = max(1, avail // bundles)
+        usable = logical - reserve_default
+    usable = max(1, usable)
 
-    # small, sensible caps (overridable in Config)
-    dump_cap     = _cfg(cfg, "dump_cap", 1)         # fasterq-dump rarely benefits >1
-    fastp_cap    = _cfg(cfg, "fastp_cap", 8)        # fastp scales but with diminishing returns
-    kallisto_cap = _cfg(cfg, "kallisto_cap", 32)    # kallisto scales well up to ~32
+    default_bundles = (1 if usable < 8 else 2 if usable < 24 else 3 if usable < 48 else 4 if usable < 96 else 6)
+    bundles = _clamp(int(_cfg(cfg, "max_bundles", default_bundles)), 1, usable)
 
-    # prefetch is I/O-bound — give leftover lightweight workers (overrideable)
-    default_pf = min(24, max(2, avail - bundles * bundle_threads))
-    prefetch_workers = int(_cfg(cfg, "prefetch_workers", default_pf))
+    forced_bt = _cfg(cfg, "bundle_threads", None)
+    bt = max(1, int(forced_bt)) if forced_bt is not None else max(1, usable // bundles)
+
+    dump_cap     = _cfg(cfg, "dump_cap", 1)
+    fastp_cap    = _cfg(cfg, "fastp_cap", 8)
+    kallisto_cap = _cfg(cfg, "kallisto_cap", 32)
+
+    default_pf = _clamp(max(4, logical // 8), 2, 24)
+    pf_workers = int(_cfg(cfg, "prefetch_workers", default_pf))
 
     return ThreadPlan(
         bundle_concurrency=bundles,
-        bundle_threads=bundle_threads,
-        prefetch_workers=prefetch_workers,
-        total_threads=total,
-        reserved_threads=reserve,
+        bundle_threads=bt,
         dump_cap=None if dump_cap is None else int(dump_cap),
         fastp_cap=None if fastp_cap is None else int(fastp_cap),
         kallisto_cap=None if kallisto_cap is None else int(kallisto_cap),
+        prefetch_workers=pf_workers,
+        logical_cpus=logical,
+        user_max_threads=(int(_cfg(cfg, "max_threads")) if _cfg(cfg, "max_threads", None) is not None else None),
+        reserved_for_os=reserve_default,
+        usable_threads=usable,
     )
 
 def run_download_and_process(
-    dataset: "Dataset",
-    *,
-    cfg: "Config",
-    cache_dir: Path,
-    work_root: Path,
-    temp_dir: Path,
-    log_path: Path,
-    cache_high_gb: int | None = None,
-    cache_low_gb: int | None = None,
+        dataset: "Dataset",
+        *,
+        cfg: "Config",
+        cache_dir: Path,
+        work_root: Path,
+        temp_dir: Path,
+        log_path: Path
 ):
-    cache_high_gb = cache_high_gb or _cfg(cfg, "cache_high_gb", 300)
-    cache_low_gb  = cache_low_gb  or _cfg(cfg, "cache_low_gb", 250)
+    """
+    Orchestrate the two operational modes:
 
-    plan = _plan_threads(cfg)
+      CACHE MODE:
+        • Prefetch thread runs in parallel
+        • Processing daemon consumes cached .sra files
+
+      NO-CACHE MODE (--no-cache):
+        • No prefetch thread
+        • Processing daemon calls prefetch_one() internally per-SRR
+        • Still parallel across bundles
+    """
+
+    # ----------------------------------------
+    # Decide cache mode using CacheGate
+    # ----------------------------------------
+    gate = CacheGate(
+        cache_dir,
+        cfg.cache_high_gb * (1024 ** 3),
+        cfg.cache_low_gb * (1024 ** 3),
+    )
+
+    cache_enabled = not gate.disabled
+    mode = "cache" if cache_enabled else "local"
+
     log(
-        (f"[orchestrator] threads={plan.total_threads} (reserve {plan.reserved_threads}) | "
-         f"bundles={plan.bundle_concurrency} bundle_threads={plan.bundle_threads} | "
-         f"caps(dump={plan.dump_cap},fastp={plan.fastp_cap},kallisto={plan.kallisto_cap}) | "
-         f"prefetch_workers={plan.prefetch_workers} | "
-         f"cache HIGH={cache_high_gb}GB LOW={cache_low_gb}GB"),
+        f"[cache] enabled={cache_enabled}, "
+        f"high={getattr(gate, 'high', 0)}, "
+        f"low={getattr(gate, 'low', 0)}",
         log_path,
     )
 
-    # Start processor first (consumer ready)
+    # ----------------------------------------
+    # Thread planning
+    # ----------------------------------------
+    plan = _plan_threads(cfg)
+    msg_user = "auto" if plan.user_max_threads is None else f"{plan.user_max_threads} (user)"
+
+    log(
+        (
+            f"[orchestrator] CPU: logical={plan.logical_cpus} | reserve(OS)={plan.reserved_for_os} | "
+            f"usable={plan.usable_threads} (max={msg_user}) | "
+            f"bundles={plan.bundle_concurrency} | bundle_threads={plan.bundle_threads} | "
+            f"caps(dump={plan.dump_cap}, fastp={plan.fastp_cap}, kallisto={plan.kallisto_cap}) | "
+            f"prefetch_workers={plan.prefetch_workers} | "
+            f"cache_mode={'ENABLED' if cache_enabled else 'DISABLED'}"
+        ),
+        log_path,
+    )
+
+    # ----------------------------------------
+    # BioProject progress bars
+    # ----------------------------------------
+    if getattr(dataset, "bioprojects", None):
+        _bp_bars, t_bpmon = _start_bp_progress(dataset.bioprojects,cfg, start_position=2, poll_secs=0.5)
+    else:
+        _bp_bars, t_bpmon = {}, None
+
+    # ----------------------------------------
+    # Start PROCESSING daemon
+    # ----------------------------------------
+    # NOTE: processing daemon must receive cache mode
     t_proc = Thread(
         target=run_processing_daemon,
         kwargs=dict(
             dataset=dataset,
+            cfg=cfg,
             cache_dir=cache_dir,
             work_root=work_root,
             temp_dir=temp_dir,
             log_path=log_path,
             max_bundles=plan.bundle_concurrency,
-            bundle_threads=plan.bundle_threads,
-            dump_cap=plan.dump_cap,
-            fastp_cap=plan.fastp_cap,
-            kallisto_cap=plan.kallisto_cap,
+            dump_threads=plan.dump_cap,
+            fastp_threads=min(plan.fastp_cap, plan.bundle_threads),
+            kallisto_threads=min(plan.kallisto_cap, plan.bundle_threads),
         ),
         daemon=True,
     )
     t_proc.start()
 
-    # Prefetch (BP-prioritized list from dataset.to_do(); no-op in FASTQ mode)
-    prefetch(
-        dataset=dataset,
-        cache_dir=cache_dir,
-        log_path=log_path,
-        max_workers=plan.prefetch_workers,
-        cache_high_gb=cache_high_gb,
-        cache_low_gb=cache_low_gb,
-        overwrite=False,
-    )
+    # ----------------------------------------
+    # Start PREFETCH daemon (only in CACHE MODE)
+    # ----------------------------------------
+    if cache_enabled:
+        t_pref = Thread(
+            target=prefetch,
+            kwargs=dict(
+                dataset=dataset,
+                cache_dir=cache_dir,
+                log_path=log_path,
+                max_workers=plan.prefetch_workers,
+                cache_high_gb=cfg.cache_high_gb,
+                cache_low_gb=cfg.cache_low_gb,
+                mode="cache",          # <<< NEW
+            ),
+            daemon=True,
+        )
+        t_pref.start()
+    else:
+        t_pref = None
+
+    # ----------------------------------------
+    # WAIT
+    # ----------------------------------------
+    if t_pref:
+        t_pref.join()
 
     t_proc.join()
+
+    if t_bpmon:
+        t_bpmon.join()
+
     log("[orchestrator] all done", log_path)
+

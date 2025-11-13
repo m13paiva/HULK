@@ -10,7 +10,6 @@ from .utils import (
     run_cmd
 )
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Kallisto fragment length presets by sequencer model
 # ─────────────────────────────────────────────────────────────────────────────
@@ -22,28 +21,28 @@ class FragParams:
 
 _MODEL_PARAMS = MappingProxyType({
     # NovaSeq
-    "ILLUMINA NOVASEQ 6000": FragParams(200, 20),
-    "ILLUMINA NOVASEQ X":    FragParams(200, 20),
-    "ILLUMINA NOVASEQ X PLUS": FragParams(200, 20),
+    "ILLUMINA NOVASEQ 6000":     FragParams(200, 20),
+    "ILLUMINA NOVASEQ X":        FragParams(200, 20),
+    "ILLUMINA NOVASEQ X PLUS":   FragParams(200, 20),
     # HiSeq family
-    "HISEQ X TEN":           FragParams(200, 20),
-    "ILLUMINA HISEQ X":      FragParams(200, 20),
-    "ILLUMINA HISEQ X TEN":  FragParams(200, 20),
-    "ILLUMINA HISEQ 4000":   FragParams(200, 20),
-    "ILLUMINA HISEQ 3000":   FragParams(200, 20),
-    "ILLUMINA HISEQ 2500":   FragParams(200, 20),
-    "ILLUMINA HISEQ 2000":   FragParams(200, 20),
-    "ILLUMINA HISEQ 1500":   FragParams(200, 20),
-    "ILLUMINA HISEQ 1000":   FragParams(200, 20),
+    "HISEQ X TEN":               FragParams(200, 20),
+    "ILLUMINA HISEQ X":          FragParams(200, 20),
+    "ILLUMINA HISEQ X TEN":      FragParams(200, 20),
+    "ILLUMINA HISEQ 4000":       FragParams(200, 20),
+    "ILLUMINA HISEQ 3000":       FragParams(200, 20),
+    "ILLUMINA HISEQ 2500":       FragParams(200, 20),
+    "ILLUMINA HISEQ 2000":       FragParams(200, 20),
+    "ILLUMINA HISEQ 1500":       FragParams(200, 20),
+    "ILLUMINA HISEQ 1000":       FragParams(200, 20),
     # NextSeq
-    "NEXTSEQ 1000":          FragParams(200, 20),
-    "NEXTSEQ 500":           FragParams(200, 20),
-    "NEXTSEQ 550":           FragParams(200, 20),
+    "NEXTSEQ 1000":              FragParams(200, 20),
+    "NEXTSEQ 500":               FragParams(200, 20),
+    "NEXTSEQ 550":               FragParams(200, 20),
     # BGI/MGI
-    "DNBSEQ-G400":           FragParams(170, 15),
-    "DNBSEQ-T7":             FragParams(170, 15),
-    "BGISEQ-500":            FragParams(170, 15),
-    "MGISEQ-2000RS":         FragParams(170, 15),
+    "DNBSEQ-G400":               FragParams(170, 15),
+    "DNBSEQ-T7":                 FragParams(170, 15),
+    "BGISEQ-500":                FragParams(170, 15),
+    "MGISEQ-2000RS":             FragParams(170, 15),
     # Older Illumina GA
     "ILLUMINA GENOME ANALYZER II":  FragParams(160, 20),
     "ILLUMINA GENOME ANALYZER IIX": FragParams(160, 20),
@@ -76,49 +75,79 @@ def get_frag_params(platform: str | None) -> FragParams:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_transcriptome_index(transcriptome: Path, shared: Path, log_path: Path) -> Path:
-    """Build (or rebuild) a kallisto index at <shared>/transcripts.idx."""
+    """Build (or rebuild) a kallisto index at <shared>/transcripts.idx>."""
     idx = shared / 'transcripts.idx'
     run_cmd(["kallisto", "index", "-i", str(idx), str(transcriptome)], shared, log_path)
     return idx
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Kallisto Quant
 # ─────────────────────────────────────────────────────────────────────────────
 
-def kallisto_single_cmd(run_dir: Path, run_id: str, index_path: Path, threads: int,
-                        platform: str | None, log_path, error_warnings) -> list[str]:
+def kallisto_single_cmd(
+    run_dir: Path,
+    run_id: str,
+    index_path: Path,
+    threads: int,
+    platform: str | None,
+    log_path,
+    error_warnings,
+    *,
+    bootstraps: int = 100,   # ← NEW: expose -b
+) -> list[str]:
+    """
+    Build a `kallisto quant` command line for single-end data.
+    Includes --plaintext, --single with inferred fragment length, and -b <bootstraps>.
+    """
     fq = pick_fastq(run_dir, run_id, log_path, error_warnings)
     fl = get_frag_params(platform)
     return [
         "kallisto", "quant",
-        "--plaintext",                 # ← ensure abundance.tsv is written
+        "--plaintext",                 # ensure abundance.tsv is written
         "-i", str(Path(index_path).resolve()),
         "-o", str(run_dir.resolve()),
         "-t", str(threads),
+        "-b", str(int(bootstraps)),
         "--single", "-l", str(fl.mean), "-s", str(fl.sd),
         str(fq.resolve()),
     ]
 
-def kallisto_paired_cmd(run_dir: Path, run_id: str, index_path: Path, threads: int,
-                        log_path, error_warnings) -> list[str]:
+def kallisto_paired_cmd(
+    run_dir: Path,
+    run_id: str,
+    index_path: Path,
+    threads: int,
+    log_path,
+    error_warnings,
+    *,
+    bootstraps: int = 100,   # ← NEW: expose -b
+) -> list[str]:
+    """
+    Build a `kallisto quant` command line for paired-end data.
+    Includes --plaintext and -b <bootstraps>.
+    """
     r1 = pick_fastq(run_dir, f"{run_id}_1", log_path, error_warnings)
     r2 = pick_fastq(run_dir, f"{run_id}_2", log_path, error_warnings)
     return [
         "kallisto", "quant",
-        "--plaintext",                 # ← ensure abundance.tsv is written
+        "--plaintext",                 # ensure abundance.tsv is written
         "-i", str(Path(index_path).resolve()),
         "-o", str(run_dir.resolve()),
         "-t", str(threads),
+        "-b", str(int(bootstraps)),
         str(r1.resolve()), str(r2.resolve()),
     ]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def pick_fastq(run_dir: Path, stem: str, log_path: Path, error_warnings: list[str]) -> Path | None:
+def pick_fastq(run_dir: Path, stem: str, log_path: Path, error_warnings: list[str]) -> Path:
     """
     Prefer trimmed files when present; otherwise fall back to raw and log once.
+    Raises FileNotFoundError if neither trimmed nor raw FASTQ is found.
     """
     for suff in (".trim.fastq.gz", ".trim.fastq"):
         p = run_dir / f"{stem}{suff}"
@@ -130,4 +159,4 @@ def pick_fastq(run_dir: Path, stem: str, log_path: Path, error_warnings: list[st
             log_err(error_warnings, log_path,
                     f"[{stem}] No trimmed FASTQs found in {run_dir}; quantifying on untrimmed reads.")
             return p
-    return None
+    raise FileNotFoundError(f"No FASTQ found for stem '{stem}' in {run_dir}")
