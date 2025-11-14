@@ -147,35 +147,44 @@ def _bundle_srr(
                 _rm(p)
 
         # -------------------------------
-        # kallisto quant on trimmed FASTQs
+        # kallisto quant
         # -------------------------------
-        idx = sample.metadata["kallisto_index"]
+        # Global index path from config: reference.fa → reference.idx
+        idx = cfg.reference_path.with_suffix(".idx")
+
+        # Sanity check (optional but helpful)
+        if not idx.exists():
+            raise FileNotFoundError(f"kallisto index not found at {idx}")
+
         if len(trimmed) == 2:
             # paired-end
             run_cmd(
                 [
                     "kallisto", "quant",
                     "-t", str(kallisto_threads),
+                    "-i", str(idx),
                     "-o", str(outdir),
                     "--plaintext",
                     "-b", str(bootstraps),
-                    idx,
-                    str(trimmed[0]), str(trimmed[1]),
+                    str(trimmed[0]),
+                    str(trimmed[1]),
                 ],
                 outdir,
                 sample.log_path,
             )
         else:
-            # single-end; generic fragment params; platform-aware presets live in align.py if needed
+            # single-end; generic fragment params
             run_cmd(
                 [
                     "kallisto", "quant",
                     "-t", str(kallisto_threads),
+                    "-i", str(idx),
                     "-o", str(outdir),
-                    "--single", "-l", "200", "-s", "20",
+                    "--single",
+                    "-l", "200",
+                    "-s", "20",
                     "--plaintext",
                     "-b", str(bootstraps),
-                    idx,
                     str(trimmed[0]),
                 ],
                 outdir,

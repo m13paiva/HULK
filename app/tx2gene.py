@@ -12,9 +12,36 @@ log_err
 )
 
 
-def _gene_counts(abundance_files: list[Path], sample_names: list[str], tx2gene_path: Path,
-                 mode=None,ignore_tx_version=False) -> pd.DataFrame:
-    """Compute gene-level counts from kallisto outputs with pytximport (quiet mode)."""
+def _gene_counts(
+    abundance_files: list[Path],
+    sample_names: list[str],
+    tx2gene_path: Path,
+    mode=None,
+    ignore_tx_version: bool = False,
+) -> pd.DataFrame:
+    """
+    Compute gene-level counts from kallisto outputs with pytximport (quiet mode).
+
+    mode (user-facing) can be:
+      - "raw_counts"          -> no transform (counts_from_abundance=None)
+      - "scaled_tpm"          -> counts_from_abundance="scaled_tpm"
+      - "length_scaled_tpm"   -> counts_from_abundance="length_scaled_tpm"
+    """
+    # ------------------------ normalize mode ------------------------
+    mode_norm = (mode or "").strip().lower()
+
+    if mode_norm in {"", "raw_counts", "no", "none"}:
+        cfa = None
+    elif mode_norm in {"scaled_tpm", "scaledtpm"}:
+        cfa = "scaled_tpm"
+    elif mode_norm in {"length_scaled_tpm", "lengthscaledtpm"}:
+        cfa = "length_scaled_tpm"
+    else:
+        raise ValueError(
+            "tximport_mode must be one of 'raw_counts', 'scaled_tpm', 'length_scaled_tpm' "
+            f"(got {mode!r})"
+        )
+
     prev_tqdm = os.environ.get("TQDM_DISABLE")
     os.environ["TQDM_DISABLE"] = "1"
     try:
@@ -27,7 +54,7 @@ def _gene_counts(abundance_files: list[Path], sample_names: list[str], tx2gene_p
                     [str(p) for p in abundance_files],
                     data_type="kallisto",
                     transcript_gene_map=str(tx2gene_path),
-                    counts_from_abundance=mode,
+                    counts_from_abundance=cfa,
                     output_type="xarray",
                     return_data=True,
                     existence_optional=False,
@@ -44,6 +71,7 @@ def _gene_counts(abundance_files: list[Path], sample_names: list[str], tx2gene_p
     df = ds["counts"].to_pandas()
     df.columns = sample_names
     return df
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gene count merges

@@ -1,7 +1,7 @@
-# qc.py
-
-import shutil, os
-import ast, json, re
+import os
+import ast
+import json
+import re
 import pandas as pd
 from pathlib import Path
 
@@ -21,54 +21,93 @@ def run_multiqc(
     modules=('kallisto', 'fastp'),
 ) -> Path | None:
     """
-    Build _mqc_inputs/<SRR>/ and invoke MultiQC on those *directories*,
-    explicitly ignoring HDF5 files so the kallisto module keys off
-    run_info.json + abundance.tsv reliably.
+    Run MultiQC directly on the SRR/sample directories inside a BioProject,
+    without creating a _mqc_inputs/ staging area.
+
+    We assume each sample directory may contain:
+      - fastp.json or <RUN>.fastp.json (for fastp module)
+      - run_info.json and/or kallisto logs (for kallisto module)
     """
     bioproject_dir = bioproject_dir.resolve()
-    inputs_root = prepare_mqc_inputs_for_bp(bioproject_dir, log_path, error_warnings)
-    if inputs_root is None:
-        return None
 
-    # Pick SRR dirs that contain run_info.json and abundance.tsv
-    sra_dirs = []
-    missing_msgs = []
-    for d in sorted(p for p in inputs_root.iterdir() if p.is_dir()):
-        has_runinfo = (d / "run_info.json").exists()
-        has_tsv     = (d / "abundance.tsv").exists()
-        if has_runinfo and has_tsv:
-            sra_dirs.append(d)
-        else:
-            reasons = []
-            if not has_runinfo: reasons.append("run_info.json")
-            if not has_tsv:     reasons.append("abundance.tsv")
-            missing_msgs.append(f"{d.name}: missing {', '.join(reasons)}")
-
+    # Candidate sample dirs: immediate subdirs that are not MultiQC outputs
+    sra_dirs = sorted(
+        p for p in bioproject_dir.iterdir()
+        if p.is_dir() and not p.name.startswith("multiqc_")
+    )
     if not sra_dirs:
-        log_err(error_warnings, log_path,
-                f"[MultiQC sanitize] No complete SRR dirs under {inputs_root}.\n" +
-                ("\n".join(missing_msgs) if missing_msgs else ""))
+        log_err(
+            error_warnings,
+            log_path,
+            f"[MultiQC] No sample directories found under {bioproject_dir}"
+        )
         return None
 
-    log(f"[MultiQC sanitize] Using {len(sra_dirs)} SRR dirs for parsing", log_path)
+    # Quick scan: how many dirs have fastp / kallisto inputs?
+    n_fastp = 0
+    n_kallisto = 0
+
+    for d in sra_dirs:
+        run_id = d.name
+
+        # ---- fastp candidates ----
+        # try <RUN>.fastp.json, fastp.json, then any *.fastp.json
+        fjson_candidates = [
+            d / f"{run_id}.fastp.json",
+            d / "fastp.json",
+        ]
+        hits = [p for p in fjson_candidates if p.exists()]
+        if not hits:
+            hits = list(d.glob("*.fastp.json"))
+        if hits:
+            n_fastp += 1
+
+        # ---- kallisto candidates ----
+        has_kallisto = False
+
+        # These are useful for metrics and some MultiQC behaviours
+        if (d / "run_info.json").exists() or (d / "abundance.tsv").exists():
+            has_kallisto = True
+
+        # And any log that likely contains kallisto stdout
+        if not has_kallisto:
+            log_hits = list(d.glob("kallisto*.log")) + list(d.glob("*_log.txt"))
+            if log_hits:
+                has_kallisto = True
+
+        if has_kallisto:
+            n_kallisto += 1
+
+    if n_fastp == 0 and n_kallisto == 0:
+        log_err(
+            error_warnings,
+            log_path,
+            f"[MultiQC] No fastp or kallisto inputs detected under {bioproject_dir}"
+        )
+        return None
+
+    log(
+        f"[MultiQC] Detected fastp={n_fastp}, kallisto={n_kallisto} candidate dirs under {bioproject_dir}",
+        log_path,
+    )
 
     report_name = f"multiqc_{bioproject_dir.name}"
     cmd = [
         "multiqc",
-        *map(str, sra_dirs),          # ← pass directories, not individual files
+        *map(str, sra_dirs),
         "-o", str(bioproject_dir),
         "-n", report_name,
         "--force",
         "--ignore", "multiqc_*",
         "--ignore", "*/multiqc_*",
-        "--ignore", "*.h5",           # ← stop kallisto module from touching HDF5
-        "-v",                         # helpful verbosity in your log
+        "--ignore", "*.h5",  # keep kallisto module focused on text/logs
+        "-v",
     ]
     for m in modules:
         cmd += ["-m", m]
 
-    # Run from _mqc_inputs (not strictly required, but keeps paths short)
-    run_cmd(cmd, cwd=inputs_root, log_path=log_path)
+    # Run from the BioProject directory
+    run_cmd(cmd, cwd=bioproject_dir, log_path=log_path)
 
     out = bioproject_dir / f"{report_name}_data"
     if not out.exists():
@@ -76,7 +115,14 @@ def run_multiqc(
         return None
     return out
 
-def run_multiqc_global(in_dir: Path, out_dir: Path, report_name: str, log_path: Path, modules=('kallisto', 'fastp')) -> None:
+
+def run_multiqc_global(
+    in_dir: Path,
+    out_dir: Path,
+    report_name: str,
+    log_path: Path,
+    modules=('kallisto', 'fastp')
+) -> None:
     """Generic MultiQC runner (used for the global/shared report)."""
     in_dir = in_dir.resolve()
     if not out_dir.is_absolute():
@@ -90,115 +136,16 @@ def run_multiqc_global(in_dir: Path, out_dir: Path, report_name: str, log_path: 
         "--force",
         "--ignore", "multiqc_*",
         "--ignore", "*/multiqc_*",
+        "--ignore", "*.h5",
     ]
     for m in modules:
         cmd += ["-m", m]
     run_cmd(cmd, cwd=in_dir, log_path=log_path)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MultiQC preparation (sanitized inputs so sample IDs are clean)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _safe_link_or_copy(src: Path, dst: Path, log_path: Path) -> None:
-    """Hard-link if possible; fall back to symlink/copy. Always logs action."""
-    try:
-        if dst.exists() or dst.is_symlink():
-            dst.unlink()
-        os.link(src, dst)
-        log(f"[MultiQC] Hard-linked {src} -> {dst}", log_path)
-        return
-    except Exception as e:
-        try:
-            if dst.exists() or dst.is_symlink():
-                dst.unlink()
-            os.symlink(src, dst)
-            log(f"[MultiQC] Symlinked {src} -> {dst}", log_path)
-            return
-        except Exception as e2:
-            shutil.copy2(src, dst)
-            log(f"[MultiQC] Copied {src} -> {dst} (hardlink/symlink failed: {e}; {e2})", log_path)
-
-def prepare_mqc_inputs_for_bp(
-    bioproject_dir: Path,
-    log_path: Path,
-    error_warnings: list[str],
-) -> Path | None:
-    """
-    Create <bioproject_dir>/_mqc_inputs/<RUN> with:
-      - run_info.json
-      - abundance.tsv (and abundance.h5 if present)
-      - <RUN>.fastp.json
-    Returns the path, or None if nothing was prepared.
-    """
-    tmp_root = bioproject_dir / "_mqc_inputs"
-    if tmp_root.exists():
-        shutil.rmtree(tmp_root)
-    tmp_root.mkdir(parents=True, exist_ok=True)
-
-    n_fastp = 0
-    n_kallisto = 0
-
-    for sra_dir in sorted(p for p in bioproject_dir.iterdir() if p.is_dir()):
-        run_id = sra_dir.name
-        dst = tmp_root / run_id
-        dst.mkdir(parents=True, exist_ok=True)
-
-        # fastp json (prefer exact; otherwise any *.fastp.json)
-        fjson = sra_dir / f"{run_id}.fastp.json"
-        if not fjson.exists():
-            hits = list(sra_dir.glob("*.fastp.json"))
-            fjson = hits[0] if hits else None
-        if fjson and fjson.exists():
-            _safe_link_or_copy(fjson, dst / fjson.name, log_path)
-            n_fastp += 1
-        else:
-            log_err(error_warnings, log_path, f"[{run_id}] Missing fastp JSON; fastp totals may be absent in MultiQC")
-
-        # kallisto: expose stdout log (what MultiQC actually parses) + run_info/abundance
-        have_k = False
-
-        runinfo = sra_dir / "run_info.json"
-        if runinfo.exists():
-            _safe_link_or_copy(runinfo, dst / "run_info.json", log_path)
-            have_k = True
-
-        for name in ("abundance.tsv", "abundance.h5"):
-            src = sra_dir / name
-            if src.exists():
-                _safe_link_or_copy(src, dst / name, log_path)
-                have_k = True
-
-        # Also copy the kallisto stdout log so MultiQC can detect the module
-        # Your pipeline writes: outdir / f"kallisto_{run_id}.log"
-        klog = sra_dir / f"kallisto_{run_id}.log"
-        if not klog.exists():
-            # Fallback: grab any plausible kallisto log in the SRA dir
-            hits = list(sra_dir.glob("kallisto*.log"))
-            if hits:
-                klog = hits[0]
-        if klog.exists():
-            _safe_link_or_copy(klog, dst / klog.name, log_path)
-            have_k = True
-
-        if have_k:
-            n_kallisto += 1
-
-        else:
-            log_err(error_warnings, log_path, f"[{run_id}] Missing kallisto run_info.json and abundance file")
-
-    if (n_fastp + n_kallisto) == 0:
-        log_err(error_warnings, log_path, f"[MultiQC sanitize] No inputs prepared in {bioproject_dir}")
-        shutil.rmtree(tmp_root, ignore_errors=True)
-        return None
-
-    log(f"[MultiQC sanitize] Prepared fastp={n_fastp}, kallisto={n_kallisto} under {tmp_root}", log_path)
-    return tmp_root
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MultiQC-derived read metrics (strict with fallback)
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def build_bp_metrics(
     bp_id: str,
@@ -243,13 +190,6 @@ def build_bp_metrics(
             return int(round(float(x)))
         except Exception:
             return pd.NA
-
-    def _close(a, b, rtol=0.05):
-        # relative closeness with tolerance
-        try:
-            return (pd.notna(a) and pd.notna(b) and abs(int(a) - int(b)) <= rtol * max(1, int(b)))
-        except Exception:
-            return False
 
     bp_id = str(bp_id)
     bioproject_dir = Path(bioproject_dir)
@@ -324,9 +264,8 @@ def build_bp_metrics(
                 _log_err(f"[{bp_id}] Failed parsing {ri}: {e}")
         return rows
 
-    rows = []
-    rows += _harvest_runinfo(bioproject_dir / "_mqc_inputs")  # sanitized inputs
-    rows += _harvest_runinfo(bioproject_dir)                  # raw SRR dirs (fallback)
+    # Now we only look in the BioProject SRR dirs (no _mqc_inputs anymore)
+    rows = _harvest_runinfo(bioproject_dir)
 
     if rows:
         k_df = pd.DataFrame(rows, columns=["Sample","pseudoaligned_reads","_n_processed"])
@@ -347,20 +286,22 @@ def build_bp_metrics(
         return pd.DataFrame(columns=["Sample","total_reads","high_quality_reads","pseudoaligned_reads"])
 
     # ---------- ADJUST COUNTS TO FRAGMENTS WHEN DEFINITELY PAIRED ----------
-    # Decide per-row using kallisto ground truth (5% tolerance).
-    # If ambiguous or n_processed missing, leave as-is (assume single-end / already fragment-scale).
     try:
-        # Work on local copies to avoid pandas warnings
         tr = out["total_reads"].astype("Int64")
         hq = out["high_quality_reads"].astype("Int64")
         np_ = out["_n_processed"].astype("Int64")
 
-        # Vectorized paired/single detection
-        paired_mask  = hq.notna() & np_.notna() & hq.apply(lambda x: False if pd.isna(x) else True) & np_.apply(lambda x: False if pd.isna(x) else True)
-        paired_mask  = paired_mask & (abs(hq - (2 * np_)) <= (0.05 * (2 * np_.astype("float")))).fillna(False)
+        # paired if hq ~= 2 * n_processed (5% tolerance)
+        paired_mask  = hq.notna() & np_.notna()
+        paired_mask  = paired_mask & (
+            (abs(hq - (2 * np_)) <= (0.05 * (2 * np_.astype("float"))))
+        ).fillna(False)
 
+        # single if hq ~= 1 * n_processed (5% tolerance)
         single_mask  = hq.notna() & np_.notna()
-        single_mask  = single_mask & (abs(hq - np_) <= (0.05 * np_.astype("float"))).fillna(False)
+        single_mask  = single_mask & (
+            (abs(hq - np_) <= (0.05 * np_.astype("float")))
+        ).fillna(False)
 
         # Halve fastp counts only for confidently paired rows
         idx = paired_mask[paired_mask].index
@@ -370,7 +311,7 @@ def build_bp_metrics(
     except Exception as e:
         _log_err(f"[{bp_id}] Failed while adjusting paired-end counts: {e}")
 
-    # Drop helper (kallisto processed) before writing
+    # Drop helper column before writing
     if "_n_processed" in out.columns:
         out = out.drop(columns=["_n_processed"])
 
