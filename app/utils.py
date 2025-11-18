@@ -205,8 +205,11 @@ def detect_fastq_layout(run_id: str, outdir: Path):
 # TPM merges
 # ─────────────────────────────────────────────────────────────────────────────
 
-def merge_bioproject_tpm(bioproject_dir: Path, log_path: Path, error_warnings: list[str], output_file: Path | None = None) -> None:
+def merge_bioproject_tpm(bp,cfg, output_file: Path | None = None) -> None:
     """Merge all kallisto TPMs for one BP into a single TSV."""
+    bioproject_dir = bp.path
+    log_path = bp.log_path
+    error_warnings = cfg.error_warnings
     abundance_files = list(bioproject_dir.glob("*/abundance.tsv"))
     if not abundance_files:
         log_err(error_warnings, log_path, f"No abundance.tsv found in {bioproject_dir}")

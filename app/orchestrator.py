@@ -17,46 +17,92 @@ from .cache_manager import CacheGate
 
 
 
-def _start_bp_progress(bioprojects,cfg, *, start_position: int = 2, poll_secs: float = 0.5):
+def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: float = 0.5):
     """Create one tqdm bar per BioProject and return a monitor thread."""
     bp_bars = {}
     last_done = {}
     pos = start_position
+
+    terminal = {"done", "failed", "skipped"}
+
+    # -------------------------------
+    # Create bars with initial offset
+    # -------------------------------
     for bp in bioprojects:
         total = len(bp.samples)
-        bar = tqdm(total=total, desc=pad_desc(bp.id), unit="SRR", position=pos, leave=True)
+
+        bar = tqdm(
+            total=total,
+            desc=pad_desc(bp.id),
+            unit="SRR",
+            position=pos,
+            leave=True,
+            mininterval=0,
+        )
+
+        # initial offset = already completed samples
+        init = sum(
+            1 for s in bp.samples
+            if getattr(s, "status", None) in terminal
+        )
+        if init:
+            bar.update(init)
+            bar.refresh()
+
         bp_bars[bp.id] = bar
-        last_done[bp.id] = 0
+        last_done[bp.id] = init
         pos += 1
 
+    # -------------------------------
+    # Monitor thread to update bars
+    # -------------------------------
     def _monitor():
-        terminal = {"done", "failed", "skipped"}
+        # Track which BPs have already had postprocessing run in THIS pipeline run
+        already_postprocessed = set()
+
         while True:
             all_finished = True
             for bp in bioprojects:
-                done_now = sum(1 for s in bp.samples if getattr(s, "status", None) in terminal)
+                done_now = sum(
+                    1 for s in bp.samples
+                    if getattr(s, "status", None) in terminal
+                )
                 delta = done_now - last_done[bp.id]
+
                 if delta > 0:
                     bp_bars[bp.id].update(delta)
+                    bp_bars[bp.id].refresh()
                     last_done[bp.id] = done_now
-                if done_now == len(bp.samples) and getattr(bp, "status", None) != "done":
+
+                # All samples terminal -> run postprocessing ONCE per run
+                if done_now == len(bp.samples) and bp.id not in already_postprocessed:
+                    # optional: keep status for humans
                     bp.status = "done"
                     try:
                         bp.run_postprocessing(cfg)
                     except Exception as e:
-                        log(f"[{bp.id}] Postprocessing failed: {e}", cfg.log)
+                        log(f"[{bp.id}] Postprocessing failed: {e}", bp.log_path)
+                    finally:
+                        already_postprocessed.add(bp.id)
 
                 if done_now < len(bp.samples):
                     all_finished = False
+
             if all_finished:
                 break
+
             time.sleep(poll_secs)
+
+        # close at end
         for bar in bp_bars.values():
             bar.close()
 
     t = Thread(target=_monitor, daemon=True)
     t.start()
+
+
     return bp_bars, t
+
 
 
 def _cfg(cfg, name, default=None):

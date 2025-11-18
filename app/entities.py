@@ -90,21 +90,9 @@ class Config:
         self.no_cache: bool = bool(no_cache)
 
         # --------------------------- Directory setup ---------------------------
-        self.outdir.mkdir(parents=True, exist_ok=True)
-
         self.shared = (self.outdir / "shared").resolve()
-        if self.shared.exists() and self.force:
-            shutil.rmtree(self.shared)
-        self.shared.mkdir(parents=True, exist_ok=True)
-
         self.cache = (self.shared / "cache").resolve()
-        if self.cache.exists() and self.force:
-            shutil.rmtree(self.cache)
-        self.cache.mkdir(parents=True, exist_ok=True)
-
         self.log = (self.shared / "log.txt").resolve()
-        with open(self.log, "w", encoding="utf-8") as f:
-            f.write(f"\n===== HULK start {datetime.now().isoformat()} =====\n")
 
     # ======================================================================
     # Internal helpers
@@ -189,6 +177,22 @@ class Config:
             lines.append(f"tx2gene:      {self.tx2gene}")
         return "\n".join(lines)
 
+    def prepare_directories(self) -> None:
+        if self.outdir.exists() and self.force:
+            shutil.rmtree(self.outdir)
+        self.outdir.mkdir(parents=True, exist_ok=True)
+
+        if self.shared.exists() and self.force:
+            shutil.rmtree(self.shared)
+        self.shared.mkdir(parents=True, exist_ok=True)
+
+        if self.cache.exists() and self.force:
+            shutil.rmtree(self.cache)
+        self.cache.mkdir(parents=True, exist_ok=True)
+
+        with open(self.log, "w", encoding="utf-8") as f:
+            f.write(f"\n===== HULK start {datetime.now().isoformat()} =====\n")
+
     def __repr__(self) -> str:
         return f"<Config output={self.outdir} threads={self.min_threads}-{self.max_threads}>"
 
@@ -203,7 +207,9 @@ class Sample:
             metadata: Optional[Dict[str, Any]] = None,
             bioproject: Optional["BioProject"] = None,
             outdir: Optional[Path] = None,
-            status: str = "pending",  # "pending" | "ready" | "processing" | "done" | "failed"
+            status: str = "pending",  # "pending" | "ready" | "processing" | "done" | "failed" | "prefetched"
+            cache_dir: Optional[Path] = None,
+            no_cache: bool = False,
     ):
         self.id = str(sample_id)
         self.type = sample_type.upper()
@@ -212,31 +218,63 @@ class Sample:
 
         self.bioproject = bioproject
 
+        # -------------------------
+        # Decide per-sample outdir
+        # -------------------------
         if self.type == "SRR":
             if bioproject is None:
                 raise ValueError("SRR sample requires a BioProject.")
-            # BP path is already <outdir>/<BP>
             self.outdir = bioproject.path / self.id
         else:
             if outdir is None:
                 raise ValueError("FASTQ sample requires an outdir.")
-            # outdir here is the base for FASTQ mode
             self.outdir = outdir / self.id
 
         self.outdir.mkdir(parents=True, exist_ok=True)
 
         # per-sample log
         self.log_path = self.outdir / f"{self.id}_log.txt"
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.log_path, "w") as f:
-            f.write(f"# Log for Sample {self.id}\n")
+        if not self.log_path.exists():
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.log_path, "w") as f:
+                f.write(f"# Log for Sample {self.id}\n")
 
         self.fastq_paths: List[Path] = list(fastq_paths or [])
         self.metadata: Dict[str, Any] = dict(metadata or {})
         self.status = status
 
-        # dynamically set during prefetch if applicable
+        # dynamically set during prefetch / detection
         self.sra_path: Optional[Path] = None
+
+        # ------------------------------------------------------
+        # Auto-detect state from disk (done / prefetched)
+        # ------------------------------------------------------
+        if self.type == "SRR":
+            # 1) Fully done? (abundance.tsv present)
+            if self.is_done():
+                # is_done() already sets status="done"
+                return
+
+            # 2) Already-prefetched SRA?
+            candidates: List[Path] = []
+
+            # cache mode: shared cache/SRR.sra
+            if not no_cache and cache_dir is not None:
+                candidates.append(cache_dir / f"{self.id}.sra")
+
+            # no-cache or legacy: <BP>/<SRR>/<SRR>.sra
+            candidates.append(self.outdir / f"{self.id}.sra")
+
+            for sra_file in candidates:
+                try:
+                    if sra_file.exists() and sra_file.stat().st_size > 0:
+                        self.sra_path = sra_file
+                        if self.status not in {"done", "failed"}:
+                            self.status = "prefetched"
+                        break
+                except OSError:
+                    # If stat() fails, just ignore and try others
+                    continue
 
     def is_srr(self) -> bool:
         return self.type == "SRR"
@@ -254,10 +292,18 @@ class Sample:
     def __repr__(self) -> str:
         return f"<Sample id={self.id} type={self.type} status={self.status}>"
 
+
+
 # ------------------------------ BioProject ----------------------------
 
 class BioProject:
-    def __init__(self, bioproject_id: str, base_outdir: Optional[Path] = None):
+    def __init__(
+            self,
+            bioproject_id: str,
+            base_outdir: Optional[Path] = None,
+            cache_dir: Optional[Path] = None,
+            no_cache: bool = False,
+    ):
         if base_outdir is None:
             raise ValueError("BioProject requires a base_outdir.")
         self.id = str(bioproject_id)
@@ -267,14 +313,23 @@ class BioProject:
         self.status: str = "pending"
         self.samples: List["Sample"] = []
 
+        # cache settings (for Sample autodetect)
+        self.cache_dir = cache_dir
+        self.no_cache = no_cache
+
         # per-BioProject log
         self.log_path = self.path / f"{self.id}_log.txt"
-
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.log_path, "w") as f:
             f.write(f"# Log for BioProject {self.id}\n")
 
-    def add_srr(self, srr_id: str, *, metadata: Optional[Dict[str, Any]] = None, status: str = "pending") -> "Sample":
+    def add_srr(
+            self,
+            srr_id: str,
+            *,
+            metadata: Optional[Dict[str, Any]] = None,
+            status: str = "pending",
+    ) -> "Sample":
         s = Sample(
             sample_id=srr_id,
             sample_type="SRR",
@@ -283,6 +338,8 @@ class BioProject:
             bioproject=self,
             outdir=None,
             status=status,
+            cache_dir=None if self.no_cache else self.cache_dir,
+            no_cache=self.no_cache,
         )
         self.samples.append(s)
         return s
@@ -305,80 +362,89 @@ class BioProject:
         else:
             self.status = "pending"
 
-    def run_postprocessing(self, cfg):
+    def get_sample_ids(self):
+        return [sample.id for sample in self.samples]
+
+    def run_postprocessing(
+            self,
+            cfg: "Config"
+    ) -> None:
         """
-        Run per-BioProject finalization steps:
-          1. MultiQC
-          2. TPM merge
-          3. tximport gene counts (only if user provided -g)
-          4. Read metrics table
+        Per-BioProject post-processing:
+            • MultiQC (fastp + kallisto)
+            • TPM merge
+            • Gene counts (pytximport)
+            • Read metrics (fastp + run_info.json)
         """
+        bp_dir = self.path
+        log_path = cfg.log
+        errors = cfg.error_warnings
+        if not bp_dir.exists():
+            from .utils import log
+            log(f"[{self.id}] No output directory found; skipping post-processing", log_path)
+            return
+
+        # Internal imports — prevent circular import loops
         from .utils import log, log_err, merge_bioproject_tpm
         from .qc import run_multiqc, build_bp_metrics
         from .tx2gene import bp_gene_counts
 
-        bp_id = self.id
-        bp_dir = self.path
-        log_path = self.log_path
+        run_ids = [s.id for s in self.samples]
 
-        errors: list[str] = []
-
-        log(f"[{bp_id}] === Starting BioProject post-processing ===", log_path)
-
-        # ---------------------------------------------------------
-        # 1) MULTIQC
-        # ---------------------------------------------------------
+        # ─────────────────────────────────────────
+        # 1) MultiQC
+        # ─────────────────────────────────────────
         try:
-            mqc = run_multiqc(bp_dir, log_path, errors)
-            if mqc:
-                log(f"[{bp_id}] MultiQC complete: {mqc}", log_path)
-            else:
-                log_err(errors, log_path, f"[{bp_id}] MultiQC returned no output")
+            mqc_data = run_multiqc(
+                self,
+                cfg,
+                modules=("kallisto", "fastp"),
+            )
+            if mqc_data is None:
+                log(f"[{self.id}] MultiQC returned no output", log_path)
         except Exception as e:
-            log_err(errors, log_path, f"[{bp_id}] MultiQC failed: {e}")
+            log_err(errors, log_path, f"[{self.id}] MultiQC failed: {e}")
+            mqc_data = None
 
-        # ---------------------------------------------------------
-        # 2) TPM MERGE (always run)
-        # ---------------------------------------------------------
+        # ─────────────────────────────────────────
+        # 2) TPM merge
+        # ─────────────────────────────────────────
         try:
-            merge_bioproject_tpm(bp_dir, log_path, errors)
-            log(f"[{bp_id}] TPM merge complete.", log_path)
+            merge_bioproject_tpm(
+                self,
+                cfg
+            )
+            log(f"[{self.id}] TPM merge complete.", log_path)
         except Exception as e:
-            log_err(errors, log_path, f"[{bp_id}] TPM merge failed: {e}")
+            log_err(errors, log_path, f"[{self.id}] TPM merge failed: {e}")
 
-        # ---------------------------------------------------------
-        # 3) TXIMPORT GENE COUNTS  (--gene-counts required)
-        # ---------------------------------------------------------
-        if cfg.tx2gene:
-            try:
-                run_ids = [s.id for s in self.samples]
-                bp_gene_counts(
-                    bp_dir,
-                    run_ids,
-                    cfg.tx2gene,
-                    log_path,
-                    errors,
-                    tximport_opts=cfg.tximport_opts,
-                )
-                log(f"[{bp_id}] tximport gene counts complete.", log_path)
-            except Exception as e:
-                log_err(errors, log_path, f"[{bp_id}] tximport gene counts failed: {e}")
-        else:
-            log(f"[{bp_id}] No tx2gene provided → skipping gene counts.", log_path)
-
-        # ---------------------------------------------------------
-        # 4) READ METRICS TABLE (multiqc-derived)
-        # ---------------------------------------------------------
+        # ─────────────────────────────────────────
+        # 3) Gene-level counts
+        # ─────────────────────────────────────────
         try:
-            build_bp_metrics(bp_id, bp_dir, log_path, errors)
-            log(f"[{bp_id}] Read metrics table written.", log_path)
+            bp_gene_counts(
+                self,
+                cfg
+            )
+            log(f"[{self.id}] Gene counts complete.", log_path)
         except Exception as e:
-            log_err(errors, log_path, f"[{bp_id}] read metrics failed: {e}")
+            log_err(errors, log_path, f"[{self.id}] tximport gene counts failed: {e}")
 
-        log(f"[{bp_id}] === BioProject post-processing complete ===", log_path)
+        # ─────────────────────────────────────────
+        # 4) Read metrics table
+        # ─────────────────────────────────────────
+        try:
+            build_bp_metrics(
+                self,
+                cfg,
+                out_tsv=bp_dir / "read_metrics.tsv",
+            )
+            log(f"[{self.id}] Read metrics table written.", log_path)
+        except Exception as e:
+            log_err(errors, log_path, f"[{self.id}] Failed to build read metrics: {e}")
 
-    def __repr__(self):
-        return f"<BioProject id={self.id} status={self.status} samples={len(self.samples)}>"
+        log(f"[{self.id}] === BioProject post-processing complete ===", log_path)
+
 
 # ------------------------------- Dataset ------------------------------
 
@@ -387,8 +453,7 @@ class Dataset:
     Single-mode collection of samples for a run.
     mode: "SRR" (grouped by BioProject) or "FASTQ" (local fastqs)
     """
-    def __init__(self, dataset_id: str, config: "Config", mode: str):
-        self.id = str(dataset_id)
+    def __init__(self, config: "Config", mode: str):
         self.config = config
         self.mode = mode.upper()
         if self.mode not in {"SRR", "FASTQ"}:
@@ -414,7 +479,14 @@ class Dataset:
     def get_or_create_bioproject(self, bioproject_id: str) -> BioProject:
         bp = self._find_bioproject(bioproject_id)
         if bp is None:
-            bp = BioProject(bioproject_id, base_outdir=self.path)
+            cache_dir = getattr(self.config, "cache", None)
+            no_cache = bool(getattr(self.config, "no_cache", False))
+            bp = BioProject(
+                bioproject_id,
+                base_outdir=self.path,
+                cache_dir=None if no_cache else cache_dir,
+                no_cache=no_cache,
+            )
             self.bioprojects.append(bp)
         return bp
 
@@ -446,11 +518,15 @@ class Dataset:
             for s in self.samples:
                 if s.is_done():
                     s.status = "done"
+                else:
+                    s.status = "pending"
         else:
             for bp in self.bioprojects:
                 for s in bp.samples:
                     if s.is_done():
                         s.status = "done"
+                    else:
+                        s.status = "pending"
                 bp.update_status()
 
     def to_do_pairs(self) -> List[Tuple["BioProject", "Sample"]]:
@@ -482,7 +558,7 @@ class Dataset:
 
     @classmethod
     def from_dataframe(cls, df, cfg: "Config") -> "Dataset":
-        ds = cls(dataset_id="run", config=cfg, mode="SRR")
+        ds = cls(config=cfg, mode="SRR")
         for _, row in df.iterrows():
             srr = str(row["Run"])
             bp_id = str(row["BioProject"])

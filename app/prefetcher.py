@@ -114,19 +114,40 @@ def prefetch_one(sample: "Sample", cache_dir: Path, *,
 def prefetch(dataset: "Dataset", cache_dir: Path, log_path: Path, *,
              max_workers=MAX_WORKERS_DEFAULT, retries=3, prefetch_max=PREFETCH_MAX_DEFAULT,
              cache_high_gb=300, cache_low_gb=250, poll_secs=POLL_SECS_DEFAULT,
-             overwrite=False,mode="cache") -> Dict[str, Dict[str,str]]:
-    results: Dict[str, Dict[str,str]] = {}
+             overwrite=False, mode="cache") -> Dict[str, Dict[str, str]]:
+    results: Dict[str, Dict[str, str]] = {}
 
     cache_dir = cache_dir.expanduser().resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    candidates = [s for s in dataset.to_do() if s.type == "SRR"]
-    total = len(candidates)
-    log(f"[prefetch] start: {total} SRR | workers={max_workers} | cache={cache_dir}", log_path)
-
+    # ---- TOTAL SRRs (for progress bar total) ----
+    all_srrs = [
+        s for bp in dataset.bioprojects
+        for s in bp.samples
+        if s.type == "SRR"
+    ]
+    total = len(all_srrs)
     if total == 0:
         return results  # FASTQ mode → nothing to prefetch
 
+    # ---- Pending SRRs (for actual work) ----
+    candidates = [
+        s for s in dataset.to_do()
+        if s.type == "SRR" and s.status != "prefetched"
+    ]
+
+    # ---- Initial offset (already done + already prefetched) ----
+    already_done = sum(1 for s in all_srrs if s.status == "done")
+    already_prefetched = sum(1 for s in all_srrs if s.status == "prefetched")
+    initial_offset = already_done + already_prefetched
+
+    log(
+        f"[prefetch] start: {len(candidates)} SRR to fetch "
+        f"({already_prefetched} already prefetched, {already_done} done) | total={total}",
+        log_path,
+    )
+
+    # ---- Prefetch task wrapper ----
     def task(s: "Sample"):
         return prefetch_one(
             s, cache_dir,
@@ -137,17 +158,44 @@ def prefetch(dataset: "Dataset", cache_dir: Path, log_path: Path, *,
             mode=mode,
         )
 
-    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="prefetch") as ex:
+    # ---- Launch workers ----
+    with ThreadPoolExecutor(max_workers=max_workers,
+                            thread_name_prefix="prefetch") as ex:
         futs = [ex.submit(task, s) for s in candidates]
-        with tqdm(total=total, desc=pad_desc("Prefetch"), unit="SRR", position=0, leave=True) as pbar:
+
+        # ---- Progress bar ----
+        with tqdm(
+            total=total,
+            desc=pad_desc("Prefetch"),
+            unit="SRR",
+            position=0,
+            leave=True,
+            mininterval=0,       # always redraw
+        ) as pbar:
+
+            # Apply initial offset and force redraw
+            if initial_offset:
+                pbar.update(initial_offset)
+                pbar.refresh()
+
+            # Update bar as futures complete
             for fut in as_completed(futs):
                 res = fut.result()
                 results[res["run_id"]] = res
+
                 ok = sum(1 for r in results.values() if r["status"] == "prefetched")
                 fail = sum(1 for r in results.values() if r["status"] == "failed")
                 pbar.set_postfix(ok=ok, fail=fail)
-                pbar.update(1)
 
-    log(f"[prefetch] done. ok={sum(1 for r in results.values() if r['status']=='prefetched')}, "
-        f"fail={sum(1 for r in results.values() if r['status']=='failed')}", log_path)
+                pbar.update(1)
+                pbar.refresh()
+
+    log(
+        f"[prefetch] done. ok={sum(1 for r in results.values() if r['status']=='prefetched')}, "
+        f"fail={sum(1 for r in results.values() if r['status']=='failed')}",
+        log_path,
+    )
+
     return results
+
+

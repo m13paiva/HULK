@@ -18,6 +18,8 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
       • run global MultiQC
       • optional aggregation (TPM / gene counts)
     """
+    cfg.prepare_directories()
+    data.update_status()
     outdir: Path = cfg.outdir
     shared: Path = cfg.shared
     cache_dir: Path = cfg.cache

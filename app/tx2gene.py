@@ -77,8 +77,14 @@ def _gene_counts(
 # Gene count merges
 # ─────────────────────────────────────────────────────────────────────────────
 
-def bp_gene_counts(bioproject_dir: Path, sra_ids: list[str], tx2gene: Path, log_path: Path, error_warnings: list[str],tximport_opts=None) -> Path | None:
+def bp_gene_counts(bp,cfg) -> Path | None:
     """Write <bioproject_dir>/gene_counts.tsv (genes × samples). Logs missing SRAs but proceeds."""
+    bioproject_dir = bp.path
+    sra_ids = bp.get_sample_ids()
+    tx2gene = cfg.tx2gene
+    log_path = bp.log_path
+    error_warnings = cfg.error_warnings
+    tximport_opts = cfg.tximport_opts
     files, names = [], []
     for run_id in sra_ids:
         f = bioproject_dir / run_id / "abundance.tsv"

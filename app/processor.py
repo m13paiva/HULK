@@ -122,6 +122,8 @@ def _bundle_srr(
         else:
             fqs = [p for p in (fq1, fq2) if p is not None]
 
+        _rm(sra)
+
         # -------------------------------
         # fastp → trimmed FASTQs
         # -------------------------------
@@ -271,7 +273,25 @@ def run_processing_daemon(
     futures = set()
 
     total = len(dataset)
-    pbar = tqdm(total=total, desc=pad_desc("Processing"), unit="sample", position=1, leave=True)
+
+    # Count already finished samples
+    initial_offset = sum(
+        1 for s in dataset.samples
+        if getattr(s, "status", None) in {"done", "failed", "skipped"}
+    )
+
+    pbar = tqdm(
+        total=total,
+        desc=pad_desc("Processing"),
+        unit="sample",
+        position=1,
+        leave=True,
+        mininterval=0,
+    )
+
+    if initial_offset:
+        pbar.update(initial_offset)
+        pbar.refresh()
 
     def maybe_launch(sample: "Sample"):
         # Only launch when ready
