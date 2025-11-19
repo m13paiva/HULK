@@ -12,7 +12,7 @@ from tqdm.auto import tqdm
 
 from .utils import log, pad_desc
 from .prefetcher import prefetch
-from .processor import run_processing_daemon
+from .processor import process
 from .cache_manager import CacheGate
 
 
@@ -34,7 +34,7 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
         bar = tqdm(
             total=total,
             desc=pad_desc(bp.id),
-            unit="SRR",
+            unit="Sample",
             position=pos,
             leave=True,
             mininterval=0,
@@ -236,7 +236,7 @@ def run_download_and_process(
     # ----------------------------------------
     # NOTE: processing daemon must receive cache mode
     t_proc = Thread(
-        target=run_processing_daemon,
+        target=process,
         kwargs=dict(
             dataset=dataset,
             cfg=cfg,
@@ -256,7 +256,7 @@ def run_download_and_process(
     # ----------------------------------------
     # Start PREFETCH daemon (only in CACHE MODE)
     # ----------------------------------------
-    if cache_enabled:
+    if cache_enabled and dataset.mode == "SRR":
         t_pref = Thread(
             target=prefetch,
             kwargs=dict(

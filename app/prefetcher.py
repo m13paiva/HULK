@@ -167,7 +167,7 @@ def prefetch(dataset: "Dataset", cache_dir: Path, log_path: Path, *,
         with tqdm(
             total=total,
             desc=pad_desc("Prefetch"),
-            unit="SRR",
+            unit="Sample",
             position=0,
             leave=True,
             mininterval=0,       # always redraw

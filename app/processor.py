@@ -237,7 +237,7 @@ def _process_fastq(
         return {"run_id": sid, "status": "failed"}
 
 
-def run_processing_daemon(
+def process(
     dataset: "Dataset",
     *,
     cfg: "Config",
