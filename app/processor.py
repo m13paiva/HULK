@@ -13,6 +13,10 @@ from tqdm.auto import tqdm
 
 from .utils import log, run_cmd, pad_desc
 from .prefetcher import prefetch_one  # ← used in no-cache mode
+from .align import (
+    kallisto_single_cmd,
+    kallisto_paired_cmd,
+)
 
 POLL_SECS = 3.0
 
@@ -122,6 +126,7 @@ def _bundle_srr(
         else:
             fqs = [p for p in (fq1, fq2) if p is not None]
 
+        # remove .sra as soon as we have fastqs on disk
         _rm(sra)
 
         # -------------------------------
@@ -143,60 +148,54 @@ def _bundle_srr(
             ]
         run_cmd(cmd, outdir, sample.log_path)
 
-        # CLEANUP STEP 1 — remove *raw* FASTQs immediately after fastp
+        # CLEANUP STEP 1 — remove *raw* FASTQs produced by fasterq-dump
         for p in fqs:
             if p is not None and p.exists():
                 _rm(p)
 
         # -------------------------------
-        # kallisto quant
+        # kallisto quant (via align.py helpers)
         # -------------------------------
-        # Global index path from config: reference.fa → reference.idx
-        idx = cfg.reference_path.with_suffix(".idx")
-
-        # Sanity check (optional but helpful)
+        idx = Path(cfg.reference_path).resolve()
         if not idx.exists():
             raise FileNotFoundError(f"kallisto index not found at {idx}")
 
+        # Prefer sample's own Model (from input table). Fall back to global seq_tech if needed.
+        platform = None
+        meta = getattr(sample, "metadata", None) or {}
+        platform = meta.get("Model") or meta.get("Platform") or getattr(cfg, "seq_tech", None)
+
         if len(trimmed) == 2:
             # paired-end
-            run_cmd(
-                [
-                    "kallisto", "quant",
-                    "-t", str(kallisto_threads),
-                    "-i", str(idx),
-                    "-o", str(outdir),
-                    "--plaintext",
-                    "-b", str(bootstraps),
-                    str(trimmed[0]),
-                    str(trimmed[1]),
-                ],
-                outdir,
-                sample.log_path,
+            qcmd = kallisto_paired_cmd(
+                run_dir=outdir,
+                run_id=srr,
+                index_path=idx,
+                threads=kallisto_threads,
+                log_path=sample.log_path,
+                error_warnings=cfg.error_warnings,
+                bootstraps=bootstraps,
             )
         else:
-            # single-end; generic fragment params
-            run_cmd(
-                [
-                    "kallisto", "quant",
-                    "-t", str(kallisto_threads),
-                    "-i", str(idx),
-                    "-o", str(outdir),
-                    "--single",
-                    "-l", "200",
-                    "-s", "20",
-                    "--plaintext",
-                    "-b", str(bootstraps),
-                    str(trimmed[0]),
-                ],
-                outdir,
-                sample.log_path,
+            # single-end
+            qcmd = kallisto_single_cmd(
+                run_dir=outdir,
+                run_id=srr,
+                index_path=idx,
+                threads=kallisto_threads,
+                platform=platform,
+                log_path=sample.log_path,
+                error_warnings=cfg.error_warnings,
+                bootstraps=bootstraps,
             )
 
-        # CLEANUP STEP 2 — remove trimmed FASTQs now that kallisto is done
-        for p in trimmed:
-            if p.exists():
-                _rm(p)
+        run_cmd(qcmd, outdir, sample.log_path)
+
+        # CLEANUP STEP 2 — remove trimmed FASTQs unless user requested to keep them
+        if not getattr(cfg, "keep_fastq", False):
+            for p in trimmed:
+                if p.exists():
+                    _rm(p)
 
         # CLEANUP STEP 3 — temp dir for fasterq-dump
         _rm(tmp)
@@ -222,18 +221,119 @@ def _process_fastq(
     fastp_threads: int = 4,
     kallisto_threads: int = 12,
 ) -> Dict[str, str]:
-    """Placeholder for FASTQ-only mode (not yet implemented)."""
+    """
+    FASTQ-only mode:
+      • use sample.fastq_paths (1 = SE, 2 = PE)
+      • fastp → trimmed FASTQs under a per-sample outdir
+      • kallisto quant on trimmed FASTQs using align.py helpers.
+    """
     sid = sample.id
-    outdir = (work_root / sid).resolve()
+
+    # Prefer sample.outdir if already set (e.g. <outdir>/fastq_samples/<sample>),
+    # otherwise fall back to <work_root>/<sample>.
+    outdir = getattr(sample, "outdir", None)
+    if outdir is None:
+        outdir = (work_root / sid).resolve()
+    else:
+        outdir = Path(outdir).resolve()
+
     outdir.mkdir(parents=True, exist_ok=True)
+
+    fqs = list(getattr(sample, "fastq_paths", []) or [])
+    if not fqs:
+        raise FileNotFoundError(f"No FASTQ paths registered for FASTQ sample '{sid}'")
+
+    # how many bootstraps? come from cfg.align settings, default 100
+    bootstraps = int(getattr(cfg, "kallisto_bootstrap", 100))
+
     try:
         sample.status = "processing"
-        # TODO: implement FASTQ-only flow mirroring _bundle_srr
+
+        # -------------------------------
+        # fastp → trimmed FASTQs
+        # -------------------------------
+        # We never touch the original FASTQs (they're user-provided).
+        if len(fqs) == 2:
+            # paired-end: canonical trimmed names <sid>_1.trim.fastq, <sid>_2.trim.fastq
+            trimmed_r1 = outdir / f"{sid}_1.trim.fastq"
+            trimmed_r2 = outdir / f"{sid}_2.trim.fastq"
+            trimmed = [trimmed_r1, trimmed_r2]
+
+            cmd = [
+                "fastp",
+                "-w", str(fastp_threads),
+                "-i", str(fqs[0]),
+                "-I", str(fqs[1]),
+                "-o", str(trimmed_r1),
+                "-O", str(trimmed_r2),
+            ]
+        elif len(fqs) == 1:
+            # single-end: canonical trimmed name <sid>.trim.fastq
+            trimmed_se = outdir / f"{sid}.trim.fastq"
+            trimmed = [trimmed_se]
+
+            cmd = [
+                "fastp",
+                "-w", str(fastp_threads),
+                "-i", str(fqs[0]),
+                "-o", str(trimmed_se),
+            ]
+        else:
+            # more than 2 FASTQs per sample is not supported in this simple layout
+            raise ValueError(
+                f"Sample '{sid}' has {len(fqs)} FASTQ files; expected 1 (SE) or 2 (PE)."
+            )
+
+        run_cmd(cmd, outdir, sample.log_path)
+
+        # -------------------------------
+        # kallisto quant (via align.py helpers)
+        # -------------------------------
+        idx = Path(cfg.reference_path).resolve()
+        if not idx.exists():
+            raise FileNotFoundError(f"kallisto index not found at {idx}")
+
+        # In FASTQ mode we rely on global CLI-provided technology
+        platform = getattr(cfg, "seq_tech", None)
+
+        if len(trimmed) == 2:
+            # paired-end
+            qcmd = kallisto_paired_cmd(
+                run_dir=outdir,
+                run_id=sid,
+                index_path=idx,
+                threads=kallisto_threads,
+                log_path=sample.log_path,
+                error_warnings=cfg.error_warnings,
+                bootstraps=bootstraps,
+            )
+        else:
+            # single-end
+            qcmd = kallisto_single_cmd(
+                run_dir=outdir,
+                run_id=sid,
+                index_path=idx,
+                threads=kallisto_threads,
+                platform=platform,
+                log_path=sample.log_path,
+                error_warnings=cfg.error_warnings,
+                bootstraps=bootstraps,
+            )
+
+        run_cmd(qcmd, outdir, sample.log_path)
+
+        # CLEANUP — keep or remove trimmed FASTQs according to cfg.keep_fastq
+        if not getattr(cfg, "keep_fastq", False):
+            for p in trimmed:
+                if p.exists():
+                    _rm(p)
+
         sample.status = "done"
+        log(f"✅ [FASTQ:{sid}] bundle done", sample.log_path)
         return {"run_id": sid, "status": "done"}
     except Exception as e:
         sample.status = "failed"
-        log(f"❌ [{sid}] failed: {e}", sample.log_path)
+        log(f"❌ [FASTQ:{sid}] failed: {e}", sample.log_path)
         return {"run_id": sid, "status": "failed"}
 
 
@@ -352,7 +452,10 @@ def process(
                 maybe_launch(s)
 
             # exit condition
-            if not futures and all(getattr(s, "status", None) in {"done", "failed", "skipped"} for s in dataset.to_do()):
+            if not futures and all(
+                getattr(s, "status", None) in {"done", "failed", "skipped"}
+                for s in dataset.to_do()
+            ):
                 break
 
             time.sleep(poll_secs)

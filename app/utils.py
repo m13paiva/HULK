@@ -201,31 +201,6 @@ def detect_fastq_layout(run_id: str, outdir: Path):
     return "MISSING", None, None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TPM merges
-# ─────────────────────────────────────────────────────────────────────────────
-
-def merge_bioproject_tpm(bp,cfg, output_file: Path | None = None) -> None:
-    """Merge all kallisto TPMs for one BP into a single TSV."""
-    bioproject_dir = bp.path
-    log_path = bp.log_path
-    error_warnings = cfg.error_warnings
-    abundance_files = list(bioproject_dir.glob("*/abundance.tsv"))
-    if not abundance_files:
-        log_err(error_warnings, log_path, f"No abundance.tsv found in {bioproject_dir}")
-        return
-
-    merged = None
-    for ab_file in abundance_files:
-        run_id = ab_file.parent.name
-        df = pd.read_csv(ab_file, sep="\t", usecols=["target_id", "tpm"]).rename(columns={"tpm": run_id})
-        merged = df if merged is None else merged.merge(df, on="target_id", how="outer")
-
-    merged = merged.fillna(0.0)
-    if output_file is None:
-        output_file = bioproject_dir / f"{bioproject_dir.name}_TPM.tsv"
-    merged.to_csv(output_file, sep="\t", index=False)
-
 def smash():
     '''Makes Hulk Smash (easter egg)'''
     VIDEO_PATH = os.environ.get("HULK_SMASH_PATH", "/opt/hulk/hulk_smash.mp4")
@@ -242,25 +217,6 @@ def smash():
         check=False,
         stderr=subprocess.DEVNULL,
     )
-
-
-def merge_all_bioprojects_tpm(output_root: Path, log_path: Path, error_warnings: list[str], output_file: Path | None = None) -> None:
-    """Merge all kallisto TPMs across all BioProjects into <output_root>/all_bioprojects_TPM.tsv."""
-    abundance_files = list(output_root.glob("*/*/abundance.tsv"))
-    if not abundance_files:
-        log_err(error_warnings, log_path, f"No abundance.tsv files found in {output_root}")
-        return
-
-    merged = None
-    for ab_file in abundance_files:
-        run_id = ab_file.parent.name
-        df = pd.read_csv(ab_file, sep="\t", usecols=["target_id", "tpm"]).rename(columns={"tpm": run_id})
-        merged = df if merged is None else merged.merge(df, on="target_id", how="outer")
-
-    merged = merged.fillna(0.0)
-    if output_file is None:
-        output_file = output_root / "all_bioprojects_TPM.tsv"
-    merged.to_csv(output_file, sep="\t", index=False)
 
 def pad_desc(name: str, width: int = 14) -> str:
     """Pad tqdm descriptions so bars line up neatly."""

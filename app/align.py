@@ -1,4 +1,4 @@
-# align.py
+from __future__ import annotations
 
 import re
 from dataclasses import dataclass
@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .utils import (
     log_err,
-    run_cmd
+    run_cmd,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -18,6 +18,7 @@ from .utils import (
 class FragParams:
     mean: int
     sd:   int
+
 
 _MODEL_PARAMS = MappingProxyType({
     # NovaSeq
@@ -57,8 +58,12 @@ _FALLBACK_RULES = [
 ]
 _DEFAULT_PARAMS = FragParams(200, 20)
 
+
 def get_frag_params(platform: str | None) -> FragParams:
-    """Return suggested fragment length params for kallisto --single based on sequencer model."""
+    """
+    Return suggested fragment length params for kallisto --single
+    based on sequencer model / platform string.
+    """
     if not platform:
         return _DEFAULT_PARAMS
     key = platform.strip().upper()
@@ -75,8 +80,16 @@ def get_frag_params(platform: str | None) -> FragParams:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_transcriptome_index(transcriptome: Path, shared: Path, log_path: Path) -> Path:
-    """Build (or rebuild) a kallisto index at <shared>/transcripts.idx>."""
-    idx = shared / 'transcripts.idx'
+    """
+    Build (or rebuild) a kallisto index at <shared>/transcripts.idx.
+
+    NOTE:
+      Typical usage in the new pipeline:
+        • if reference is FASTA → call this once at top-level
+        • then set cfg.reference_path = returned idx
+        • workers only see the index path.
+    """
+    idx = shared / "transcripts.idx"
     run_cmd(["kallisto", "index", "-i", str(idx), str(transcriptome)], shared, log_path)
     return idx
 
@@ -91,20 +104,23 @@ def kallisto_single_cmd(
     index_path: Path,
     threads: int,
     platform: str | None,
-    log_path,
+    log_path: Path,
     error_warnings,
     *,
-    bootstraps: int = 100,   # ← NEW: expose -b
+    bootstraps: int = 100,
 ) -> list[str]:
     """
     Build a `kallisto quant` command line for single-end data.
-    Includes --plaintext, --single with inferred fragment length, and -b <bootstraps>.
+
+    • Prefers trimmed FASTQs (stem.trim.fastq[.gz])
+    • Falls back to raw (stem.fastq[.gz]) with a warning
+    • Includes --plaintext, --single, -l/-s inferred from platform, and -b <bootstraps>.
     """
     fq = pick_fastq(run_dir, run_id, log_path, error_warnings)
     fl = get_frag_params(platform)
     return [
         "kallisto", "quant",
-        "--plaintext",                 # ensure abundance.tsv is written
+        "--plaintext",
         "-i", str(Path(index_path).resolve()),
         "-o", str(run_dir.resolve()),
         "-t", str(threads),
@@ -113,25 +129,29 @@ def kallisto_single_cmd(
         str(fq.resolve()),
     ]
 
+
 def kallisto_paired_cmd(
     run_dir: Path,
     run_id: str,
     index_path: Path,
     threads: int,
-    log_path,
+    log_path: Path,
     error_warnings,
     *,
-    bootstraps: int = 100,   # ← NEW: expose -b
+    bootstraps: int = 100,
 ) -> list[str]:
     """
     Build a `kallisto quant` command line for paired-end data.
-    Includes --plaintext and -b <bootstraps>.
+
+    • Prefers trimmed FASTQs (run_id_1.trim.fastq[.gz], run_id_2.trim.fastq[.gz])
+    • Falls back to raw if needed
+    • Includes --plaintext and -b <bootstraps>.
     """
     r1 = pick_fastq(run_dir, f"{run_id}_1", log_path, error_warnings)
     r2 = pick_fastq(run_dir, f"{run_id}_2", log_path, error_warnings)
     return [
         "kallisto", "quant",
-        "--plaintext",                 # ensure abundance.tsv is written
+        "--plaintext",
         "-i", str(Path(index_path).resolve()),
         "-o", str(run_dir.resolve()),
         "-t", str(threads),
@@ -148,6 +168,12 @@ def pick_fastq(run_dir: Path, stem: str, log_path: Path, error_warnings: list[st
     """
     Prefer trimmed files when present; otherwise fall back to raw and log once.
     Raises FileNotFoundError if neither trimmed nor raw FASTQ is found.
+
+    Recognised patterns:
+      • <stem>.trim.fastq.gz
+      • <stem>.trim.fastq
+      • <stem>.fastq.gz
+      • <stem>.fastq
     """
     for suff in (".trim.fastq.gz", ".trim.fastq"):
         p = run_dir / f"{stem}{suff}"
@@ -156,7 +182,10 @@ def pick_fastq(run_dir: Path, stem: str, log_path: Path, error_warnings: list[st
     for suff in (".fastq.gz", ".fastq"):
         p = run_dir / f"{stem}{suff}"
         if p.exists():
-            log_err(error_warnings, log_path,
-                    f"[{stem}] No trimmed FASTQs found in {run_dir}; quantifying on untrimmed reads.")
+            log_err(
+                error_warnings,
+                log_path,
+                f"[{stem}] No trimmed FASTQs found in {run_dir}; quantifying on untrimmed reads.",
+            )
             return p
     raise FileNotFoundError(f"No FASTQ found for stem '{stem}' in {run_dir}")

@@ -35,7 +35,9 @@ class Config:
         dry_run: bool = False,
         tx2gene: Optional[Path] = None,
         keep_fastq: bool = False,
-        # NEW: feature / tool config that should live *in* Config
+        # NEW: sequencing technology (FASTQ mode)
+        seq_tech: Optional[str] = None,
+        # Existing feature / tool config
         trim_window_size: int = 4,
         trim_mean_quality: int = 20,
         align_method: str = "kallisto",
@@ -44,6 +46,17 @@ class Config:
         tximport_ignore_tx_version: bool = False,
         cache_gb: Optional[int] = None,    # -c/--cache (GiB)
         no_cache: bool = False,            # --no-cache
+        # NEW: DESeq2 / expression matrix / plotting options (used by Seidr subcmd)
+        deseq2_vst_enabled: bool = True,   # main toggle for DESeq2+VST stage
+        expr_use_matrix: str = "vst",      # "vst" or "normalized"
+        drop_nonvarying_genes: bool = True,
+        plot_pca: bool = False,
+        plot_heatmap: bool = False,
+        plot_var_heatmap: bool = False,
+        plots_only_mode: bool = False,
+        tximport_only_mode: bool = False,
+        target_genes_file: Optional[Path] = None,
+        bioproject_filter: Optional[str] = None,
     ):
         # --------------------------- Runtime (CLI) ---------------------------
         self.input_path = Path(input_path).expanduser().resolve() if input_path is not None else None
@@ -59,8 +72,10 @@ class Config:
         self.keep_fastq = keep_fastq
         self.error_warnings: List[str] = []
 
+        # Sequencing tech (mostly relevant in FASTQ mode; passed from CLI)
+        self.seq_tech: Optional[str] = seq_tech
+
         # --------------------------- Persistent JSON ---------------------------
-        # (still available if others want to inspect raw config)
         self.cfg_path = self._resolve_cfg_path()
         self.persisted_cfg = self._load_json_cfg(self.cfg_path)
 
@@ -83,6 +98,36 @@ class Config:
         self.tximport_opts: Dict[str, Any] = {
             "mode": self.tximport_mode,
             "ignore_tx_version": self.tximport_ignore_tx_version,
+        }
+
+        # DESeq2 / expression exports / plotting (used by R script & Seidr subcommand)
+        self.deseq2_vst_enabled: bool = bool(deseq2_vst_enabled)
+
+        self.expr_use_matrix: str = (expr_use_matrix or "vst").lower()
+        if self.expr_use_matrix not in {"vst", "normalized"}:
+            self.expr_use_matrix = "vst"
+
+        self.drop_nonvarying_genes: bool = bool(drop_nonvarying_genes)
+        self.plot_pca: bool = bool(plot_pca)
+        self.plot_heatmap: bool = bool(plot_heatmap)
+        self.plot_var_heatmap: bool = bool(plot_var_heatmap)
+        self.plots_only_mode: bool = bool(plots_only_mode)
+        self.tximport_only_mode: bool = bool(tximport_only_mode)
+        self.target_genes_file = Path(target_genes_file).expanduser().resolve() if target_genes_file else None
+        self.bioproject_filter = bioproject_filter
+
+        # Bundle for the Seidr subcommand / expression-network step
+        self.expr_network_opts: Dict[str, Any] = {
+            "deseq2_vst_enabled": self.deseq2_vst_enabled,
+            "use_matrix": self.expr_use_matrix,
+            "drop_nonvarying": self.drop_nonvarying_genes,
+            "pca": self.plot_pca,
+            "heatmap": self.plot_heatmap,
+            "var_heatmap": self.plot_var_heatmap,
+            "plots_only": self.plots_only_mode,
+            "tximport_only": self.tximport_only_mode,
+            "target_genes": str(self.target_genes_file) if self.target_genes_file else None,
+            "bioproject": self.bioproject_filter,
         }
 
         # cache
@@ -130,10 +175,15 @@ class Config:
         if tool == "tximport":
             return dict(self.tximport_opts)
         if tool == "align":
+            # seq_tech is optional; align/quant code can branch on it if needed
             return {
                 "method": self.align_method,
                 "bootstrap": self.kallisto_bootstrap,
+                "seq_tech": self.seq_tech,
             }
+        if tool == "seidr":
+            # Options used by the Seidr subcommand / R pipeline
+            return dict(self.expr_network_opts)
         return self.persisted_cfg.get(tool, {})
 
     @property
@@ -168,11 +218,24 @@ class Config:
             f"Aggregate:    {self.aggregate}",
             f"Dry run:      {self.dry_run}",
             f"Keep FASTQ:   {self.keep_fastq}",
+            f"Seq. tech:    {self.seq_tech or '-'}",
             f"Trim:         ws={self.trim_window_size}, mq={self.trim_mean_quality}",
             f"Align:        method={self.align_method}, boot={self.kallisto_bootstrap}",
             f"tximport:     mode={self.tximport_mode}, ignore_ver={self.tximport_ignore_tx_version}",
-            f"Cache:        no_cache={self.no_cache}, high={self.cache_high_gb} GiB, low={self.cache_low_gb} GiB",
+            f"DESeq2/VST:   enabled={self.deseq2_vst_enabled}, "
+            f"matrix={self.expr_use_matrix}, drop_nonzvar={self.drop_nonvarying_genes}",
+            f"Plots:        PCA={self.plot_pca}, HM={self.plot_heatmap}, "
+            f"VarHM={self.plot_var_heatmap}, plots_only={self.plots_only_mode}, "
+            f"txi_only={self.tximport_only_mode}",
         ]
+        if self.bioproject_filter or self.target_genes_file:
+            lines.append(
+                f"Expr scope:   bioproject={self.bioproject_filter or '-'}, "
+                f"target_genes={self.target_genes_file or '-'}"
+            )
+        lines.append(
+            f"Cache:        no_cache={self.no_cache}, high={self.cache_high_gb} GiB, low={self.cache_low_gb} GiB",
+        )
         if self.tx2gene:
             lines.append(f"tx2gene:      {self.tx2gene}")
         return "\n".join(lines)
@@ -195,6 +258,7 @@ class Config:
 
     def __repr__(self) -> str:
         return f"<Config output={self.outdir} threads={self.min_threads}-{self.max_threads}>"
+
 
 # ------------------------------- Sample -------------------------------
 
@@ -372,8 +436,7 @@ class BioProject:
         """
         Per-BioProject post-processing:
             • MultiQC (fastp + kallisto)
-            • TPM merge
-            • Gene counts (pytximport)
+            • R-based expression post-processing (tximport / DESeq2 / plots)
             • Read metrics (fastp + run_info.json)
         """
         bp_dir = self.path
@@ -385,9 +448,9 @@ class BioProject:
             return
 
         # Internal imports — prevent circular import loops
-        from .utils import log, log_err, merge_bioproject_tpm
+        from .utils import log, log_err
         from .qc import run_multiqc, build_bp_metrics
-        from .tx2gene import bp_gene_counts
+        from .post_processing import run_postprocessing_bp
 
         run_ids = [s.id for s in self.samples]
 
@@ -407,31 +470,25 @@ class BioProject:
             mqc_data = None
 
         # ─────────────────────────────────────────
-        # 2) TPM merge
+        # 2) R-based BP-level expression post-processing
+        #     - tximport-only if DESeq2 is off / tximport-only mode
+        #     - full DESeq2+VST+plots ("full treatment") if DESeq2 enabled
         # ─────────────────────────────────────────
         try:
-            merge_bioproject_tpm(
-                self,
-                cfg
-            )
-            log(f"[{self.id}] TPM merge complete.", log_path)
+            if getattr(cfg, "tx2gene", None) is not None:
+                counts_path = run_postprocessing_bp(self, cfg)
+                if counts_path is not None:
+                    log(f"[{self.id}] Gene counts complete: {counts_path}", log_path)
+                else:
+                    # Full DESeq2/VST mode or no counts file; still a success if R didn’t error.
+                    log(f"[{self.id}] R post-processing complete (no dedicated gene_counts.tsv).", log_path)
+            else:
+                log(f"[{self.id}] No tx2gene provided; skipping R-based post-processing.", log_path)
         except Exception as e:
-            log_err(errors, log_path, f"[{self.id}] TPM merge failed: {e}")
+            log_err(errors, log_path, f"[{self.id}] R-based BP post-processing failed: {e}")
 
         # ─────────────────────────────────────────
-        # 3) Gene-level counts
-        # ─────────────────────────────────────────
-        try:
-            bp_gene_counts(
-                self,
-                cfg
-            )
-            log(f"[{self.id}] Gene counts complete.", log_path)
-        except Exception as e:
-            log_err(errors, log_path, f"[{self.id}] tximport gene counts failed: {e}")
-
-        # ─────────────────────────────────────────
-        # 4) Read metrics table
+        # 3) Read metrics table
         # ─────────────────────────────────────────
         try:
             build_bp_metrics(
@@ -460,9 +517,12 @@ class Dataset:
             raise ValueError("Dataset mode must be 'SRR' or 'FASTQ'.")
         self.path = config.outdir
         self.path.mkdir(parents=True, exist_ok=True)
+
+        # Root for per-sample outputs in FASTQ mode
         self.fastq_root = self.path / "fastq_samples"
         if self.mode == "FASTQ":
             self.fastq_root.mkdir(parents=True, exist_ok=True)
+
         self.samples: List[Sample] = []
         self.bioprojects: List[BioProject] = []
 
@@ -478,9 +538,9 @@ class Dataset:
 
     def get_or_create_bioproject(self, bioproject_id: str) -> BioProject:
         bp = self._find_bioproject(bioproject_id)
+        cache_dir = getattr(self.config, "cache", None)
+        no_cache = bool(getattr(self.config, "no_cache", False))
         if bp is None:
-            cache_dir = getattr(self.config, "cache", None)
-            no_cache = bool(getattr(self.config, "no_cache", False))
             bp = BioProject(
                 bioproject_id,
                 base_outdir=self.path,
@@ -490,17 +550,38 @@ class Dataset:
             self.bioprojects.append(bp)
         return bp
 
-    def add_srr(self, bioproject_id: str, srr_id: str, *, metadata: Optional[Dict[str, Any]] = None, status: str = "pending") -> Sample:
+    def add_srr(
+        self,
+        bioproject_id: str,
+        srr_id: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        status: str = "pending",
+    ) -> Sample:
         bp = self.get_or_create_bioproject(bioproject_id)
         s = bp.add_srr(srr_id, metadata=metadata, status=status)
         self.samples.append(s)
         return s
 
     # FASTQ helpers
-    def add_fastq(self, sample_id: str, fastq_paths: List[Path], *, outdir: Optional[Path] = None,
-                  metadata: Optional[Dict[str, Any]] = None, status: str = "pending") -> Sample:
+    def add_fastq(
+        self,
+        sample_id: str,
+        fastq_paths: List[Path],
+        *,
+        outdir: Optional[Path] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        status: str = "pending",
+    ) -> Sample:
+        """
+        Register a FASTQ-based sample.
+
+        fastq_paths should contain 1 file (single-end) or 2 files (paired-end);
+        they point to the original FASTQ files (under the user-provided FASTQ root).
+        """
         target_outdir = Path(outdir) if outdir else self.fastq_root
         target_outdir.mkdir(parents=True, exist_ok=True)
+
         s = Sample(
             sample_id=sample_id,
             sample_type="FASTQ",
@@ -536,7 +617,7 @@ class Dataset:
             bp.update_status()
         ordered_bps = sorted(
             (bp for bp in self.bioprojects if bp.remaining() > 0),
-            key=lambda b: (b.remaining(), b.total(), b.id)
+            key=lambda b: (b.remaining(), b.total(), b.id),
         )
         pairs: List[Tuple["BioProject", "Sample"]] = []
         for bp in ordered_bps:
@@ -558,6 +639,10 @@ class Dataset:
 
     @classmethod
     def from_dataframe(cls, df, cfg: "Config") -> "Dataset":
+        """
+        Build a SRR-mode dataset from a metadata dataframe with
+        columns 'Run', 'BioProject', and optionally 'Model'.
+        """
         ds = cls(config=cfg, mode="SRR")
         for _, row in df.iterrows():
             srr = str(row["Run"])
@@ -568,19 +653,58 @@ class Dataset:
 
     @classmethod
     def from_fastq_dir(cls, directory: Path, cfg: "Config") -> "Dataset":
+        """
+        Build a FASTQ-mode dataset from a directory structured as:
+
+            <root>/
+              sampleA/
+                sampleA_R1.fastq.gz
+                sampleA_R2.fastq.gz
+              sampleB/
+                sampleB_R.fastq.gz    # single-end
+
+        Each immediate subdirectory of <root> is treated as one sample.
+        All FASTQ files directly inside that subdirectory are attached
+        to that sample's fastq_paths.
+        """
         directory = Path(directory).expanduser().resolve()
         if not directory.is_dir():
             raise ValueError(f"FASTQ input must be a directory: {directory}")
-        files = sorted(p for p in directory.iterdir() if p.is_file() and _is_fastq(p))
-        if not files:
-            raise ValueError(f"No FASTQ files found in: {directory}")
-        names = [p.name for p in files]
-        if len(set(names)) != len(names):
-            raise ValueError("Duplicate FASTQ filenames detected; filenames must be unique for sample IDs.")
-        ds = cls(dataset_id="run", config=cfg, mode="FASTQ")
-        for f in files:
-            ds.add_fastq(sample_id=f.name, fastq_paths=[f])
+
+        ds = cls(config=cfg, mode="FASTQ")
+
+        sample_dirs = sorted(p for p in directory.iterdir() if p.is_dir())
+        if not sample_dirs:
+            raise ValueError(
+                f"No sample subdirectories found in FASTQ root: {directory}\n"
+                "Expected layout: <root>/<sample_id>/(R1/R2 or R.fastq[.gz])"
+            )
+
+        for sample_dir in sample_dirs:
+            fastqs = sorted(
+                p for p in sample_dir.iterdir()
+                if p.is_file() and _is_fastq(p)
+            )
+            if not fastqs:
+                # You can choose to skip empty dirs instead of raising:
+                raise ValueError(
+                    f"No FASTQ files found in sample directory: {sample_dir}"
+                )
+
+            # sample_id is the folder name
+            sample_id = sample_dir.name
+            ds.add_fastq(sample_id=sample_id, fastq_paths=fastqs)
+
+        if not ds.samples:
+            raise ValueError(
+                f"No FASTQ files found in any subdirectory of: {directory}"
+            )
+
         return ds
 
     def __repr__(self) -> str:
-        return f"<Dataset id={self.id} mode={self.mode} n_samples={len(self.samples)} n_bioprojects={len(self.bioprojects)}>"
+        return (
+            f"<Dataset mode={self.mode} "
+            f"n_samples={len(self.samples)} "
+            f"n_bioprojects={len(self.bioprojects)}>"
+        )

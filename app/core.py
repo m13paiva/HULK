@@ -5,9 +5,9 @@ from pathlib import Path
 from .utils import log
 from .align import build_transcriptome_index
 from .qc import run_multiqc_global
-from .tx2gene import global_gene_counts
 from .entities import Config, Dataset
 from .orchestrator import run_download_and_process
+from .post_processing import run_postprocessing as run_r_postprocessing
 
 
 def pipeline(data: "Dataset", cfg: "Config") -> None:
@@ -83,25 +83,11 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     # Global MultiQC
     run_multiqc_global(outdir, shared, "multiqc_shared", log_path, modules=("kallisto", "fastp"))
 
-    # Aggregation
-    if getattr(cfg, "aggregate", False):
-        if getattr(cfg, "tx2gene", None) is not None:
-            global_gene_counts(
-                outdir,
-                cfg.tx2gene,
-                log_path,
-                cfg.error_warnings,
-                shared / "global_gene_counts.tsv",
-                tximport_opts,
-            )
-        else:
-            from .utils import merge_all_bioprojects_tpm
-            merge_all_bioprojects_tpm(
-                outdir,
-                log_path,
-                cfg.error_warnings,
-                shared / "overall_TPM.tsv",
-            )
+    # Post-processing (R-based: tximport + DESeq2/VST + plots/exports)
+    if getattr(cfg, "tx2gene", None) is not None:
+        # This will respect cfg.deseq2_vst_enabled and the plot flags.
+        # If DESeq2 is disabled, it will automatically fall back to tximport-only.
+        run_r_postprocessing(data, cfg)
 
     # Warnings, if any
     if getattr(cfg, "error_warnings", None):
