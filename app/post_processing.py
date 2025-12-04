@@ -117,7 +117,7 @@ def run_postprocessing_bp(bp, cfg: Config, *, r_script: Path | None = None) -> P
           → tximport-only; R writes <prefix>.tximport_counts.tsv
           → we move that to <BP>/gene_counts.tsv and return that Path.
     """
-    log_path = cfg.log
+    log_path = bp.log_path
     errors = cfg.error_warnings
 
     if cfg.tx2gene is None:

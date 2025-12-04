@@ -97,6 +97,9 @@ TXIMPORT_ONLY     <- isTRUE(opt$tximport_only)
 TARGET_GENES_PATH <- opt$target_genes
 MODE              <- toupper(opt$mode %||% "SRR")
 
+# Per-BioProject mode flag (used to treat plots like FASTQ: sample-centred)
+PER_BP_MODE <- !is.null(BIOPROJECT_ID)
+
 ## Basic sanity check
 if (PLOTS_ONLY && TXIMPORT_ONLY) {
   stop("Cannot use --plots-only together with --tximport-only.")
@@ -179,7 +182,7 @@ write_seidr <- function(M, out_dir, drop_nonvarying = FALSE) {
   genes_path <- file.path(out_dir, "genes.txt")
   readr::write_tsv(M, expr_path, col_names = FALSE)
   readr::write_lines(genes, genes_path)
-  msg("[Seidr] Wrote %s (shape %d x %d) and %s (n=%d)",
+  msg("[ExprExport] Wrote %s (shape %d x %d) and %s (n=%d)",
       expr_path, nrow(M), ncol(M), genes_path, length(genes))
 
   if (drop_nonvarying) {
@@ -189,8 +192,8 @@ write_seidr <- function(M, out_dir, drop_nonvarying = FALSE) {
     genes_f <- file.path(out_dir, "genes.nonzvar.txt")
     readr::write_tsv(Mf, expr_f, col_names = FALSE)
     readr::write_lines(make.unique(colnames(Mf)), genes_f)
-    msg("[Seidr] Dropped %d non-varying genes; kept %d", ncol(M) - ncol(Mf), ncol(Mf))
-    msg("[Seidr] Wrote %s and %s", expr_f, genes_f)
+    msg("[ExprExport] Dropped %d non-varying genes; kept %d", ncol(M) - ncol(Mf), ncol(Mf))
+    msg("[ExprExport] Wrote %s and %s", expr_f, genes_f)
   }
 }
 
@@ -273,8 +276,8 @@ make_plots <- function(vst_mat,
     pca_df <- pca_df %>%
       dplyr::left_join(sample_info, by = "sample")
 
-    if (MODE == "FASTQ") {
-      # FASTQ mode: colour by sample, legend "Samples"
+    if (MODE == "FASTQ" || PER_BP_MODE) {
+      # FASTQ or per-BioProject SRR: colour by sample, legend "Samples"
       p <- ggplot(pca_df, aes(x = PC1, y = PC2, colour = sample)) +
         geom_point(size = 2, alpha = 0.8) +
         theme_bw() +
@@ -283,7 +286,7 @@ make_plots <- function(vst_mat,
           colour = "Samples"
         )
     } else {
-      # SRR mode: colour by BioProject
+      # Global SRR mode: colour by BioProject
       p <- ggplot(pca_df, aes(x = PC1, y = PC2, colour = bioproject)) +
         geom_point(size = 2, alpha = 0.8) +
         theme_bw() +
@@ -299,25 +302,23 @@ make_plots <- function(vst_mat,
 
   ## ---------------- Expression heatmap ----------------
   if (DO_EXPR_HM) {
-    # Decide grouping for columns: BioProject (SRR) vs Samples (FASTQ)
-    if (MODE == "FASTQ") {
-      # FASTQ: order by sample, group by sample
-      ord_samples    <- order(sample_info$sample)
+    # Decide grouping for columns: BioProject (global SRR) vs Samples (FASTQ or per-BP)
+    if (MODE == "FASTQ" || PER_BP_MODE) {
+      # FASTQ and per-BioProject SRR: order/group by sample
+      ord_samples     <- order(sample_info$sample)
       sample_info_ord <- sample_info[ord_samples, , drop = FALSE]
 
       group_vec      <- sample_info_ord$sample
       group_title    <- "Samples"
       legend_suffix  <- ".sample_legend.tsv"
-      legend_colname <- "sample"
     } else {
-      # SRR: order by BioProject then sample, group by BioProject
-      ord_samples    <- order(sample_info$bioproject, sample_info$sample)
+      # Global SRR: order by BioProject then sample, group by BioProject
+      ord_samples     <- order(sample_info$bioproject, sample_info$sample)
       sample_info_ord <- sample_info[ord_samples, , drop = FALSE]
 
       group_vec      <- sample_info_ord$bioproject
       group_title    <- "BioProject group"
       legend_suffix  <- ".bp_legend.tsv"
-      legend_colname <- "bioproject"
     }
 
     grp_levels <- unique(group_vec)
@@ -347,7 +348,7 @@ make_plots <- function(vst_mat,
 
     if (!is.null(heat_mat)) {
       # Legend table written to disk (same folder as heatmap_pdf, i.e. plots/)
-      if (MODE == "FASTQ") {
+      if (MODE == "FASTQ" || PER_BP_MODE) {
         legend_df <- data.frame(
           group_id = group_ids,
           sample   = grp_levels,
@@ -378,6 +379,7 @@ make_plots <- function(vst_mat,
         column_split = group_factor,
         top_annotation = ComplexHeatmap::HeatmapAnnotation(
           group = group_factor,
+          show_annotation_name = FALSE,  # hide the extra "group" label near the bar
           annotation_legend_param = list(
             group = list(
               title  = group_title,
