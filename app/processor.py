@@ -229,8 +229,8 @@ def _process_fastq(
     """
     sid = sample.id
 
-    # Prefer sample.outdir if already set (e.g. <outdir>/fastq_samples/<sample>),
-    # otherwise fall back to <work_root>/<sample>.
+    # Prefer sample.outdir if already set (e.g. <outdir>/samples/<sid>),
+    # otherwise fall back to <work_root>/<sid>.
     outdir = getattr(sample, "outdir", None)
     if outdir is None:
         outdir = (work_root / sid).resolve()
@@ -238,6 +238,7 @@ def _process_fastq(
         outdir = Path(outdir).resolve()
 
     outdir.mkdir(parents=True, exist_ok=True)
+    sample.outdir = outdir
 
     fqs = list(getattr(sample, "fastq_paths", []) or [])
     if not fqs:

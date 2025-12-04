@@ -57,10 +57,10 @@ option_list <- list(
               help = "Generate PCA plot (VST) [default: %default]"),
   make_option(c("--heatmap"), dest = "heatmap",
               action = "store_true", default = FALSE,
-              help = "Generate global / targeted expression heatmap grouped by BioProject [default: %default]"),
+              help = "Generate global / targeted expression heatmap (grouped by BioProject or sample) [default: %default]"),
   make_option(c("--var-heatmap"), dest = "var_heatmap",
               action = "store_true", default = FALSE,
-              help = "Generate gene x BioProject variance heatmap (VST); disabled in --bioproject mode [default: %default]"),
+              help = "Generate gene x BioProject variance heatmap (VST); disabled in --bioproject mode and in FASTQ mode [default: %default]"),
   make_option(c("--plots-only"), dest = "plots_only",
               action = "store_true", default = FALSE,
               help = "Only build PCA/heatmaps from existing VST file; skip tximport/DESeq2/Seidr [default: %default]"),
@@ -69,7 +69,10 @@ option_list <- list(
               help = "Only run tximport and write gene x sample counts table; skip DESeq2, VST, plotting, and Seidr [default: %default]"),
   make_option(c("--target-genes"), dest = "target_genes",
               type = "character", default = NULL,
-              help = "Path to file with target gene IDs (one per line) for targeted plots [default: %default]")
+              help = "Path to file with target gene IDs (one per line) for targeted plots [default: %default]"),
+  make_option(c("--mode"), dest = "mode",
+              type = "character", default = "SRR",
+              help = "Input mode: SRR or FASTQ (affects plot labels and variance heatmap) [default: %default]")
 )
 
 opt <- parse_args(OptionParser(option_list = option_list))
@@ -92,10 +95,17 @@ DO_VAR_HM         <- isTRUE(opt$var_heatmap)
 PLOTS_ONLY        <- isTRUE(opt$plots_only)
 TXIMPORT_ONLY     <- isTRUE(opt$tximport_only)
 TARGET_GENES_PATH <- opt$target_genes
+MODE              <- toupper(opt$mode %||% "SRR")
 
 ## Basic sanity check
 if (PLOTS_ONLY && TXIMPORT_ONLY) {
   stop("Cannot use --plots-only together with --tximport-only.")
+}
+
+## Disable variance heatmap in FASTQ mode regardless of CLI flag
+if (MODE == "FASTQ" && DO_VAR_HM) {
+  message("[VarHeatmap] Disabled in FASTQ mode (--mode=FASTQ).")
+  DO_VAR_HM <- FALSE
 }
 
 ## ===========================
@@ -105,12 +115,12 @@ if (PLOTS_ONLY && TXIMPORT_ONLY) {
 # OUT_DIR is now the root (global: <OUTPUT>/shared; BP: <OUTPUT>/<BioProject>)
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 
-plots_dir   <- file.path(OUT_DIR, "plots")
-deseq2_dir  <- file.path(OUT_DIR, "deseq2")
+plots_dir    <- file.path(OUT_DIR, "plots")
+deseq2_dir   <- file.path(OUT_DIR, "deseq2")
 tximport_dir <- file.path(OUT_DIR, "tximport")
 
-dir.create(plots_dir,   showWarnings = FALSE, recursive = TRUE)
-dir.create(deseq2_dir,  showWarnings = FALSE, recursive = TRUE)
+dir.create(plots_dir,    showWarnings = FALSE, recursive = TRUE)
+dir.create(deseq2_dir,   showWarnings = FALSE, recursive = TRUE)
 dir.create(tximport_dir, showWarnings = FALSE, recursive = TRUE)
 
 # tximport-related
@@ -263,13 +273,25 @@ make_plots <- function(vst_mat,
     pca_df <- pca_df %>%
       dplyr::left_join(sample_info, by = "sample")
 
-    p <- ggplot(pca_df, aes(x = PC1, y = PC2, colour = bioproject)) +
-      geom_point(size = 2, alpha = 0.8) +
-      theme_bw() +
-      labs(
-        title = "PCA (VST-normalized expression)",
-        colour = "BioProject"
-      )
+    if (MODE == "FASTQ") {
+      # FASTQ mode: colour by sample, legend "Samples"
+      p <- ggplot(pca_df, aes(x = PC1, y = PC2, colour = sample)) +
+        geom_point(size = 2, alpha = 0.8) +
+        theme_bw() +
+        labs(
+          title  = "PCA (VST-normalized expression)",
+          colour = "Samples"
+        )
+    } else {
+      # SRR mode: colour by BioProject
+      p <- ggplot(pca_df, aes(x = PC1, y = PC2, colour = bioproject)) +
+        geom_point(size = 2, alpha = 0.8) +
+        theme_bw() +
+        labs(
+          title  = "PCA (VST-normalized expression)",
+          colour = "BioProject"
+        )
+    }
 
     ggsave(pca_pdf, plot = p, width = 6, height = 5)
     msg("[PCA] Saved PCA plot to %s", pca_pdf)
@@ -277,16 +299,31 @@ make_plots <- function(vst_mat,
 
   ## ---------------- Expression heatmap ----------------
   if (DO_EXPR_HM) {
-    # Order samples by BioProject then sample
-    ord_samples <- order(sample_info$bioproject, sample_info$sample)
-    sample_info_ord <- sample_info[ord_samples, , drop = FALSE]
+    # Decide grouping for columns: BioProject (SRR) vs Samples (FASTQ)
+    if (MODE == "FASTQ") {
+      # FASTQ: order by sample, group by sample
+      ord_samples    <- order(sample_info$sample)
+      sample_info_ord <- sample_info[ord_samples, , drop = FALSE]
 
-    # BioProject -> numeric groups
-    bp_vec    <- sample_info_ord$bioproject
-    bp_levels <- unique(bp_vec)
-    group_ids <- seq_along(bp_levels)
-    bp_numeric_factor <- factor(
-      match(bp_vec, bp_levels),
+      group_vec      <- sample_info_ord$sample
+      group_title    <- "Samples"
+      legend_suffix  <- ".sample_legend.tsv"
+      legend_colname <- "sample"
+    } else {
+      # SRR: order by BioProject then sample, group by BioProject
+      ord_samples    <- order(sample_info$bioproject, sample_info$sample)
+      sample_info_ord <- sample_info[ord_samples, , drop = FALSE]
+
+      group_vec      <- sample_info_ord$bioproject
+      group_title    <- "BioProject group"
+      legend_suffix  <- ".bp_legend.tsv"
+      legend_colname <- "bioproject"
+    }
+
+    grp_levels <- unique(group_vec)
+    group_ids  <- seq_along(grp_levels)
+    group_factor <- factor(
+      match(group_vec, grp_levels),
       levels = group_ids,
       labels = as.character(group_ids)
     )
@@ -310,14 +347,23 @@ make_plots <- function(vst_mat,
 
     if (!is.null(heat_mat)) {
       # Legend table written to disk (same folder as heatmap_pdf, i.e. plots/)
-      bp_legend_df <- data.frame(
-        group_id   = group_ids,
-        bioproject = bp_levels,
-        stringsAsFactors = FALSE
-      )
-      legend_path <- sub("\\.pdf$", ".bp_legend.tsv", heatmap_pdf)
-      readr::write_tsv(bp_legend_df, legend_path)
-      msg("[Heatmap] Saved BioProject numeric legend to %s", legend_path)
+      if (MODE == "FASTQ") {
+        legend_df <- data.frame(
+          group_id = group_ids,
+          sample   = grp_levels,
+          stringsAsFactors = FALSE
+        )
+      } else {
+        legend_df <- data.frame(
+          group_id   = group_ids,
+          bioproject = grp_levels,
+          stringsAsFactors = FALSE
+        )
+      }
+
+      legend_path <- sub("\\.pdf$", legend_suffix, heatmap_pdf)
+      readr::write_tsv(legend_df, legend_path)
+      msg("[Heatmap] Saved %s numeric legend to %s", group_title, legend_path)
 
       # Draw heatmap: column_split gives numeric group labels 1..N
       msg("[Heatmap] Saving expression heatmap to %s", heatmap_pdf)
@@ -329,14 +375,14 @@ make_plots <- function(vst_mat,
         show_column_names = FALSE,
         cluster_rows = TRUE,
         cluster_columns = FALSE,
-        column_split = bp_numeric_factor,
+        column_split = group_factor,
         top_annotation = ComplexHeatmap::HeatmapAnnotation(
-          group = bp_numeric_factor,
+          group = group_factor,
           annotation_legend_param = list(
             group = list(
-              title  = "BioProject group",
+              title  = group_title,
               at     = as.character(group_ids),
-              labels = paste(group_ids, bp_levels, sep = " = ")
+              labels = paste(group_ids, grp_levels, sep = " = ")
             )
           )
         ),

@@ -74,6 +74,13 @@ def get_frag_params(platform: str | None) -> FragParams:
             return params
     return _DEFAULT_PARAMS
 
+def list_known_seq_techs() -> list[str]:
+    """
+    Return a sorted list of all known sequencing technologies
+    recognized by HULK for fragment-length presets.
+    """
+    return sorted(_MODEL_PARAMS.keys())
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Kallisto Index

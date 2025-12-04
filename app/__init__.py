@@ -13,4 +13,4 @@ except PackageNotFoundError:  # editable installs during development, or no dist
         # Optional: if you generate/set a version at build time
         from ._version import __version__  # type: ignore
     except Exception:
-        __version__ = "1.0.0"
+        __version__ = "0.0.0"

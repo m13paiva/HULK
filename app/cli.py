@@ -31,33 +31,33 @@ RIGHT_COL = 50
 LOGO_PAD = 20
 
 HELP_BODY = (
-    "HULK is a H(igh-volume b)ulk RNA-seq data preprocessing pipeline for NCBI SRA accessions "
-    "and (optionally) user-provided FASTQ files.\n"
+    "\n\n"
+    "==================================================================================================================================================\n"
+    "HULK is a H(igh-volume b)ulk RNA-seq data preprocessing pipeline for NCBI SRA accessions and user-provided FASTQ files.\n"
     "\n"
-    "SRA mode (recommended for public data):\n"
-    "  Given an input table (CSV/TSV/TXT) with columns 'Run', 'BioProject', and 'Model', HULK will:\n"
-    "    • fetch SRR data (prefetch) with safe resume/overwrite,\n"
-    "    • convert to FASTQ (fasterq-dump),\n"
-    "    • perform QC/trimming with fastp,\n"
-    "    • quantify against a transcriptome using kallisto.\n"
+    "SRA mode (recommended for public data): given an input table (.csv/.tsv/.txt) with columns 'Run', 'BioProject', and 'Model' (this table is easily\n"
+    "obtainable via NCBI's SRA search -> Send to: -> File -> RunInfo. HULK fetches SRR data (prefetch) with safe resume/overwrite, converts to FASTQ\n"
+    "(fasterq-dump), performs QC/trimming with fastp, quantifies against a transcriptome using kallisto, optionally aggregates counts/TPM via tximport,\n"
+    "and can run DESeq2/VST to produce PCA and expression/variance heatmap plots.\n"
     "\n"
-    "FASTQ mode:\n"
-    "  Alternatively, you can pass -i/--input a directory of FASTQ files. In this mode, HULK expects:\n"
-    "    • one subdirectory per sample (e.g. <INPUT>/<sample_id>/...), and\n"
-    "    • within each sample folder either:\n"
-    "        - R1/R2 FASTQs for paired-end reads (filenames containing 'r1' and 'r2'), or\n"
-    "        - a single 'r' FASTQ for single-end reads (filenames containing 'r').\n"
-    "  The pipeline infers library layout (paired vs single) from these patterns.\n"
-    "  Because SRA metadata are not available in FASTQ mode, you MUST specify the sequencing\n"
-    "  technology/platform via --seq-tech (e.g. 'illumina'); this is used to choose sensible\n"
-    "  defaults for kallisto parameters.\n"
+    "FASTQ mode (local FASTQ folders): -i/--input points to a directory where each sample is a subfolder containing 1 (single-end) or 2 (paired-end)\n"
+    "FASTQ files. Because in this mode metadata are not available, you MUST provide the sequencing technology via --seq-tech. The value must match \n"
+    "one of HULK's known platforms and is used to choose sensible fragment-length defaults for kallisto single-end quantification.\n"
     "\n"
-    "The transcriptome may be a compressed FASTA (.fa/.fasta/.fa.gz) or a prebuilt kallisto index (.idx).\n"
-    "If a FASTA is provided, HULK builds a shared index once and reuses it.\n"
+    "Reference transcriptome: -r/--reference accepts a transcriptome FASTA (.fa/.fasta[.gz])or a prebuilt kallisto index (.idx). If a FASTA is\n"
+    "provided, HULK builds a shared index once and reuses it across all samples in the run.\n"
     "\n"
-    "Outputs are organized as <OUTPUT>/<BioProject>/<Run>/ ... A master log is written to <OUTPUT>/shared/log.txt.\n"
-    "Re-runs are safe: completed SRRs are skipped unless --force is given; partial downloads are resumed/cleaned.\n"
+    "Outputs: in SRA mode, results are written under <OUTPUT>/<BioProject>/<Run>/; in FASTQ mode, under <OUTPUT>/fastq_samples/<sample_id>/. In both\n"
+    "cases a shared log is written to <OUTPUT>/shared/log.txt and, when enabled, a shared cache is used for SRA prefetch data management.\n"
+    "\n"
+    "Configuration subcommands: 'trim' persists fastp trimming defaults; 'align' configures alignment/kallisto options (e.g. bootstraps); 'tximport'\n"
+    "configures aggregation/normalization mode; and 'plot' controls global and per-BioProject PCA/heatmap plotting behaviour.\n"
+    "\n"
+    "Re-runs are safe: completed samples are skipped unless --force is given; partial or interrupted runs are cleaned up or resumed when possible.\n"
+    "==================================================================================================================================================\n"
 )
+
+
 
 # ---------------------------- Persisted config I/O ----------------------------
 
@@ -105,19 +105,35 @@ def _pad_block(text: str, n: int) -> str:
     return "\n".join((" " * n) + line for line in lines)
 
 class SpacedFormatterMixin:
-    def _fmt_rows_with_spacing(self, formatter: click.HelpFormatter, title: str, rows: list[tuple[str, str | None]]) -> None:
+    def _fmt_rows_with_spacing(
+            self,
+            formatter: click.HelpFormatter,
+            title: str,
+            rows: list[tuple[str, str | None]],
+    ) -> None:
         rows = [r for r in rows if r]
         if not rows:
             return
+
         formatter.write(f"{title}:\n")
         for i, (left, right) in enumerate(rows):
             left = left or ""
             right = right or ""
             visible_left_len = len(left)
-            gap = (RIGHT_COL - visible_left_len)
+            gap = RIGHT_COL - visible_left_len
             if gap < 2:
                 gap = 2
-            formatter.write(f"  {left}{' ' * gap}{right}\n")
+
+            # Support multi-line right-hand text with proper indentation
+            right_lines = right.splitlines() or [""]
+            first_line = right_lines[0]
+            formatter.write(f"  {left}{' ' * gap}{first_line}\n")
+
+            # Subsequent lines: indent to the same column as the first description
+            indent = "  " + " " * RIGHT_COL
+            for extra in right_lines[1:]:
+                formatter.write(f"{indent}{extra}\n")
+
             if i < len(rows) - 1:
                 formatter.write("\n")
 
@@ -182,12 +198,14 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
     type=click.Path(exists=True, dir_okay=True, path_type=Path),
     required=False,
     help=(
-        "SRA mode: input table (.csv/.tsv/.txt) with 'Run','BioProject','Model'. "
-        "FASTQ mode: a directory where each sample is a subfolder containing either "
-        "R1/R2 FASTQs (filenames with 'r1' and 'r2' for paired-end) or a single 'r' FASTQ "
-        "for single-end. The pipeline infers layout from these names."
+        "SRA mode: input table (.csv/.tsv/.txt) with 'Run','BioProject','Model'.\n"
+        "FASTQ mode: directory where each sample is a subfolder containing 1 (single-end)\n"
+        "or 2 (paired-end) FASTQ files. Layout (single vs paired) is inferred from\n"
+        "the files present."
     ),
 )
+
+
 @click.option(
     "-r",
     "--reference",
@@ -214,8 +232,6 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
 @click.option("-y", "--yes", is_flag=True, help="Assume 'yes' to prompts and run without asking.")
 @click.option("-f", "--force", "--overwrite", is_flag=True,
               help="Force re-run: overwrite totally/partially processed SRRs.")
-@click.option("-a", "--aggregate", "--overall-table", is_flag=True,
-              help="Create a merged TPM table across all BioProjects; with --gene-counts, also a global gene-counts table.")
 @click.option("-n", "--dry-run", is_flag=True,
               help="Validate inputs and configuration, print plan, and exit without running tools.")
 @click.option("-g", "--gene-counts", "tx2gene_path",
@@ -263,7 +279,6 @@ def cli(
     verbosity: bool,
     yes: bool,
     force: bool,
-    aggregate: bool,
     dry_run: bool,
     tx2gene_path: Path | None,
     no_cache: bool,
@@ -283,7 +298,6 @@ def cli(
         verbosity=verbosity,
         yes=yes,
         force=force,
-        aggregate=aggregate,
         dry_run=dry_run,
         tx2gene_path=tx2gene_path,
         no_cache=no_cache,
@@ -402,7 +416,6 @@ def _run_pipeline(
     verbosity: bool,
     yes: bool,
     force: bool,
-    aggregate: bool,
     dry_run: bool,
     tx2gene_path: Path | None,
     no_cache: bool,
@@ -412,7 +425,7 @@ def _run_pipeline(
     seq_tech: str | None,
 ) -> None:
     if input_path is None or reference_path is None:
-        raise click.usageError("Missing required options: -i/--input and -r/--reference. See 'hulk -h'.")
+        raise click.UsageError("Missing required options: -i/--input and -r/--reference. See 'hulk -h'.")
 
     # Load persisted sections from ~/.hulk.json (or fixed path)
     persisted = _cfg_load(None)
@@ -456,7 +469,6 @@ def _run_pipeline(
         max_threads=max_threads,
         verbose=verbosity,
         force=force,
-        aggregate=aggregate,
         dry_run=dry_run,
         tx2gene=tx2gene_path,
         keep_fastq=keep_fastq,
@@ -488,15 +500,19 @@ def _run_pipeline(
 
     # Dataset
     if input_path.is_dir():
-        fastq_files = scan_fastqs(input_path)
-        if not fastq_files:
-            raise click.UsageError(f"No FASTQ files found in directory: {input_path}")
+        # FASTQ mode:
+        #   - root directory contains one subdirectory per sample
+        #   - each sample directory contains 1 (SE) or 2 (PE) FASTQs
+        # Dataset.from_fastq_dir will validate that each subdir has FASTQs.
         dataset = Dataset.from_fastq_dir(input_path, cfg)
         df = None
     else:
         suf = input_path.suffix.lower()
         if suf not in INPUT_FORMATS:
-            raise click.UsageError(f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))} (got: {input_path.name})")
+            raise click.UsageError(
+                f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))} "
+                f"(got: {input_path.name})"
+            )
         try:
             if suf == ".csv":
                 df = pd.read_csv(input_path, low_memory=False)
@@ -528,12 +544,42 @@ def _run_pipeline(
                 f" (found: {', '.join(tx2gene_df.columns)})"
             )
 
-    # Enforce seq-tech in FASTQ mode
-    if getattr(dataset, "mode", None) == "FASTQ" and not seq_tech:
-        raise click.UsageError(
-            "In FASTQ mode you must specify the sequencing technology/platform with --seq-tech "
-            "(e.g. '--seq-tech illumina')."
-        )
+    # ------------------------------------------------------------------
+    # FASTQ mode: require a known sequencing technology
+    # ------------------------------------------------------------------
+    if getattr(dataset, "mode", None) == "FASTQ":
+        from .align import list_known_seq_techs, _MODEL_PARAMS
+
+        known_techs = list_known_seq_techs()
+        seq_tech = getattr(cfg, "seq_tech", None)
+
+        if not seq_tech:
+            # No --seq-tech given → print all known techs and abort
+            click.secho(
+                "[WARNING] No sequencing technology provided (--seq-tech).\n"
+                "It is required in FASTQ mode to correctly set fragment length parameters "
+                "for kallisto quantification.\n",
+                fg="yellow",
+            )
+            click.echo("Known technologies:\n  - " + "\n  - ".join(known_techs))
+            raise click.UsageError(
+                "Missing --seq-tech. Please specify one of the known sequencing technologies listed above."
+            )
+
+        seq_tech_upper = seq_tech.strip().upper()
+        if seq_tech_upper not in _MODEL_PARAMS:
+            # Provided value not in known presets → print all known techs and abort
+            click.secho(
+                f"[WARNING] Sequencing technology '{seq_tech}' not recognised in preset table.\n"
+                "HULK only accepts known technologies in FASTQ mode.\n",
+                fg="yellow",
+            )
+            click.echo("Known technologies:\n  - " + "\n  - ".join(known_techs))
+            raise click.UsageError(
+                f"Unknown sequencing technology '{seq_tech}'. "
+                "Please use one of the known technologies listed above."
+            )
+
 
     # Print ALL opts (incl persisted defaults)
     _print_config_summary(dataset, cfg)
@@ -567,10 +613,10 @@ def _run_pipeline(
     type=click.Path(exists=True, dir_okay=True, path_type=Path),
     required=False,
     help=(
-        "SRA mode: input table (.csv/.tsv/.txt) with 'Run','BioProject','Model'. "
-        "FASTQ mode: a directory where each sample is a subfolder containing either "
-        "R1/R2 FASTQs (filenames with 'r1' and 'r2' for paired-end) or a single 'r' FASTQ "
-        "for single-end. The pipeline infers layout from these names."
+        "SRA mode: input table (.csv/.tsv/.txt) with 'Run','BioProject','Model'.\n"
+        "FASTQ mode: directory where each sample is a subfolder containing 1 (single-end)\n"
+        "or 2 (paired-end) FASTQ files. Layout (single vs paired) is inferred from\n"
+        "the files present."
     ),
 )
 @click.option(
@@ -599,8 +645,6 @@ def _run_pipeline(
 @click.option("-y", "--yes", is_flag=True, help="Assume 'yes' to prompts and run without asking.")
 @click.option("-f", "--force", "--overwrite", is_flag=True,
               help="Force re-run: overwrite totally/partially processed SRRs.")
-@click.option("-a", "--aggregate", "--overall-table", is_flag=True,
-              help="Create a merged TPM table across BioProjects; with --gene-counts, also a global gene-counts table.")
 @click.option("-n", "--dry-run", is_flag=True,
               help="Validate inputs and configuration, print plan, and exit without running tools.")
 @click.option("-g", "--gene-counts", "tx2gene_path",

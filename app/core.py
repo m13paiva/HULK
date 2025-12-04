@@ -11,13 +11,7 @@ from .post_processing import run_postprocessing as run_r_postprocessing
 
 
 def pipeline(data: "Dataset", cfg: "Config") -> None:
-    """
-    Top-level runner:
-      • (re)build index if needed & inject into samples
-      • orchestrate prefetch + processing
-      • run global MultiQC
-      • optional aggregation (TPM / gene counts)
-    """
+
     cfg.prepare_directories()
     data.update_status()
     outdir: Path = cfg.outdir

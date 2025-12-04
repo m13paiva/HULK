@@ -6,11 +6,17 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional, List, Tuple
 
-FASTQ_EXTS = {".fastq", ".fq", ".fastq.gz", ".fq.gz"}
+_FASTQ_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz",".trim.fastq")
 
-def _is_fastq(p: Path) -> bool:
+
+def _is_fastq_path(p: Path) -> bool:
+    """
+    Return True if p looks like a FASTQ/FASTQ.GZ file.
+    """
+    if not p.is_file():
+        return False
     name = p.name.lower()
-    return any(name.endswith(ext) for ext in FASTQ_EXTS)
+    return any(name.endswith(suf) for suf in _FASTQ_SUFFIXES)
 
 # ------------------------------- Config -------------------------------
 class Config:
@@ -31,7 +37,6 @@ class Config:
         max_threads: int = 10,
         verbose: bool = False,
         force: bool = False,
-        aggregate: bool = False,
         dry_run: bool = False,
         tx2gene: Optional[Path] = None,
         keep_fastq: bool = False,
@@ -66,7 +71,6 @@ class Config:
         self.max_threads = max_threads
         self.verbose = verbose
         self.force = force
-        self.aggregate = aggregate
         self.dry_run = dry_run
         self.tx2gene = Path(tx2gene).expanduser().resolve() if tx2gene else None
         self.keep_fastq = keep_fastq
@@ -215,7 +219,6 @@ class Config:
             f"Threads:      min={self.min_threads}, max={self.max_threads}",
             f"Force:        {self.force}",
             f"Verbose:      {self.verbose}",
-            f"Aggregate:    {self.aggregate}",
             f"Dry run:      {self.dry_run}",
             f"Keep FASTQ:   {self.keep_fastq}",
             f"Seq. tech:    {self.seq_tech or '-'}",
@@ -519,7 +522,7 @@ class Dataset:
         self.path.mkdir(parents=True, exist_ok=True)
 
         # Root for per-sample outputs in FASTQ mode
-        self.fastq_root = self.path / "fastq_samples"
+        self.fastq_root = self.path / "samples"
         if self.mode == "FASTQ":
             self.fastq_root.mkdir(parents=True, exist_ok=True)
 
@@ -565,22 +568,27 @@ class Dataset:
 
     # FASTQ helpers
     def add_fastq(
-        self,
-        sample_id: str,
-        fastq_paths: List[Path],
-        *,
-        outdir: Optional[Path] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        status: str = "pending",
+            self,
+            sample_id: str,
+            fastq_paths: List[Path],
+            *,
+            outdir: Optional[Path] = None,
+            metadata: Optional[Dict[str, Any]] = None,
+            status: str = "pending",
     ) -> Sample:
         """
-        Register a FASTQ-based sample.
+        FASTQ helpers.
 
-        fastq_paths should contain 1 file (single-end) or 2 files (paired-end);
-        they point to the original FASTQ files (under the user-provided FASTQ root).
+        In FASTQ mode we let Sample create its own directory as:
+            <parent_outdir>/<sample_id>/
+
+        So here we just pass the *parent* (typically <outdir>/samples).
         """
-        target_outdir = Path(outdir) if outdir else self.fastq_root
-        target_outdir.mkdir(parents=True, exist_ok=True)
+        # Parent directory under which samples live
+        if outdir is None:
+            parent_outdir = self.fastq_root
+        else:
+            parent_outdir = Path(outdir).resolve()
 
         s = Sample(
             sample_id=sample_id,
@@ -588,9 +596,10 @@ class Dataset:
             fastq_paths=fastq_paths,
             metadata=metadata,
             bioproject=None,
-            outdir=target_outdir,
+            outdir=parent_outdir,
             status=status,
         )
+
         self.samples.append(s)
         return s
 
@@ -661,11 +670,12 @@ class Dataset:
                 sampleA_R1.fastq.gz
                 sampleA_R2.fastq.gz
               sampleB/
-                sampleB_R.fastq.gz    # single-end
+                sampleB.trim.fastq    # single-end also OK
+              emptyFolder/
+                # no FASTQs → skipped with a [WARNING]
 
-        Each immediate subdirectory of <root> is treated as one sample.
-        All FASTQ files directly inside that subdirectory are attached
-        to that sample's fastq_paths.
+        Each immediate subdirectory of <root> is treated as one potential sample.
+        Subdirectories without FASTQs are skipped with a warning.
         """
         directory = Path(directory).expanduser().resolve()
         if not directory.is_dir():
@@ -683,19 +693,18 @@ class Dataset:
         for sample_dir in sample_dirs:
             fastqs = sorted(
                 p for p in sample_dir.iterdir()
-                if p.is_file() and _is_fastq(p)
+                if _is_fastq_path(p)
             )
             if not fastqs:
-                # You can choose to skip empty dirs instead of raising:
-                raise ValueError(
-                    f"No FASTQ files found in sample directory: {sample_dir}"
-                )
+                # Just warn and continue; this BioProject folder may contain other stuff
+                print(f"[WARNING] No FASTQ files found in sample directory: {sample_dir}")
+                continue
 
-            # sample_id is the folder name
             sample_id = sample_dir.name
             ds.add_fastq(sample_id=sample_id, fastq_paths=fastqs)
 
         if not ds.samples:
+            # None of the subdirs had FASTQs → hard error
             raise ValueError(
                 f"No FASTQ files found in any subdirectory of: {directory}"
             )

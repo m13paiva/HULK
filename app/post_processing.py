@@ -137,8 +137,7 @@ def run_postprocessing_bp(bp, cfg: Config, *, r_script: Path | None = None) -> P
         )
         return None
 
-    # Outputs for this BP live under its own R_output dir
-    out_dir = bp.path / "R_output"
+    out_dir = bp.path
     out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -224,9 +223,8 @@ def run_postprocessing_bp(bp, cfg: Config, *, r_script: Path | None = None) -> P
     log(f"[{bp.id}] R post-processing (DESeq2/VST) completed.", log_path)
     return None
 
+def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) -> List[str]:
 
-
-def _build_r_args_global(cfg: Config, out_dir: Path) -> List[str]:
     """
     Build argument list for a *global* run of the R post-processing
     script (no --bioproject restriction).
@@ -245,6 +243,10 @@ def _build_r_args_global(cfg: Config, out_dir: Path) -> List[str]:
         "--prefix", "hulk",  # arbitrary; R script default is 'seidr_input'
         "--counts-from-abundance", counts_from_abundance,
     ]
+
+    # Mode hint for the R script (SRR vs FASTQ)
+    if mode:
+        args.extend(["--mode", mode])
 
     # tximport ignore version
     if getattr(cfg, "tximport_ignore_tx_version", False):
@@ -292,6 +294,7 @@ def _build_r_args_global(cfg: Config, out_dir: Path) -> List[str]:
         if getattr(cfg, "plot_var_heatmap", False):
             args.append("--var-heatmap")
 
+
     return args
 
 
@@ -338,12 +341,14 @@ def run_postprocessing(dataset: Dataset, cfg: Config, *, r_script: Path | None =
         return
 
     # Where to put all outputs from the R script
-    out_dir = cfg.shared / "post_processing"
+    out_dir = cfg.shared
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Build command-line arguments
     try:
-        args = _build_r_args_global(cfg, out_dir)
+        r_mode = getattr(dataset, "mode", None)  # "SRR" or "FASTQ"
+        args = _build_r_args_global(cfg, out_dir, mode=r_mode)
+
     except Exception as e:
         log_err(
             error_warnings,
