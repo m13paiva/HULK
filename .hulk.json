@@ -1,6 +1,6 @@
 {
   "trim": {
-    "window_size": 30,
-    "mean_quality": 10
+    "window_size": 3,
+    "mean_quality": 1
   }
 }

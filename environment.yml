@@ -3,7 +3,9 @@ channels:
   - conda-forge
   - bioconda
   - defaults
+
 dependencies:
+  # --- Python stack ---
   - python=3.11
   - numpy
   - pandas
@@ -11,8 +13,22 @@ dependencies:
   - tqdm
   - sra-tools
   - kallisto
-  - pytximport
-  - pyarrow
   - fastp
   - multiqc
   - click
+
+  # --- R / Bioconductor stack ---
+  - r-base>=4.3,<4.4          
+  - r-optparse
+  - r-readr
+  - r-dplyr
+  - r-tibble
+  - r-tidyr
+  - r-ggplot2
+
+  # Bioconductor packages
+  - bioconductor-deseq2       # DESeq2
+  - bioconductor-tximport     # tximport (R)
+  - bioconductor-complexheatmap
+  - r-circlize                # dependency of ComplexHeatmap
+

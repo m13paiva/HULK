@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hulk"
-version = "1.1.0"                      # ← bump me to change `hulk -V`
+version = "1.2.0"                      
 description = "HULK: RNA-seq pipeline CLI"
 readme = "README.md"
 authors = [{ name = "Manuel Almeida" },{ name = "Pedro Barros" }]
