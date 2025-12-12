@@ -10,12 +10,50 @@ from typing import Optional
 
 from tqdm.auto import tqdm
 
-from .utils import log, pad_desc
+from .utils import log, log_err, pad_desc
 from .prefetcher import prefetch
 from .processor import process
 from .cache_manager import CacheGate
+from .qc import run_multiqc, build_bp_metrics
+from .post_processing import run_postprocessing_bp
 
 
+def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
+    """
+    Per-BioProject post-processing logic.
+    """
+    log_path = cfg.log
+    errors = cfg.error_warnings
+
+    # 1. MultiQC
+    try:
+        mqc_data = run_multiqc(bp, cfg, modules=("kallisto", "fastp"))
+        if mqc_data is None:
+            log(f"[{bp.id}] MultiQC returned no output", log_path)
+    except Exception as e:
+        log_err(errors, log_path, f"[{bp.id}] MultiQC failed: {e}")
+
+    # 2. R-based Post-processing
+    try:
+        if getattr(cfg, "tx2gene", None) is not None:
+            counts_path = run_postprocessing_bp(bp, cfg)
+            if counts_path is not None:
+                log(f"[{bp.id}] Gene counts complete: {counts_path}", log_path)
+            else:
+                log(f"[{bp.id}] R post-processing complete.", log_path)
+        else:
+            log(f"[{bp.id}] No tx2gene provided; skipping R steps.", log_path)
+    except Exception as e:
+        log_err(errors, log_path, f"[{bp.id}] R-based BP post-processing failed: {e}")
+
+    # 3. Read Metrics
+    try:
+        build_bp_metrics(bp, cfg, out_tsv=bp.path / "read_metrics.tsv")
+        log(f"[{bp.id}] Read metrics table written.", log_path)
+    except Exception as e:
+        log_err(errors, log_path, f"[{bp.id}] Failed to build read metrics: {e}")
+
+    log(f"[{bp.id}] === BioProject post-processing complete ===", log_path)
 
 def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: float = 0.5):
     """Create one tqdm bar per BioProject and return a monitor thread."""
@@ -79,7 +117,8 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
                     # optional: keep status for humans
                     bp.status = "done"
                     try:
-                        bp.run_postprocessing(cfg)
+                        _finalize_bioproject(bp, cfg)
+
                     except Exception as e:
                         log(f"[{bp.id}] Postprocessing failed: {e}", bp.log_path)
                     finally:

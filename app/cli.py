@@ -4,15 +4,17 @@ from __future__ import annotations
 import os
 import sys
 import json
+import shutil
 from pathlib import Path
-from typing import Any, List, Dict, Optional
+from typing import Any, List, Dict, Optional, Tuple
 
 import click
 import pandas as pd
 from click.core import ParameterSource
 
-from .core import pipeline                 # expects: pipeline(dataset, cfg)
+from .core import pipeline
 from .entities import Config, Dataset
+from .post_processing import run_postprocessing
 from .utils import transcriptome_suffixes, smash, scan_fastqs
 from .logo import LOGO
 from . import __version__
@@ -35,34 +37,20 @@ HELP_BODY = (
     "==================================================================================================================================================\n"
     "HULK is a H(igh-volume b)ulk RNA-seq data preprocessing pipeline for NCBI SRA accessions and user-provided FASTQ files.\n"
     "\n"
-    "SRA mode (recommended for public data): given an input table (.csv/.tsv/.txt) with columns 'Run', 'BioProject', and 'Model' (this table is easily\n"
-    "obtainable via NCBI's SRA search -> Send to: -> File -> RunInfo. HULK fetches SRR data (prefetch) with safe resume/overwrite, converts to FASTQ\n"
-    "(fasterq-dump), performs QC/trimming with fastp, quantifies against a transcriptome using kallisto, optionally aggregates counts/TPM via tximport,\n"
-    "and can run DESeq2/VST to produce PCA and expression/variance heatmap plots.\n"
+    "SRA mode (recommended for public data): given an input table (.csv/.tsv/.txt) with columns 'Run', 'BioProject', and 'Model'.\n"
     "\n"
-    "FASTQ mode (local FASTQ folders): -i/--input points to a directory where each sample is a subfolder containing 1 (single-end) or 2 (paired-end)\n"
-    "FASTQ files. Because in this mode metadata are not available, you MUST provide the sequencing technology via --seq-tech. The value must match \n"
-    "one of HULK's known platforms and is used to choose sensible fragment-length defaults for kallisto single-end quantification.\n"
+    "FASTQ mode (local FASTQ folders): -i/--input points to a directory where each sample is a subfolder.\n"
     "\n"
-    "Reference transcriptome: -r/--reference accepts a transcriptome FASTA (.fa/.fasta[.gz])or a prebuilt kallisto index (.idx). If a FASTA is\n"
-    "provided, HULK builds a shared index once and reuses it across all samples in the run.\n"
-    "\n"
-    "Outputs: in SRA mode, results are written under <OUTPUT>/<BioProject>/<Run>/; in FASTQ mode, under <OUTPUT>/fastq_samples/<sample_id>/. In both\n"
-    "cases a shared log is written to <OUTPUT>/shared/log.txt and, when enabled, a shared cache is used for SRA prefetch data management.\n"
-    "\n"
-    "Configuration subcommands: 'trim' persists fastp trimming defaults; 'align' configures alignment/kallisto options (e.g. bootstraps); 'tximport'\n"
-    "configures aggregation/normalization mode; and 'plot' controls global and per-BioProject PCA/heatmap plotting behaviour.\n"
-    "\n"
-    "Re-runs are safe: completed samples are skipped unless --force is given; partial or interrupted runs are cleaned up or resumed when possible.\n"
+    "Configuration subcommands: 'trim', 'align', 'tximport', 'deseq2', and 'plot' control persistence settings.\n"
     "==================================================================================================================================================\n"
 )
-
 
 
 # ---------------------------- Persisted config I/O ----------------------------
 
 def _cfg_path(_: Path | None = None) -> Path:
     return CFG_FIXED_PATH
+
 
 def _cfg_load(_: Path | None = None) -> Dict[str, Any]:
     p = _cfg_path(None)
@@ -74,6 +62,7 @@ def _cfg_load(_: Path | None = None) -> Dict[str, Any]:
     except Exception:
         return {}
 
+
 def _cfg_save(cfg: dict[str, Any], _: Path | None = None) -> Path:
     p = _cfg_path(None)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +73,7 @@ def _cfg_save(cfg: dict[str, Any], _: Path | None = None) -> Path:
     tmp.replace(p)
     return p
 
+
 def _cfg_update(section: str, payload: dict[str, Any], _: Path | None = None) -> Path:
     cfg = _cfg_load(None)
     sect = cfg.get(section, {})
@@ -93,16 +83,19 @@ def _cfg_update(section: str, payload: dict[str, Any], _: Path | None = None) ->
     cfg[section] = sect
     return _cfg_save(cfg, None)
 
+
 def _cfg_reset(section: str, _: Path | None = None) -> Path:
     cfg = _cfg_load(None)
     if section in cfg:
         del cfg[section]
     return _cfg_save(cfg, None)
 
+
 # ---------------------------- Help formatting ----------------------------
 def _pad_block(text: str, n: int) -> str:
     lines = text.rstrip("\n").splitlines()
     return "\n".join((" " * n) + line for line in lines)
+
 
 class SpacedFormatterMixin:
     def _fmt_rows_with_spacing(
@@ -124,12 +117,10 @@ class SpacedFormatterMixin:
             if gap < 2:
                 gap = 2
 
-            # Support multi-line right-hand text with proper indentation
             right_lines = right.splitlines() or [""]
             first_line = right_lines[0]
             formatter.write(f"  {left}{' ' * gap}{first_line}\n")
 
-            # Subsequent lines: indent to the same column as the first description
             indent = "  " + " " * RIGHT_COL
             for extra in right_lines[1:]:
                 formatter.write(f"{indent}{extra}\n")
@@ -137,11 +128,13 @@ class SpacedFormatterMixin:
             if i < len(rows) - 1:
                 formatter.write("\n")
 
+
 class HulkGroup(SpacedFormatterMixin, click.Group):
     def make_context(self, info_name, args, parent=None, **extra):
         ctx = super().make_context(info_name, args, parent=parent, **extra)
         ctx.max_content_width = WIDE_HELP
         return ctx
+
     def format_help(self, ctx, formatter):
         self.format_usage(ctx, formatter)
         formatter.write_text("\n")
@@ -150,10 +143,12 @@ class HulkGroup(SpacedFormatterMixin, click.Group):
         self.format_commands(ctx, formatter)
         formatter.write("\n")
         self.format_options(ctx, formatter)
+
     def format_options(self, ctx, formatter):
         opts = [p.get_help_record(ctx) for p in self.get_params(ctx)]
         opts = [o for o in opts if o]
         self._fmt_rows_with_spacing(formatter, "Options", opts)
+
     def format_commands(self, ctx, formatter):
         commands: list[tuple[str, str]] = []
         for name in self.list_commands(ctx):
@@ -165,21 +160,25 @@ class HulkGroup(SpacedFormatterMixin, click.Group):
         if commands:
             self._fmt_rows_with_spacing(formatter, "Commands", commands)
 
+
 class HulkCommand(SpacedFormatterMixin, click.Command):
     def make_context(self, info_name, args, parent=None, **extra):
         ctx = super().make_context(info_name, args, parent=parent, **extra)
         ctx.max_content_width = WIDE_HELP
         return ctx
+
     def format_help(self, ctx, formatter):
         self.format_usage(ctx, formatter)
         formatter.write("\n")
         if self.help:
             formatter.write(self.help.strip() + "\n\n")
         self.format_options(ctx, formatter)
+
     def format_options(self, ctx, formatter):
         opts = [p.get_help_record(ctx) for p in self.get_params(ctx)]
         opts = [o for o in opts if o]
         self._fmt_rows_with_spacing(formatter, "Options", opts)
+
 
 # ---------------------------- Root CLI ----------------------------
 
@@ -197,22 +196,15 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
     "input_path",
     type=click.Path(exists=True, dir_okay=True, path_type=Path),
     required=False,
-    help=(
-        "SRA mode: input table (.csv/.tsv/.txt) with 'Run','BioProject','Model'.\n"
-        "FASTQ mode: directory where each sample is a subfolder containing 1 (single-end)\n"
-        "or 2 (paired-end) FASTQ files. Layout (single vs paired) is inferred from\n"
-        "the files present."
-    ),
+    help="Input table (.csv/.tsv) or FASTQ directory.",
 )
-
-
 @click.option(
     "-r",
     "--reference",
     "reference_path",
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     required=False,
-    help="Reference transcriptome (.fasta/.fa[.gz]) or kallisto index (.idx).",
+    help="Transcriptome FASTA or kallisto index.",
 )
 @click.option(
     "-o",
@@ -223,69 +215,56 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
     show_default=True,
     help="Output directory.",
 )
-@click.option("--min-threads", type=int, default=DEFAULT_MIN_THREADS, show_default=True,
-              help="Minimum number of threads per SRR.")
-@click.option("-t", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True,
-              help="Maximum total threads.")
-@click.option("--verbosity/--no-verbosity", default=True, show_default=True,
-              help="Show live progress bars and console messages (default: on).")
-@click.option("-y", "--yes", is_flag=True, help="Assume 'yes' to prompts and run without asking.")
-@click.option("-f", "--force", "--overwrite", is_flag=True,
-              help="Force re-run: overwrite totally/partially processed SRRs.")
-@click.option("-n", "--dry-run", is_flag=True,
-              help="Validate inputs and configuration, print plan, and exit without running tools.")
-@click.option("-g", "--gene-counts", "tx2gene_path",
-              type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              default=None,
-              help="Enable gene counts using a tx2gene (.csv) with columns 'transcript_id','gene_id'.")
-@click.option(
-    "--no-cache",
-    is_flag=True,
-    help="Disable SRA caching (do not allocate a shared cache volume).",
-)
-@click.option(
-    "-c", "--cache",
-    "cache_gb",
-    type=int,
-    default=None,
-    help="Maximum SRA cache size (GiB). Default: auto (300 GiB or free space based).",
-)
-@click.option("--keep-fastq", is_flag=True, help="Keep trimmed FASTQ files.")
-@click.option(
-    "--deseq2/--no-deseq2",
-    "deseq2_enabled",
-    default=True,
-    show_default=True,
-    help="Enable DESeq2 normalization + VST expression matrices for downstream plots/network exports.",
-)
+@click.option("--min-threads", type=int, default=DEFAULT_MIN_THREADS, show_default=True, help="Threads per SRR.")
+@click.option("-t", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True, help="Total threads.")
+@click.option("--verbosity/--no-verbosity", default=True, show_default=True, help="Live progress.")
+@click.option("-y", "--yes", is_flag=True, help="Skip prompts.")
+@click.option("-f", "--force", is_flag=True, help="Force re-run (overwrite processed data).")
+@click.option("-n", "--dry-run", is_flag=True, help="Validate and plan without running.")
+@click.option("-g", "--gene-counts", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="tx2gene map for gene-level counts.")
+@click.option("--no-cache", is_flag=True, help="Disable SRA cache.")
+@click.option("-c", "--cache", "cache_gb", type=int, default=None, help="Max SRA cache size (GiB).")
+@click.option("--keep-fastq", is_flag=True, help="Keep trimmed FASTQs.")
 @click.option(
     "--seq-tech",
     "seq_tech",
     type=str,
     default=None,
-    help=(
-        "Sequencing technology/platform (e.g. 'illumina'). "
-        "Required in FASTQ mode; used to choose kallisto parameters."
-    ),
+    help="Sequencing technology (Required for FASTQ mode).",
+)
+@click.option(
+    "--target-genes",
+    "target_genes_files",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    help="File(s) containing target genes (one gene per line). Can be used multiple times.",
+)
+@click.option(
+    "--rem-missing-bps",
+    is_flag=True,
+    default=False,
+    help="DANGER: Remove output folders for BioProjects NOT present in the input table.",
 )
 @click.pass_context
 def cli(
-    ctx: click.Context,
-    input_path: Path | None,
-    reference_path: Path | None,
-    output_dir: Path,
-    min_threads: int,
-    max_threads: int,
-    verbosity: bool,
-    yes: bool,
-    force: bool,
-    dry_run: bool,
-    tx2gene_path: Path | None,
-    no_cache: bool,
-    cache_gb: int | None,
-    keep_fastq: bool,
-    deseq2_enabled: bool,
-    seq_tech: str | None,
+        ctx: click.Context,
+        input_path: Path | None,
+        reference_path: Path | None,
+        output_dir: Path,
+        min_threads: int,
+        max_threads: int,
+        verbosity: bool,
+        yes: bool,
+        force: bool,
+        dry_run: bool,
+        tx2gene_path: Path | None,
+        no_cache: bool,
+        cache_gb: int | None,
+        keep_fastq: bool,
+        seq_tech: str | None,
+        target_genes_files: Tuple[Path],
+        rem_missing_bps: bool,
 ):
     if ctx.invoked_subcommand is not None:
         return
@@ -303,26 +282,21 @@ def cli(
         no_cache=no_cache,
         cache_gb=cache_gb,
         keep_fastq=keep_fastq,
-        deseq2_enabled=deseq2_enabled,
         seq_tech=seq_tech,
+        target_genes_files=list(target_genes_files) if target_genes_files else None,
+        rem_missing_bps=rem_missing_bps,
     )
+
 
 # ---------------------------- Summary printing ----------------------------
 def _print_trailing_newlines(n_bioprojects: int | None = 0) -> None:
-    """
-    Pad the terminal with blank lines so the shell prompt appears
-    after all tqdm progress bars.
-    """
     try:
-        # One line per BioProject + a couple extra
         n = n_bioprojects or 0
         pad_lines = max(4, n + 2)
-
-        # Print the blank lines without adding an extra newline from click itself
         click.echo("\n" * pad_lines, nl=False)
     except Exception:
-        # Never let cosmetic padding break the CLI
         pass
+
 
 def _val(x, default_symbol="-"):
     if x is None:
@@ -331,98 +305,99 @@ def _val(x, default_symbol="-"):
         return "True" if x else "False"
     return str(x)
 
-def _print_config_summary(dataset, cfg) -> None:
-    """Print all opts, including persisted trim/tximport/align (show defaults if unset)."""
-    # Dataset counts
+
+def _warn(s): return click.style(f"!!! {s} !!!", fg="red", bold=True)
+
+
+def _print_config_summary(dataset: Dataset, cfg: Config) -> None:
+    """Print complete summary of Config and Dataset options."""
+
+    # --- Danger Zone First ---
+    if cfg.force or cfg.rem_missing_bps:
+        click.echo("\n" + click.style(">>> DANGER ZONE <<<", fg="red", bold=True, blink=True))
+        if cfg.force:
+            click.echo(_warn(f"FORCE ENABLED: Will overwrite existing data in: {cfg.outdir}"))
+        if cfg.rem_missing_bps:
+            click.echo(_warn(f"REM-MISSING-BPS ENABLED: Will DELETE any folder in output not in input table!"))
+        click.echo("-" * 40)
+
+    print("\n============ Run Summary ============")
+
+    # --- Dataset Stats ---
     total = "-"
     try:
         total = len(dataset)
-    except Exception:
+    except:
         pass
-    bps = getattr(dataset, "bioprojects", [])
+
+    bps_len = len(getattr(dataset, "bioprojects", []))
+
     done = None
     try:
         done = len(dataset.done())
-    except Exception:
-        done = None
-
-    print("\n============ Run Summary ============")
-    print(f"Mode:                 {_val(getattr(dataset, 'mode', None))}")
+    except:
+        pass
+    mode = _val(getattr(dataset, 'mode', 'Unknown'))
+    print(f"Mode:                 {mode}")
     print(f"Samples (total):      {_val(total)}")
-    print(f"BioProjects (total):  {_val(len(bps))}")
+    if mode !="SRA":
+        print(f"BioProjects (total):  {_val(bps_len)}")
     if done is not None:
         print(f"Samples (done):       {_val(done)}")
-    print(f"Output directory:     {_val(getattr(cfg, 'outdir', None))}")
-    print(f"Shared directory:     {_val(getattr(cfg, 'shared', None))}")
-    print(f"Log file:             {_val(getattr(cfg, 'log', None))}")
-    print(f"Threads:              {_val(getattr(cfg, 'threads', None))}")
-    print(f"Reference:            {_val(getattr(cfg, 'reference_path', None))}")
-    print(f"Tx2Gene:              {_val(getattr(cfg, 'tx2gene', None))}")
-    print(f"Seq. technology:      {_val(getattr(cfg, 'seq_tech', None))}")
+    print("-" * 20)
 
-    # ---- Trim (fastp) ----
-    print(f"Fastp window size:    {_val(getattr(cfg, 'trim_window_size', None))}")
-    print(f"Fastp mean quality:   {_val(getattr(cfg, 'trim_mean_quality', None))}")
+    # --- Paths ---
+    print(f"Input:                {_val(cfg.input_path)}")
+    print(f"Output directory:     {_val(cfg.outdir)}")
+    print(f"Reference:            {_val(cfg.reference_path)}")
+    print(f"Tx2Gene:              {_val(cfg.tx2gene)}")
 
-    # ---- Align (kallisto) ----
-    print(f"Align method:         {_val(getattr(cfg, 'align_method', 'kallisto'))}")
-    if getattr(cfg, 'align_method', 'kallisto') == "kallisto":
-        print(f"Kallisto bootstraps:  {_val(getattr(cfg, 'kallisto_bootstrap', 100))}")
+    # --- Scope ---
+    if cfg.target_genes_files:
+        tgs = [f.name for f in cfg.target_genes_files]
+        print(f"Target Genes:         {len(tgs)} files loaded ({', '.join(tgs)})")
     else:
-        print(f"Kallisto bootstraps:  -")
+        print(f"Target Genes:         None (Global analysis)")
+    print(f"BioProj Filter:       {_val(cfg.bioproject_filter or 'All')}")
 
-    # ---- tximport ----
-    txi_mode = getattr(cfg, "tximport_mode", None)
-    txi_ignore = getattr(cfg, "tximport_ignore_tx_version", None)
-    print(f"tximport mode:        {_val(txi_mode)}")
-    print(f"tximport ignore ver.: {_val(txi_ignore)}")
+    # --- Resources ---
+    print(f"Threads:              min={cfg.min_threads}, max={cfg.max_threads}")
+    print(f"Cache:                no_cache={cfg.no_cache}, high={cfg.cache_high_gb}G, low={cfg.cache_low_gb}G")
 
-    # ---- DESeq2 / plotting ----
-    print(f"DESeq2/VST enabled:   {_val(getattr(cfg, 'deseq2_vst_enabled', None))}")
-    pca_flag = getattr(cfg, "plot_pca", None)
-    hm_flag = getattr(cfg, "plot_heatmap", None)
-    varhm_flag = getattr(cfg, "plot_var_heatmap", None)
-    print(f"Plots (PCA/HM/VarHM): {_val(pca_flag)}/{_val(hm_flag)}/{_val(varhm_flag)}")
+    # --- Tool Configs ---
+    print("-" * 20 + " Tools " + "-" * 20)
+    print(f"Seq. technology:      {_val(cfg.seq_tech)}")
+    print(f"Keep FASTQ:           {_val(cfg.keep_fastq)}")
+    print(f"Trim (fastp):         ws={cfg.trim_window_size}, mq={cfg.trim_mean_quality}")
+    print(f"Align ({cfg.align_method}):      boot={cfg.kallisto_bootstrap}")
+    print(f"tximport:             mode={cfg.tximport_mode}, ignore_ver={cfg.tximport_ignore_tx_version}")
 
-    print(f"Force re-run:         {_val(getattr(cfg, 'force', False))}")
-    print(f"No-exec (dry run):    {_val(getattr(cfg, 'dry_run', False))}")
-
-    use_cache = not getattr(cfg, 'no_cache', False)
-    print(f"Use cache:            {_val(use_cache)}")
-
-    # --- Cache volume summary ---
-    if use_cache:
-        cg = getattr(cfg, "cache_gb", None)
-        if cg is None:
-            # automatic mode (final high watermark computed by CacheGate)
-            # We cannot compute it now (dry run), so show "auto"
-            print(f"Cache volume (GiB):   auto")
-        else:
-            print(f"Cache volume (GiB):   {cg}")
-    else:
-        print(f"Cache volume (GiB):   -")
+    # --- DESeq2 & Plots ---
+    deseq_status = "ENABLED" if cfg.deseq2_vst_enabled else "DISABLED"
+    print(f"DESeq2/VST:           {deseq_status} (Var Threshold: {cfg.deseq2_var_threshold})")
+    print(f"Plots:                PCA={cfg.plot_pca}, HM={cfg.plot_heatmap}, VarHM={cfg.plot_var_heatmap}")
 
     print("=====================================\n")
 
-# ---------------------------- Runner ----------------------------
 
 def _run_pipeline(
-    *,
-    input_path: Path | None,
-    reference_path: Path | None,
-    output_dir: Path,
-    min_threads: int,
-    max_threads: int,
-    verbosity: bool,
-    yes: bool,
-    force: bool,
-    dry_run: bool,
-    tx2gene_path: Path | None,
-    no_cache: bool,
-    cache_gb: int | None = None,
-    keep_fastq: bool,
-    deseq2_enabled: bool,
-    seq_tech: str | None,
+        *,
+        input_path: Path | None,
+        reference_path: Path | None,
+        output_dir: Path,
+        min_threads: int,
+        max_threads: int,
+        verbosity: bool,
+        yes: bool,
+        force: bool,
+        dry_run: bool,
+        tx2gene_path: Path | None,
+        no_cache: bool,
+        cache_gb: int | None = None,
+        keep_fastq: bool,
+        seq_tech: str | None,
+        target_genes_files: List[Path] | None,
+        rem_missing_bps: bool,
 ) -> None:
     if input_path is None or reference_path is None:
         raise click.UsageError("Missing required options: -i/--input and -r/--reference. See 'hulk -h'.")
@@ -431,14 +406,12 @@ def _run_pipeline(
     persisted = _cfg_load(None)
     trim_cfg = persisted.get("trim", {}) or {}
     align_cfg = persisted.get("align", {}) or {}
-    txi_cfg   = persisted.get("tximport", {}) or {}
-    plot_cfg  = persisted.get("plot", {}) or {}
+    txi_cfg = persisted.get("tximport", {}) or {}
+    plot_cfg = persisted.get("plot", {}) or {}
 
     # ---- Trim defaults ----
-    DEFAULT_WS = 4
-    DEFAULT_MQ = 20
-    ws = trim_cfg.get("window_size", DEFAULT_WS)
-    mq = trim_cfg.get("mean_quality", DEFAULT_MQ)
+    ws = trim_cfg.get("window_size", 4)
+    mq = trim_cfg.get("mean_quality", 20)
 
     # ---- Align defaults ----
     align_method = (align_cfg.get("method") or "kallisto").lower()
@@ -448,14 +421,13 @@ def _run_pipeline(
     txi_mode = txi_cfg.get("mode") or "raw_counts"
     txi_ignore = bool(txi_cfg.get("ignore_tx_version", False))
 
-    # ---- Plot defaults (global + per-BioProject) ----
+    # ---- Plot defaults ----
     global_pca = bool(plot_cfg.get("global_pca", False))
     global_heatmap = bool(plot_cfg.get("global_heatmap", False))
     global_var_heatmap = bool(plot_cfg.get("global_var_heatmap", False))
     bp_pca = bool(plot_cfg.get("bp_pca", False))
     bp_heatmap = bool(plot_cfg.get("bp_heatmap", False))
 
-    # For now, Config just needs to know whether these plot types are requested at all.
     plot_pca = global_pca or bp_pca
     plot_heatmap = global_heatmap or bp_heatmap
     plot_var_heatmap = global_var_heatmap
@@ -483,12 +455,13 @@ def _run_pipeline(
         tximport_mode=txi_mode,
         tximport_ignore_tx_version=txi_ignore,
 
-        deseq2_vst_enabled=deseq2_enabled,
         plot_pca=plot_pca,
         plot_heatmap=plot_heatmap,
         plot_var_heatmap=plot_var_heatmap,
 
         seq_tech=seq_tech,
+        target_genes_files=target_genes_files,
+        rem_missing_bps=rem_missing_bps,
     )
 
     # Validate reference
@@ -498,21 +471,16 @@ def _run_pipeline(
             f"Transcriptome file must be one of: {', '.join(sorted(TRANSCRIPTOME_FORMATS))} (got: {reference_path.name})"
         )
 
-    # Dataset
+    # Dataset Loading
+    df = None
     if input_path.is_dir():
-        # FASTQ mode:
-        #   - root directory contains one subdirectory per sample
-        #   - each sample directory contains 1 (SE) or 2 (PE) FASTQs
-        # Dataset.from_fastq_dir will validate that each subdir has FASTQs.
+        # FASTQ mode
         dataset = Dataset.from_fastq_dir(input_path, cfg)
-        df = None
     else:
+        # SRA mode
         suf = input_path.suffix.lower()
         if suf not in INPUT_FORMATS:
-            raise click.UsageError(
-                f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))} "
-                f"(got: {input_path.name})"
-            )
+            raise click.UsageError(f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))}")
         try:
             if suf == ".csv":
                 df = pd.read_csv(input_path, low_memory=False)
@@ -521,313 +489,279 @@ def _run_pipeline(
             else:
                 df = pd.read_table(input_path)
         except Exception as e:
-            raise click.ClickException(f"Could not read input file '{input_path}': {e}")
+            raise click.ClickException(f"Could not read input file: {e}")
 
         if not REQUIRED_INPUT_COLS.issubset(df.columns):
-            missing = REQUIRED_INPUT_COLS.difference(df.columns)
             raise click.UsageError(
-                "Input file must contain columns: " + ", ".join(sorted(REQUIRED_INPUT_COLS)) +
-                (f" (missing: {', '.join(sorted(missing))})" if missing else "")
-            )
+                "Input file missing columns: " + ", ".join(sorted(REQUIRED_INPUT_COLS.difference(df.columns))))
         df = df[list(REQUIRED_INPUT_COLS)]
         dataset = Dataset.from_dataframe(df, cfg)
 
-    # tx2gene validation if provided
+    # tx2gene validation
     if tx2gene_path is not None:
         try:
             tx2gene_df = pd.read_csv(tx2gene_path, sep=None, engine="python")
+            if not REQUIRED_TX2GENE_COLS.issubset(tx2gene_df.columns):
+                raise click.UsageError("tx2gene missing cols: " + ", ".join(REQUIRED_TX2GENE_COLS))
         except Exception as e:
-            raise click.ClickException(f"Could not read tx2gene file '{tx2gene_path}': {e}")
-        if not REQUIRED_TX2GENE_COLS.issubset(tx2gene_df.columns):
-            raise click.UsageError(
-                "tx2gene file must contain columns: " + ", ".join(sorted(REQUIRED_TX2GENE_COLS)) +
-                f" (found: {', '.join(tx2gene_df.columns)})"
-            )
+            raise click.ClickException(str(e))
 
-    # ------------------------------------------------------------------
-    # FASTQ mode: require a known sequencing technology
-    # ------------------------------------------------------------------
+    # FASTQ mode technology check
     if getattr(dataset, "mode", None) == "FASTQ":
         from .align import list_known_seq_techs, _MODEL_PARAMS
-
         known_techs = list_known_seq_techs()
         seq_tech = getattr(cfg, "seq_tech", None)
-
         if not seq_tech:
-            # No --seq-tech given → print all known techs and abort
-            click.secho(
-                "[WARNING] No sequencing technology provided (--seq-tech).\n"
-                "It is required in FASTQ mode to correctly set fragment length parameters "
-                "for kallisto quantification.\n",
-                fg="yellow",
-            )
-            click.echo("Known technologies:\n  - " + "\n  - ".join(known_techs))
-            raise click.UsageError(
-                "Missing --seq-tech. Please specify one of the known sequencing technologies listed above."
-            )
+            raise click.UsageError(f"FASTQ mode requires --seq-tech. Known: {', '.join(known_techs)}")
+        if seq_tech.strip().upper() not in _MODEL_PARAMS:
+            raise click.UsageError(f"Unknown seq-tech '{seq_tech}'. Known: {', '.join(known_techs)}")
 
-        seq_tech_upper = seq_tech.strip().upper()
-        if seq_tech_upper not in _MODEL_PARAMS:
-            # Provided value not in known presets → print all known techs and abort
-            click.secho(
-                f"[WARNING] Sequencing technology '{seq_tech}' not recognised in preset table.\n"
-                "HULK only accepts known technologies in FASTQ mode.\n",
-                fg="yellow",
-            )
-            click.echo("Known technologies:\n  - " + "\n  - ".join(known_techs))
-            raise click.UsageError(
-                f"Unknown sequencing technology '{seq_tech}'. "
-                "Please use one of the known technologies listed above."
-            )
+    # ------------------------------------------------------------------
+    # DANGEROUS LOGIC: rem-missing-bps
+    # ------------------------------------------------------------------
+    if rem_missing_bps:
+        if getattr(dataset, "mode", None) != "SRA":
+            click.secho("[WARNING] --rem-missing-bps ignored: Only applicable in SRA mode (input=Table).", fg="yellow")
+        else:
+            if output_dir.exists():
+                expected_bps = set(getattr(dataset, "bioprojects", []))
+                existing_items = [p for p in output_dir.iterdir() if p.is_dir()]
+                blacklist = {"shared", "fastq_samples"}
 
+                for folder in existing_items:
+                    if folder.name in blacklist:
+                        continue
 
-    # Print ALL opts (incl persisted defaults)
+                    if folder.name not in expected_bps:
+                        msg = f"[DANGER] Removing extraneous BioProject folder: {folder.name}"
+                        click.secho(msg, fg="red", bold=True)
+                        if not dry_run:
+                            try:
+                                shutil.rmtree(folder)
+                            except Exception as ex:
+                                click.secho(f"Failed to remove {folder}: {ex}", fg="red")
+            else:
+                click.secho("[INFO] Output directory does not exist, nothing to clean.", fg="blue")
+
+    # Print summary (Cleanly passing both objects to the view function)
     _print_config_summary(dataset, cfg)
 
-    if not cfg.deseq2_vst_enabled and (cfg.plot_pca or cfg.plot_heatmap or cfg.plot_var_heatmap):
-        click.secho("Note: DESeq2 is disabled; any configured expression plots will be skipped downstream.", fg="yellow")
-
     if dry_run:
-        click.secho("\n✅ Dry run complete. No tools executed.\n", fg="green")
+        click.secho("✅ Dry run complete. No tools executed.\n", fg="green")
         sys.exit(0)
 
-    if not yes:
-        click.echo("")
-        click.confirm("Proceed with the run? (Y/n)", default=True, abort=True)
+    # Extra warning for the reckless
+    if (force or rem_missing_bps) and not yes:
+        click.secho("WARNING: You have selected DESTRUCTIVE options (Force and/or Rem-Missing).", fg="red", blink=True,
+                    bold=True)
+        click.confirm("Are you absolutely sure you want to proceed?", default=False, abort=True)
+    elif not yes:
+        click.confirm("Proceed with the run?", default=True, abort=True)
 
     pipeline(dataset, cfg)
+
     if getattr(dataset, "mode", None) == "FASTQ":
         _print_trailing_newlines(0)
     else:
-        _print_trailing_newlines(len(getattr(dataset, "bioprojects",None)))
-
+        _print_trailing_newlines(len(getattr(dataset, "bioprojects", None)))
     sys.exit(0)
+
 
 # ---------------------------- Subcommands ----------------------------
 
 @click.group(cls=HulkCommand, help="Run the HULK pipeline with explicit options.")
-@click.option(
-    "-i",
-    "--input",
-    "input_path",
-    type=click.Path(exists=True, dir_okay=True, path_type=Path),
-    required=False,
-    help=(
-        "SRA mode: input table (.csv/.tsv/.txt) with 'Run','BioProject','Model'.\n"
-        "FASTQ mode: directory where each sample is a subfolder containing 1 (single-end)\n"
-        "or 2 (paired-end) FASTQ files. Layout (single vs paired) is inferred from\n"
-        "the files present."
-    ),
-)
-@click.option(
-    "-r",
-    "--reference",
-    "reference_path",
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    required=False,
-    help="Reference transcriptome (.fasta/.fa[.gz]) or kallisto index (.idx).",
-)
-@click.option(
-    "-o",
-    "--output",
-    "output_dir",
-    type=click.Path(dir_okay=True, file_okay=False, path_type=Path),
-    default=DEFAULT_OUTDIR,
-    show_default=True,
-    help="Output directory.",
-)
-@click.option("--min-threads", type=int, default=DEFAULT_MIN_THREADS, show_default=True,
-              help="Minimum number of threads per SRR.")
-@click.option("-t", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True,
-              help="Maximum total threads.")
-@click.option("--verbosity/--no-verbosity", default=True, show_default=True,
-              help="Show live progress bars and console messages (default: on).")
-@click.option("-y", "--yes", is_flag=True, help="Assume 'yes' to prompts and run without asking.")
-@click.option("-f", "--force", "--overwrite", is_flag=True,
-              help="Force re-run: overwrite totally/partially processed SRRs.")
-@click.option("-n", "--dry-run", is_flag=True,
-              help="Validate inputs and configuration, print plan, and exit without running tools.")
-@click.option("-g", "--gene-counts", "tx2gene_path",
-              type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              default=None,
-              help="Enable gene counts using a tx2gene (.csv) with columns 'transcript_id','gene_id'.")
-@click.option(
-    "--no-cache",
-    is_flag=True,
-    help="Disable SRA caching (do not allocate a shared cache volume).",
-)
-@click.option(
-    "-c", "--cache",
-    "cache_gb",
-    type=int,
-    default=None,
-    help="Maximum SRA cache size (GiB). Default: auto (300 GiB or free space based).",
-)
-@click.option("--keep-fastq", is_flag=True, help="Keep FASTQ files.")
-@click.option(
-    "--deseq2/--no-deseq2",
-    "deseq2_enabled",
-    default=True,
-    show_default=True,
-    help="Enable DESeq2 normalization + VST expression matrices for downstream plots/network exports.",
-)
-@click.option(
-    "--seq-tech",
-    "seq_tech",
-    type=str,
-    default=None,
-    help=(
-        "Sequencing technology/platform (e.g. 'illumina'). "
-        "Required in FASTQ mode; used to choose kallisto parameters."
-    ),
-)
 def run_cmd(**kwargs):
-    _run_pipeline(**kwargs)
+    pass
+
 
 @cli.command("trim", cls=HulkCommand, help="Configure fastp trimming defaults.")
 @click.option("-ws", "--window-size", type=int, default=None, help="fastp sliding window size.")
 @click.option("-mq", "--mean-quality", type=int, default=None, help="fastp mean quality threshold.")
-@click.option("--reset-defaults", is_flag=True, help="Reset trim options to built-in defaults.")
+@click.option("--reset-defaults", is_flag=True, help="Reset trim options.")
 def trim(window_size: int | None, mean_quality: int | None, reset_defaults: bool):
     if reset_defaults:
         p = _cfg_reset("trim")
         click.secho(f"Reset trim settings to defaults at {p}", fg="green")
         return
     if window_size is None and mean_quality is None:
-        click.echo("Try: hulk trim -h   (to see options)")
+        click.echo("Try: hulk trim -h")
         return
     p = _cfg_update("trim", {"window_size": window_size, "mean_quality": mean_quality})
     click.secho(f"Saved trim settings to {p}", fg="green")
 
-@cli.command("tximport", cls=HulkCommand, help="Configure tximport aggregation/normalization.")
-@click.option("-m", "--mode",
-              type=click.Choice(["raw_counts", "length_scaled_tpm", "scaled_tpm", "dtu_scaled_tpm"], case_sensitive=False),
-              default=None,
-              help="tximport aggregation/normalization mode.")
-@click.option("--ignore-tx-version", "ignore_tx_version", is_flag=True, default=False,
-              help="Strip transcript version suffixes before matching.")
-@click.option("--reset-defaults", is_flag=True, help="Reset tximport options to built-in defaults.")
+
+@cli.command("tximport", cls=HulkCommand, help="Configure tximport aggregation.")
+@click.option("-m", "--mode", type=click.Choice(["raw_counts", "length_scaled_tpm", "scaled_tpm", "dtu_scaled_tpm"],
+                                                case_sensitive=False), default=None)
+@click.option("--ignore-tx-version", "ignore_tx_version", is_flag=True, default=False)
+@click.option("--reset-defaults", is_flag=True)
 def tximport(mode: str | None, ignore_tx_version: bool, reset_defaults: bool):
     if reset_defaults:
         p = _cfg_reset("tximport")
-        click.secho(f"Reset tximport settings to defaults at {p}", fg="green")
+        click.secho(f"Reset tximport settings at {p}", fg="green")
         return
     ctx = click.get_current_context()
     flag_provided = (ctx.get_parameter_source("ignore_tx_version") == ParameterSource.COMMANDLINE)
     if mode is None and not flag_provided:
-        click.echo("Try: hulk tximport -h   (to see options)")
+        click.echo("Try: hulk tximport -h")
         return
     payload = {}
-    if mode is not None:
-        payload["mode"] = mode
-    if flag_provided:
-        payload["ignore_tx_version"] = ignore_tx_version
+    if mode is not None: payload["mode"] = mode
+    if flag_provided: payload["ignore_tx_version"] = ignore_tx_version
     p = _cfg_update("tximport", payload)
     click.secho(f"Saved tximport settings to {p}", fg="green")
 
-@cli.command("align", cls=HulkCommand, help="Configure alignment/quantification method and options.")
-@click.option("--method",
-              type=click.Choice(["kallisto"], case_sensitive=False),
-              default="kallisto", show_default=True,
-              help="Alignment/quantification backend.")
-@click.option("-b", "--bootstrap", type=int, default=100, show_default=True,
-              help="Number of bootstrap samples for kallisto quant.")
-@click.option("--reset-defaults", is_flag=True, help="Reset alignment options to built-in defaults.")
+
+@cli.command("align", cls=HulkCommand, help="Configure alignment/quantification.")
+@click.option("--method", type=click.Choice(["kallisto"], case_sensitive=False), default="kallisto", show_default=True)
+@click.option("-b", "--bootstrap", type=int, default=100, show_default=True)
+@click.option("--reset-defaults", is_flag=True)
 def align(method: str, bootstrap: int, reset_defaults: bool):
     if reset_defaults:
         p = _cfg_reset("align")
-        click.secho(f"Reset align settings to defaults at {p}", fg="green")
+        click.secho(f"Reset align settings at {p}", fg="green")
         return
     payload = {"method": method.lower(), "bootstrap": int(bootstrap)}
     p = _cfg_update("align", payload)
     click.secho(f"Saved align settings to {p}", fg="green")
 
-@cli.command("plot", cls=HulkCommand, help="Configure global and per-BioProject plotting behaviour.")
-@click.option(
-    "--global-pca",
-    type=bool,
-    default=True,
-    metavar="BOOL",
-    help="Enable/disable global PCA plot across all samples (true/false).",
-)
-@click.option(
-    "--global-heatmap",
-    type=bool,
-    default=True,
-    metavar="BOOL",
-    help="Enable/disable global expression heatmap across all samples (true/false).",
-)
-@click.option(
-    "--global-var-heatmap",
-    type=bool,
-    default=True,
-    metavar="BOOL",
-    help="Enable/disable global variance heatmap (gene x BioProject) (true/false).",
-)
-@click.option(
-    "--bp-pca",
-    type=bool,
-    default=False,
-    metavar="BOOL",
-    help="Enable/disable per-BioProject PCA plots (one PCA per BioProject) (true/false).",
-)
-@click.option(
-    "--bp-heatmap",
-    type=bool,
-    default=False,
-    metavar="BOOL",
-    help="Enable/disable per-BioProject expression heatmaps (one heatmap per BioProject) (true/false).",
-)
-@click.option("--reset-defaults", is_flag=True, help="Reset plot options to built-in defaults.")
-def plot(
-    global_pca: bool | None,
-    global_heatmap: bool | None,
-    global_var_heatmap: bool | None,
-    bp_pca: bool | None,
-    bp_heatmap: bool | None,
-    reset_defaults: bool,
-):
-    """
-    Persistently configure which plots are requested.
 
-    Note: plotting only takes effect when DESeq2/VST is enabled for a run
-    (via --deseq2/--no-deseq2 on the main command or 'run' subcommand).
-    """
+@cli.command("deseq2", cls=HulkCommand, help="Configure DESeq2 and variance filtering options.")
+@click.option("--enable/--disable", "enabled", default=None, help="Enable or disable DESeq2/VST steps entirely.")
+@click.option("--var-threshold", type=float, default=None,
+              help="Low variance threshold (default 0.1). Genes below this var are excluded.")
+@click.option("--reset-defaults", is_flag=True, help="Reset DESeq2 options to defaults.")
+def deseq2(enabled: bool | None, var_threshold: float | None, reset_defaults: bool):
     if reset_defaults:
-        p = _cfg_reset("plot")
-        click.secho(f"Reset plot settings to defaults at {p}", fg="green")
+        p = _cfg_reset("deseq2")
+        click.secho(f"Reset DESeq2 settings to defaults at {p}", fg="green")
         return
 
-    if (
-        global_pca is None
-        and global_heatmap is None
-        and global_var_heatmap is None
-        and bp_pca is None
-        and bp_heatmap is None
-    ):
-        click.echo("Try: hulk plot -h   (to see options)")
+    if enabled is None and var_threshold is None:
+        click.echo("Try: hulk deseq2 -h (to see options)")
         return
 
     payload: Dict[str, Any] = {}
-    if global_pca is not None:
-        payload["global_pca"] = bool(global_pca)
-    if global_heatmap is not None:
-        payload["global_heatmap"] = bool(global_heatmap)
-    if global_var_heatmap is not None:
-        payload["global_var_heatmap"] = bool(global_var_heatmap)
-    if bp_pca is not None:
-        payload["bp_pca"] = bool(bp_pca)
-    if bp_heatmap is not None:
-        payload["bp_heatmap"] = bool(bp_heatmap)
+    if enabled is not None:
+        payload["enabled"] = enabled
+    if var_threshold is not None:
+        payload["var_threshold"] = var_threshold
 
+    p = _cfg_update("deseq2", payload)
+    click.secho(f"Saved DESeq2 settings to {p}", fg="green")
+
+
+@cli.command("plot", cls=HulkCommand, help="Configure plotting behaviour.")
+@click.option("--global-pca", type=bool, default=True)
+@click.option("--global-heatmap", type=bool, default=True)
+@click.option("--global-var-heatmap", type=bool, default=True)
+@click.option("--bp-pca", type=bool, default=False)
+@click.option("--bp-heatmap", type=bool, default=False)
+@click.option("--reset-defaults", is_flag=True)
+def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, reset_defaults):
+    if reset_defaults:
+        p = _cfg_reset("plot")
+        click.secho(f"Reset plot settings at {p}", fg="green")
+        return
+    if all(x is None for x in [global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap]):
+        click.echo("Try: hulk plot -h")
+        return
+    payload = {}
+    if global_pca is not None: payload["global_pca"] = bool(global_pca)
+    if global_heatmap is not None: payload["global_heatmap"] = bool(global_heatmap)
+    if global_var_heatmap is not None: payload["global_var_heatmap"] = bool(global_var_heatmap)
+    if bp_pca is not None: payload["bp_pca"] = bool(bp_pca)
+    if bp_heatmap is not None: payload["bp_heatmap"] = bool(bp_heatmap)
     p = _cfg_update("plot", payload)
     click.secho(f"Saved plot settings to {p}", fg="green")
 
-# ---------------------------- Entry point ----------------------------
+
+@cli.command("report", cls=HulkCommand, help="Regenerate plots and matrices from existing output.")
+@click.option("-o", "--output", "output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
+              default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
+@click.option("-g", "--gene-counts", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="tx2gene map (required).")
+@click.option("--target-genes", "target_genes_files", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              multiple=True, help="Target gene list(s) for targeted heatmaps/matrices.")
+@click.option("--no-bp-postprocessing", is_flag=True, help="Skip per-BioProject analysis (only run Global).")
+def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing):
+    """
+    Scans an existing output directory and re-runs the post-processing step
+    (DESeq2, VST, Plotting, Seidr matrices) without re-running alignment.
+
+    It is SAFE to run this command concurrently with 'hulk run' to generate
+    intermediate reports for samples that have finished.
+    """
+    click.secho("\n[Report] Scanning output directory for finished samples...", fg="yellow")
+    click.secho("[Report] Note: It is safe to run this command while the main pipeline is active.", fg="blue")
+
+    # 1. LOAD PERSISTED SETTINGS
+    persisted = _cfg_load()
+    plot_cfg = persisted.get("plot", {})
+
+    # Only load the supported flags
+    global_pca = bool(plot_cfg.get("global_pca", False))
+    global_heatmap = bool(plot_cfg.get("global_heatmap", False))
+    global_var_heatmap = bool(plot_cfg.get("global_var_heatmap", False))
+    bp_pca = bool(plot_cfg.get("bp_pca", False))
+    bp_heatmap = bool(plot_cfg.get("bp_heatmap", False))
+
+    # Combine flags for Config
+    plot_pca = global_pca or bp_pca
+    plot_heatmap = global_heatmap or bp_heatmap
+    plot_var_heatmap = global_var_heatmap
+
+    # 2. Initialize Config (WITHOUT the hallucinated args)
+    cfg = Config(
+        outdir=output_dir,
+        tx2gene=tx2gene_path,
+        target_genes_files=list(target_genes_files) if target_genes_files else None,
+        plots_only_mode=True,
+        # Pass the valid settings
+        plot_pca=plot_pca,
+        plot_heatmap=plot_heatmap,
+        plot_var_heatmap=plot_var_heatmap
+    )
+
+    # Fallback for tx2gene lookup
+    if not cfg.tx2gene:
+        saved_tx = persisted.get("general", {}).get("tx2gene")
+        if saved_tx:
+            cfg.tx2gene = Path(saved_tx).resolve()
+
+    if not cfg.tx2gene:
+        click.secho("Error: tx2gene path is missing. Provide it with -g/--gene-counts.", fg="red")
+        return
+
+    try:
+        # 3. Reconstruct Dataset
+        dataset = Dataset.reconstruct_from_output(cfg)
+
+        click.secho(f"[Report] Found {len(dataset)} samples across {len(dataset.bioprojects)} BioProjects.", fg="green")
+        click.secho(f"[Report] Mode: {dataset.mode}", fg="green")
+
+        if cfg.target_genes_files:
+            tgs = [f.name for f in cfg.target_genes_files]
+            click.secho(f"[Report] Using target lists: {', '.join(tgs)}", fg="cyan")
+
+        if no_bp_postprocessing:
+            click.secho("[Report] Skipping per-BioProject analysis (--no-bp-postprocessing).", fg="cyan")
+
+        # 4. Run Post-Processing
+        # Pass the skip_bp flag correctly
+        run_postprocessing(dataset, cfg, skip_bp=no_bp_postprocessing)
+
+        click.secho("\n[Report] Done. Check output/shared/plots for results.", fg="green")
+
+    except FileNotFoundError as e:
+        click.secho(f"[Error] {e}", fg="red")
+    except Exception as e:
+        click.secho(f"[Error] Unexpected failure: {e}", fg="red")
 
 def main():
     os.environ.setdefault("COLUMNS", str(WIDE_HELP))
     cli(standalone_mode=True)
+
 
 if __name__ == "__main__":
     main()
