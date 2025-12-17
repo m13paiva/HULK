@@ -31,6 +31,79 @@ def _map_counts_from_abundance(mode: str | None) -> str:
     )
 
 
+def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) -> List[str]:
+    """
+    Build argument list for a *global* run of the R post-processing script.
+    """
+    if cfg.tx2gene is None:
+        raise ValueError("tx2gene is required for post-processing but cfg.tx2gene is None.")
+
+    counts_from_abundance = _map_counts_from_abundance(getattr(cfg, "tximport_mode", None))
+
+    args: List[str] = [
+        "Rscript",
+        str(R_SCRIPT_PATH),
+        "--search-dir", str(cfg.outdir),
+        "--tx2gene", str(cfg.tx2gene),
+        "--out-dir", str(out_dir),
+        "--prefix", "hulk",
+        "--counts-from-abundance", counts_from_abundance,
+    ]
+
+    if mode:
+        args.extend(["--mode", mode])
+
+    if getattr(cfg, "tximport_ignore_tx_version", False):
+        args.append("--ignore-tx-version")
+
+    use_matrix = getattr(cfg, "expr_use_matrix", "vst") or "vst"
+    args.extend(["--use-matrix", use_matrix])
+
+    if not getattr(cfg, "drop_nonvarying_genes", True):
+        args.append("--no-drop-nonvarying")
+
+    var_thresh = getattr(cfg, "deseq2_var_threshold", 0.1)
+    args.extend(["--var-threshold", str(var_thresh)])
+
+    # Top N
+    top_n = getattr(cfg, "top_n_vars", 500)
+    args.extend(["--top-n", str(top_n)])
+
+    # --- Target Genes: Join multiple files with commas ---
+    target_files = getattr(cfg, "target_genes_files", [])
+    if target_files:
+        joined_targets = ",".join(str(tf) for tf in target_files)
+        args.extend(["--target-genes", joined_targets])
+
+    # Plot Modes
+    deseq2_enabled = bool(getattr(cfg, "deseq2_vst_enabled", True))
+    txi_only_mode = bool(getattr(cfg, "tximport_only_mode", False))
+    plots_only_mode = bool(getattr(cfg, "plots_only_mode", False))
+
+    if plots_only_mode:
+        args.append("--plots-only")
+
+    elif (not deseq2_enabled) or txi_only_mode:
+        args.append("--tximport-only")
+        # FORCE RE-IMPORT even in txi-only mode to capture new samples
+        args.append("--force-txi")
+        return args
+
+    else:
+        # FULL RUN: Force re-import to avoid stale cache from partial runs
+        args.append("--force-txi")
+
+    if deseq2_enabled:
+        if getattr(cfg, "plot_pca", False):
+            args.append("--pca")
+        if getattr(cfg, "plot_heatmap", False):
+            args.append("--heatmap")
+        if getattr(cfg, "plot_var_heatmap", False):
+            args.append("--var-heatmap")
+
+    return args
+
+
 def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[str], bool]:
     """
     Build argument list for a *per-BioProject* run of the R script.
@@ -57,53 +130,46 @@ def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[s
     if getattr(cfg, "tximport_ignore_tx_version", False):
         args.append("--ignore-tx-version")
 
-    # Matrix for Seidr exports: "vst" | "normalized"
     use_matrix = getattr(cfg, "expr_use_matrix", "vst")
     if use_matrix not in {"vst", "normalized"}:
         use_matrix = "vst"
     args.extend(["--use-matrix", use_matrix])
 
-    # Drop non-varying genes?  (R flag is inverse: --no-drop-nonvarying)
     if not getattr(cfg, "drop_nonvarying_genes", True):
         args.append("--no-drop-nonvarying")
 
-    # Variance Threshold
     var_thresh = getattr(cfg, "deseq2_var_threshold", 0.1)
     args.extend(["--var-threshold", str(var_thresh)])
 
-    # Multiple target gene files (passed as repeated --target-genes args)
+    # --- Target Genes: Join multiple files with commas (FIXED) ---
     target_files = getattr(cfg, "target_genes_files", [])
     if target_files:
-        for tf in target_files:
-            args.extend(["--target-genes", str(tf)])
+        joined_targets = ",".join(str(tf) for tf in target_files)
+        args.extend(["--target-genes", joined_targets])
 
-    # Decide mode:
-    # - plots-only        -> use existing VST, just plots
-    # - tximport-only     -> gene counts only
-    # - full DESeq2+VST   -> full treatment, incl. plots if requested
     deseq2_enabled = bool(getattr(cfg, "deseq2_vst_enabled", True))
     plots_only_mode = bool(getattr(cfg, "plots_only_mode", False))
     tximport_only_mode = bool(getattr(cfg, "tximport_only_mode", False))
 
     if plots_only_mode:
         args.append("--plots-only")
-        # plots-only implicitly needs DESeq2/VST to have been run before.
 
     elif (not deseq2_enabled) or tximport_only_mode:
-        # Pure tximport-only, this is where the R script writes tximport_counts.tsv
         args.append("--tximport-only")
-        # Do NOT pass any plot flags; R quits right after writing counts.
+        # FORCE RE-IMPORT (FIXED)
+        args.append("--force-txi")
         return args, True
 
-    # Full DESeq2+VST pipeline (BP-specific "full treatment")
+    else:
+        # FULL RUN: FORCE RE-IMPORT (FIXED)
+        args.append("--force-txi")
+
     if deseq2_enabled:
         if getattr(cfg, "plot_pca", False):
             args.append("--pca")
         if getattr(cfg, "plot_heatmap", False):
             args.append("--heatmap")
         if getattr(cfg, "plot_var_heatmap", False):
-            # R script will automatically disable var-heatmap in --bioproject mode usually,
-            # but we pass the flag if user requested it globally.
             args.append("--var-heatmap")
 
     return args, False
@@ -217,72 +283,6 @@ def run_postprocessing_bp(bp, cfg: Config, *, r_script: Path | None = None) -> P
     # Full DESeq2/VST mode: no gene_counts.tsv here, but all the juicy stuff
     log(f"[{bp.id}] R post-processing (DESeq2/VST) completed.", log_path)
     return None
-
-def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) -> List[str]:
-    """
-    Build argument list for a *global* run of the R post-processing script.
-    """
-    if cfg.tx2gene is None:
-        raise ValueError("tx2gene is required for post-processing but cfg.tx2gene is None.")
-
-    counts_from_abundance = _map_counts_from_abundance(getattr(cfg, "tximport_mode", None))
-
-    args: List[str] = [
-        "Rscript",
-        str(R_SCRIPT_PATH),
-        "--search-dir", str(cfg.outdir),
-        "--tx2gene", str(cfg.tx2gene),
-        "--out-dir", str(out_dir),
-        "--prefix", "hulk",
-        "--counts-from-abundance", counts_from_abundance,
-    ]
-
-    if mode:
-        args.extend(["--mode", mode])
-
-    if getattr(cfg, "tximport_ignore_tx_version", False):
-        args.append("--ignore-tx-version")
-
-    use_matrix = getattr(cfg, "expr_use_matrix", "vst") or "vst"
-    args.extend(["--use-matrix", use_matrix])
-
-    if not getattr(cfg, "drop_nonvarying_genes", True):
-        args.append("--no-drop-nonvarying")
-
-    var_thresh = getattr(cfg, "deseq2_var_threshold", 0.1)
-    args.extend(["--var-threshold", str(var_thresh)])
-
-    # Top N
-    top_n = getattr(cfg, "top_n_vars", 500)
-    args.extend(["--top-n", str(top_n)])
-
-    # --- CHANGED: Join multiple files with commas ---
-    target_files = getattr(cfg, "target_genes_files", [])
-    if target_files:
-        # Join paths with ',' and pass as a SINGLE string
-        joined_targets = ",".join(str(tf) for tf in target_files)
-        args.extend(["--target-genes", joined_targets])
-
-    # Plot Modes
-    deseq2_enabled = bool(getattr(cfg, "deseq2_vst_enabled", True))
-    txi_only_mode = bool(getattr(cfg, "tximport_only_mode", False))
-    plots_only_mode = bool(getattr(cfg, "plots_only_mode", False))
-
-    if plots_only_mode:
-        args.append("--plots-only")
-    elif (not deseq2_enabled) or txi_only_mode:
-        args.append("--tximport-only")
-        return args
-
-    if deseq2_enabled:
-        if getattr(cfg, "plot_pca", False):
-            args.append("--pca")
-        if getattr(cfg, "plot_heatmap", False):
-            args.append("--heatmap")
-        if getattr(cfg, "plot_var_heatmap", False):
-            args.append("--var-heatmap")
-
-    return args
 
 
 def run_postprocessing(dataset: Dataset, cfg: Config, *, r_script: Path | None = None, skip_bp: bool = False) -> None:

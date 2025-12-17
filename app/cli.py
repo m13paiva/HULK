@@ -676,7 +676,7 @@ def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, res
     click.secho(f"Saved plot settings to {p}", fg="green")
 
 
-@cli.command("report", cls=HulkCommand, help="Regenerate plots and matrices from existing output.")
+@cli.command("report", cls=HulkCommand, help="Regenerate plots and matrices from existing output (Safe to run while another instance of HULK runs on the same dataset.")
 @click.option("-o", "--output", "output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
               default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
 @click.option("-g", "--gene-counts", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
@@ -684,13 +684,15 @@ def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, res
 @click.option("--target-genes", "target_genes_files", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               multiple=True, help="Target gene list(s) for targeted heatmaps/matrices.")
 @click.option("--no-bp-postprocessing", is_flag=True, help="Skip per-BioProject analysis (only run Global).")
-def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing):
+@click.option("--fast", is_flag=True, help="Skip DESeq2 recalculation and only replot existing matrices (Fast Mode).")
+def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, fast):
     """
-    Scans an existing output directory and re-runs the post-processing step
-    (DESeq2, VST, Plotting, Seidr matrices) without re-running alignment.
+    Scans an existing output directory and re-runs the post-processing step.
 
-    It is SAFE to run this command concurrently with 'hulk run' to generate
-    intermediate reports for samples that have finished.
+    By default, it RECALCULATES the expression matrices (tximport -> DESeq2)
+    to ensure all currently finished samples are included.
+
+    Use --fast to skip recalculation and just replot the existing vst.tsv.
     """
     click.secho("\n[Report] Scanning output directory for finished samples...", fg="yellow")
     click.secho("[Report] Note: It is safe to run this command while the main pipeline is active.", fg="blue")
@@ -699,7 +701,6 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing):
     persisted = _cfg_load()
     plot_cfg = persisted.get("plot", {})
 
-    # Only load the supported flags
     global_pca = bool(plot_cfg.get("global_pca", False))
     global_heatmap = bool(plot_cfg.get("global_heatmap", False))
     global_var_heatmap = bool(plot_cfg.get("global_var_heatmap", False))
@@ -711,12 +712,15 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing):
     plot_heatmap = global_heatmap or bp_heatmap
     plot_var_heatmap = global_var_heatmap
 
-    # 2. Initialize Config (WITHOUT the hallucinated args)
+    # 2. Initialize Config
+    # CRITICAL CHANGE: plots_only_mode is now False by default (unless --fast is passed)
+    # This ensures we actually READ the new abundance files and update the matrix.
     cfg = Config(
         outdir=output_dir,
         tx2gene=tx2gene_path,
         target_genes_files=list(target_genes_files) if target_genes_files else None,
-        plots_only_mode=True,
+        plots_only_mode=fast,  # False = Recalculate VST; True = Just Plot
+
         # Pass the valid settings
         plot_pca=plot_pca,
         plot_heatmap=plot_heatmap,
@@ -747,8 +751,12 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing):
         if no_bp_postprocessing:
             click.secho("[Report] Skipping per-BioProject analysis (--no-bp-postprocessing).", fg="cyan")
 
+        if fast:
+            click.secho("[Report] Fast mode: Using existing VST matrix (plots only).", fg="yellow")
+        else:
+            click.secho("[Report] Recalculating expression matrices (this may take a moment)...", fg="magenta")
+
         # 4. Run Post-Processing
-        # Pass the skip_bp flag correctly
         run_postprocessing(dataset, cfg, skip_bp=no_bp_postprocessing)
 
         click.secho("\n[Report] Done. Check output/shared/plots for results.", fg="green")
