@@ -114,27 +114,38 @@ def _bundle_srr(
             sample.log_path,
         )
 
-        # detect FASTQs
-        fq1 = next(outdir.glob(f"{srr}_1.fastq"), None)
-        fq2 = next(outdir.glob(f"{srr}_2.fastq"), None)
-        if fq1 is None and fq2 is None:
-            # single-end fasterq sometimes yields just <srr>.fastq when not split
-            single = next(outdir.glob(f"{srr}.fastq"), None)
-            if single is None:
-                raise FileNotFoundError(f"No FASTQ files for {srr} in {outdir}")
-            fqs = [single]
-        else:
-            fqs = [p for p in (fq1, fq2) if p is not None]
+        # detect FASTQs (and ignore empty mates)
+        fq1 = outdir / f"{srr}_1.fastq"
+        fq2 = outdir / f"{srr}_2.fastq"
+        se = outdir / f"{srr}.fastq"
+
+        fqs = []
+        if fq1.exists() and fq1.stat().st_size > 0:
+            fqs.append(fq1)
+        if fq2.exists() and fq2.stat().st_size > 0:
+            fqs.append(fq2)
+
+        if not fqs:
+            if se.exists() and se.stat().st_size > 0:
+                fqs = [se]
+            elif fq1.exists() and fq1.stat().st_size > 0:
+                # fallback: treat as SE but normalize name for downstream
+                new_se = outdir / f"{srr}.fastq"
+                fq1.rename(new_se)
+                fqs = [new_se]
+            else:
+                raise FileNotFoundError(f"No usable FASTQ files for {srr} in {outdir}")
 
         # remove .sra as soon as we have fastqs on disk
         _rm(sra)
 
         # -------------------------------
-        # fastp → trimmed FASTQs
+        # fastp → trimmed FASTQs (CANONICAL NAMES)
         # -------------------------------
-        trimmed = [outdir / (p.stem + ".trim.fastq") for p in fqs]
         cmd = ["fastp", "-w", str(fastp_threads)]
+
         if len(fqs) == 2:
+            trimmed = [outdir / f"{srr}_1.trim.fastq", outdir / f"{srr}_2.trim.fastq"]
             cmd += [
                 "-i", str(fqs[0]),
                 "-I", str(fqs[1]),
@@ -142,10 +153,12 @@ def _bundle_srr(
                 "-O", str(trimmed[1]),
             ]
         else:
+            trimmed = [outdir / f"{srr}.trim.fastq"]
             cmd += [
                 "-i", str(fqs[0]),
                 "-o", str(trimmed[0]),
             ]
+
         run_cmd(cmd, outdir, sample.log_path)
 
         # CLEANUP STEP 1 — remove *raw* FASTQs produced by fasterq-dump

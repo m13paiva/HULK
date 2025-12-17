@@ -42,12 +42,14 @@
   - Uses **tximport** to import quantification results into R.
   - Uses **DESeq2** (optional) to compute:
     - Normalized gene-level count matrices.
-    - Variance-stabilizing transform (VST) expression matrices.  
+    - Variance-stabilizing transform (VST) expression matrices.
     (DESeq2 is currently run without metadata/design formulas.)
-  - Produces:
-    - Variance heatmaps.
-    - Expression heatmaps.
-    - PCA plots at the sample level.
+  - Produces a comprehensive suite of QC plots:
+    - **Variance Heatmaps** (clustering by gene variance).
+    - **Expression Heatmaps** (global and targeted gene sets).
+    - **PCA Plots** (Principal Component Analysis).
+    - **Sample-to-Sample Correlation Heatmaps** (Pearson correlation for outlier detection).
+    - **DESeq2 Dispersion Plots** (Model fit diagnostics).
   - Saves both the figures and the corresponding matrix files for downstream reuse.
 
 - **Gene-level expression focus**
@@ -65,7 +67,9 @@
   - Separates **prefetch** and **processing** workers in SRA mode:
     - A dedicated prefetch loop continuously downloads SRR data into a shared cache.
     - Processing workers operate only on already-prefetched data, reducing idle time and improving throughput.
-  - Uses CPU-aware concurrency to distribute work across BioProjects and runs.
+  - **Parallelized Post-Processing**:
+    - Splits R analysis into a "Compute Phase" (matrix generation) and a "Visualization Phase" (plotting).
+    - Uses concurrent workers to generate multiple plots simultaneously, significantly reducing runtime on large datasets.
 
 - **Containerized & reproducible**
   - Distributed as a Docker image.
@@ -76,24 +80,24 @@
 
 ## Supported Platforms
 
-| Vendor / Family        | Models                                                                 |
+| Vendor / Family        | Models                                                                      |
 |------------------------|-------------------------------------------------------------------------|
-| **Illumina NovaSeq**   | 6000, X, X Plus                                                         |
-| **Illumina HiSeq**     | X Ten, 4000, 3000, 2500, 2000, 1500, 1000                              |
-| **Illumina NextSeq**   | 1000, 500, 550                                                          |
-| **BGI / MGI**          | DNBSEQ-G400, DNBSEQ-T7, BGISEQ-500, MGISEQ-2000RS                      |
-| **Legacy Illumina**    | Genome Analyzer II / IIX                                               |
+| **Illumina NovaSeq** | 6000, X, X Plus                                                         |
+| **Illumina HiSeq** | X Ten, 4000, 3000, 2500, 2000, 1500, 1000                               |
+| **Illumina NextSeq** | 1000, 500, 550                                                          |
+| **BGI / MGI** | DNBSEQ-G400, DNBSEQ-T7, BGISEQ-500, MGISEQ-2000RS                       |
+| **Legacy Illumina** | Genome Analyzer II / IIX                                                |
 
 ---
 
 ## Requirements
 
-- **OS:** Linux  
-- **Container:** Docker installed and usable  
+- **OS:** Linux
+- **Container:** Docker installed and usable
 - **Network (for SRA mode):**
   - To pull the image from Docker Hub.
   - To access NCBI/ENA for `prefetch` / `fasterq-dump`.
-- **Compute:**  
+- **Compute:**
   - Designed for servers/HPC; large datasets can be computationally intensive and long-running.
 
 ---
@@ -103,7 +107,7 @@
 ### Option 1 — Official installer (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/m13paiva/hulk/main/install_hulk.sh | bash
+curl -fsSL [https://raw.githubusercontent.com/m13paiva/hulk/main/install_hulk.sh](https://raw.githubusercontent.com/m13paiva/hulk/main/install_hulk.sh) | bash
 ```
 
 This script:
@@ -143,8 +147,8 @@ In SRA mode, `-i/--input` must point to a **RunInfo-style table** (CSV/TSV/TXT) 
 - `BioProject`
 - `Model`
 
-The table is typically obtained from NCBI SRA (“Send to → File → RunInfo”).  
-The `Run` values are SRR accessions, `BioProject` is used to group runs into projects, and `Model` describes the sequencer/instrument.  
+The table is typically obtained from NCBI SRA (“Send to → File → RunInfo”).
+The `Run` values are SRR accessions, `BioProject` is used to group runs into projects, and `Model` describes the sequencer/instrument.
 The `-r/--reference` option takes either a transcriptome FASTA (`.fa/.fasta[.gz]`) or a prebuilt `kallisto` index (`.idx`).
 
 ---
@@ -166,7 +170,7 @@ In FASTQ mode, `-i/--input` must point to a **directory**:
 - Layout (single vs paired) is inferred automatically from the number of FASTQ files present.
 - Deeper nested subdirectories are ignored; only FASTQ files directly inside the sample folder are considered.
 
-Because there is no RunInfo metadata in FASTQ mode, you must provide `--seq-tech` with the sequencing technology (e.g. `ILLUMINA NovaSeq 6000`).  
+Because there is no RunInfo metadata in FASTQ mode, you must provide `--seq-tech` with the sequencing technology (e.g. `ILLUMINA NovaSeq 6000`).
 HULK uses this to select sensible fragment-length defaults for `kallisto` single-end quantification.
 
 ---
@@ -175,7 +179,7 @@ HULK uses this to select sensible fragment-length defaults for `kallisto` single
 
 To generate an SRA RunInfo table from NCBI:
 
-1. Go to the **SRA Search**: https://www.ncbi.nlm.nih.gov/sra
+1. Go to the **SRA Search**: [https://www.ncbi.nlm.nih.gov/sra](https://www.ncbi.nlm.nih.gov/sra)
 2. Search by **BioProject** or paste SRA accessions (e.g. `PRJNA1141930`).
 3. Select your runs of interest.
 4. Click **“Send to:” → “File” → “RunInfo”**.
@@ -198,7 +202,7 @@ SRR30141435,PRJNA1141930,ILLUMINA HiSeq 2500, ...
 
 ## FASTQ Mode
 
-In FASTQ mode, HULK skips SRA download and runs directly on local FASTQ files.  
+In FASTQ mode, HULK skips SRA download and runs directly on local FASTQ files.
 Instead of a RunInfo table, you provide a **directory** via `-i / --input`.
 
 ### Directory layout
@@ -239,16 +243,16 @@ Both uncompressed (`.fastq`) and compressed (`.fastq.gz`) files are supported.
 
 ### Sequencing technology (`--seq-tech`)
 
-In SRA mode, HULK can infer the sequencing technology from the `Model` column in the RunInfo table.  
+In SRA mode, HULK can infer the sequencing technology from the `Model` column in the RunInfo table.
 In FASTQ mode, there is no such metadata, so the user must provide it:
 
-- `--seq-tech TEXT`  
+- `--seq-tech TEXT`
   A string describing the sequencing technology / instrument model, for example:
   - `"ILLUMINA NovaSeq 6000"`
   - `"ILLUMINA HiSeq 2500"`
   - `"DNBSEQ-G400"`
 
-HULK uses `--seq-tech` in FASTQ mode for Kallisto parametrization and for basic descriptive labeling.  
+HULK uses `--seq-tech` in FASTQ mode for Kallisto parametrization and for basic descriptive labeling.
 If your FASTQ directory mixes data from multiple sequencing technologies, it is recommended to run HULK separately for each technology, with the appropriate `--seq-tech` value each time.
 
 ---
@@ -257,7 +261,7 @@ If your FASTQ directory mixes data from multiple sequencing technologies, it is 
 
 HULK uses a Click-based CLI with a main command and persistent configuration subcommands.
 
-> Subcommand options are stored in a small JSON file inside the container  
+> Subcommand options are stored in a small JSON file inside the container
 > at `/app/.hulk.json`.
 
 ### Main command — `hulk [OPTIONS]`
@@ -399,7 +403,7 @@ Options
 
 ### Subcommand — `hulk plot [OPTIONS]` (plotting behaviour)
 
-Configure which plots are requested in post-processing.  
+Configure which plots are requested in post-processing.
 Plotting only takes effect when DESeq2/VST is enabled in the main command (`--deseq2`).
 
 ```text
@@ -413,6 +417,15 @@ Options
   --global-var-heatmap BOOL
       Enable/disable global variance heatmap (gene x BioProject) (true/false).  [default: true]
 
+  --sample-cor BOOL
+      Enable/disable sample-to-sample correlation heatmap (Pearson). Useful for outlier detection. [default: true]
+
+  --dispersion BOOL
+      Enable/disable DESeq2 dispersion estimate plot (diagnostic). [default: true]
+
+  --top-n INTEGER
+      Number of most variable genes to use for Global Heatmap/PCA calculation. [default: 500]
+
   --bp-pca BOOL
       Enable/disable per-BioProject PCA plots (one PCA per BioProject) (true/false).  [default: false]
 
@@ -421,6 +434,34 @@ Options
 
   --reset-defaults
       Reset plot options to built-in defaults.
+
+  -h, --help
+      Show help and exit.
+```
+
+---
+
+### Subcommand — `hulk report [OPTIONS]` (regenerate reports)
+
+Scans an existing output directory and re-runs the post-processing step using the settings configured via `hulk plot`. Useful for regenerating plots, adding target gene lists, or recovering failed post-processing steps without re-running quantification.
+
+```text
+Options
+  -o, --output PATH
+      Output directory to scan. [default: output]
+
+  -g, --gene-counts PATH
+      tx2gene map (required for aggregation).
+
+  --target-genes PATH
+      File(s) containing target genes (one gene per line). Can be used multiple times.
+
+  --no-bp-postprocessing
+      Skip per-BioProject analysis (only run Global).
+
+  --fast
+      Skip DESeq2 recalculation and only replot existing matrices (Fast Mode).
+      Note: 'Dispersion' plots cannot be generated in --fast mode as they require model refitting.
 
   -h, --help
       Show help and exit.
@@ -458,13 +499,17 @@ hulk -i RunInfo.csv -r transcripts.fa.gz -g tx2gene.csv -o results
 hulk align -b 250
 hulk -i RunInfo.csv -r transcripts.fa.gz -o results
 
-# 9) Configure plotting behaviour
-hulk plot --global-pca true --global-heatmap true --global-var-heatmap true           --bp-pca false --bp-heatmap false
+# 9) Configure advanced plotting behaviour (Saved persistently)
+hulk plot --global-pca true --sample-cor true --dispersion true --top-n 1000
+hulk -i RunInfo.csv -r transcripts.fa.gz -o results
 
-# 10) Run via Docker directly (no wrapper install)
+# 10) Regenerate reports for an existing run (uses saved plot settings)
+hulk report -o results -g tx2gene.csv --target-genes my_pathway.txt
+
+# 11) Run via Docker directly (no wrapper install)
 docker run --rm -v "$PWD":/data -w /data m13paiva/hulk:latest   -i RunInfo.csv -r transcripts.fa.gz -o results --verbosity
 
-# 11) FASTQ mode (local FASTQ directory)
+# 12) FASTQ mode (local FASTQ directory)
 # fastq_runs/ has one subdirectory per sample, each with 1 (SE) or 2 (PE) FASTQ/FASTQ.GZ files.
 hulk -i fastq_runs/ -r transcripts.fa.gz -o results_fastq   --seq-tech "ILLUMINA NovaSeq 6000" --verbosity
 ```
@@ -479,23 +524,28 @@ The exact layout can vary slightly depending on the user's inputs, but a typical
 outdir/
 ├── PRJNA1141930/
 │   ├── SRR30141434/
-│   │   ├── fastp.json             ← fastp QC and trimming report 
-│   │   ├── run_info.json          ← kallisto run metadata for this sample
-│   │   ├── abundance.tsv          ← kallisto transcript-level quantification for this sample
-│   │   └── SRR30141434.log        ← Sample-level log file
-│   ├── SRRxxxxxxxx/               ← Additional samples (same structure)
-│   ├── multiqc_PRJNA1141930.html  ← Project-level MultiQC report
-│   ├── plots/                     ← Per-BioProject plots and their underlying matrices
-│   ├── deseq2/                    ← DESeq2-normalized counts and VST matrices
-│   ├── tximport/                  ← tximport summaries and intermediate artifacts
-│   └── PRJNA1141930.log           ← BioProject-level log file
-├── PRJNAxxxxxxx/                  ← Additional BioProjects (same structure)
-└── shared/                        ← Shared (across all Bioprojects and Samples) output
-    ├── plots/                     ← Global/cross-project plots and their underlying matrices
-    ├── deseq2/                    ← Global DESeq2 outputs
-    ├── tximport/                  ← Global tables from tximport
-    ├── log.txt                    ← Global log file
-    └── multiqc_global.html        ← Global MultiQC report 
+│   │   ├── fastp.json              ← fastp QC and trimming report 
+│   │   ├── run_info.json           ← kallisto run metadata for this sample
+│   │   ├── abundance.tsv           ← kallisto transcript-level quantification for this sample
+│   │   └── SRR30141434.log         ← Sample-level log file
+│   ├── SRRxxxxxxxx/                ← Additional samples (same structure)
+│   ├── multiqc_PRJNA1141930.html   ← Project-level MultiQC report
+│   ├── plots/                      ← Per-BioProject plots and their underlying matrices
+│   ├── deseq2/                     ← DESeq2-normalized counts and VST matrices
+│   ├── tximport/                   ← tximport summaries and intermediate artifacts
+│   └── PRJNA1141930.log            ← BioProject-level log file
+├── PRJNAxxxxxxx/                   ← Additional BioProjects (same structure)
+└── shared/                         ← Shared (across all Bioprojects and Samples) output
+    ├── plots/                      ← Global/cross-project plots
+    │   ├── PCA.pdf                 
+    │   ├── expression_heatmap.pdf  
+    │   ├── variance_heatmap.pdf    
+    │   ├── sample_correlation.pdf  ← (New) Sample-Sample Correlation
+    │   └── deseq2_dispersion.pdf   ← (New) DESeq2 Dispersion
+    ├── deseq2/                     ← Global DESeq2 outputs
+    ├── tximport/                   ← Global tables from tximport
+    ├── log.txt                     ← Global log file
+    └── multiqc_global.html         ← Global MultiQC report 
 ```
 
 ---
@@ -504,26 +554,26 @@ outdir/
 
 HULK orchestrates several third-party tools. If you use HULK in your research, please also consider citing the underlying tools where appropriate:
 
-- **NCBI SRA Toolkit**  
-    https://github.com/ncbi/sra-tools <br>
+- **NCBI SRA Toolkit**
+    [https://github.com/ncbi/sra-tools](https://github.com/ncbi/sra-tools) <br>
   Used for fetching and converting SRA data (`prefetch`, `fasterq-dump`) in SRA mode.
 
-- **fastp**  
-  https://github.com/OpenGene/fastp<br>
+- **fastp**
+  [https://github.com/OpenGene/fastp](https://github.com/OpenGene/fastp)<br>
   Used for read QC and trimming.
 
-- **kallisto**  
-    https://github.com/pachterlab/kallisto<br>
+- **kallisto**
+    [https://github.com/pachterlab/kallisto](https://github.com/pachterlab/kallisto)<br>
   Used for pseudoalignment and transcript quantification.
 
-- **MultiQC**  
-    https://github.com/MultiQC/MultiQC <br>
+- **MultiQC**
+    [https://github.com/MultiQC/MultiQC](https://github.com/MultiQC/MultiQC) <br>
   Used for aggregating QC metrics into per-project and global reports.
 
-- **R and Bioconductor**  
+- **R and Bioconductor**
   - **tximport** — imports transcript-level quantifications and summarizes them at the gene 
-  level.  <br> https://github.com/thelovelab/tximport
-  - **DESeq2** — computes normalized gene counts and VST matrices, and supports generation of diagnostic plots. <br> https://github.com/thelovelab/DESeq2
+  level.  <br> [https://github.com/thelovelab/tximport](https://github.com/thelovelab/tximport)
+  - **DESeq2** — computes normalized gene counts and VST matrices, and supports generation of diagnostic plots. <br> [https://github.com/thelovelab/DESeq2](https://github.com/thelovelab/DESeq2)
 
 ---
 
@@ -537,7 +587,7 @@ HULK orchestrates several third-party tools. If you use HULK in your research, p
 
 If you use HULK in your research, please cite the software as:
 
->Paiva de Almeida, M., & Barros, P. **HULK: High-volume bulk RNA-seq pipeline.** https://github.com/m13paiva/hulk
+>Paiva de Almeida, M., & Barros, P. **HULK: High-volume bulk RNA-seq pipeline.** [https://github.com/m13paiva/hulk](https://github.com/m13paiva/hulk)
 
 In addition to citing HULK, please also cite the underlying tools used in the pipeline (SRA Toolkit, fastp, kallisto, MultiQC, tximport, DESeq2) as appropriate.
 
@@ -545,5 +595,5 @@ In addition to citing HULK, please also cite the underlying tools used in the pi
 
 ## Links
 
-- GitHub: https://github.com/m13paiva/hulk  
-- Docker Hub: https://hub.docker.com/r/m13paiva/hulk
+- GitHub: [https://github.com/m13paiva/hulk](https://github.com/m13paiva/hulk)
+- Docker Hub: [https://hub.docker.com/r/m13paiva/hulk](https://hub.docker.com/r/m13paiva/hulk)

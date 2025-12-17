@@ -1,44 +1,29 @@
-# post_processing.py
-
 from __future__ import annotations
-
 import subprocess
 from pathlib import Path
-from typing import List, Any
+from types import SimpleNamespace
+from typing import List, Any, Optional, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .entities import Config
+from .entities import Config, Dataset
 from .utils import log, log_err
 
 R_SCRIPT_PATH = Path(__file__).with_name("post_processing.R")
 
 
 def _map_counts_from_abundance(mode: str | None) -> str:
-    """
-    Map Config.tximport_mode (python side) to the R script's
-    --counts-from-abundance argument.
-    """
-    m = (mode or "").strip().lower()
-    if m in {"", "raw_counts", "no", "none"}:
-        return "no"
-    if m in {"scaled_tpm", "scaledtpm"}:
-        return "scaledTPM"
-    if m in {"length_scaled_tpm", "lengthscaledtpm"}:
+    if mode == "length_scaled_tpm":
         return "lengthScaledTPM"
-    if m in {"dtu_scaled_tpm", "dtuscaledtpm"}:
+    elif mode == "scaled_tpm":
+        return "scaledTPM"
+    elif mode == "dtu_scaled_tpm":
         return "dtuScaledTPM"
-    raise ValueError(
-        "Invalid tximport_mode for R post-processing: "
-        f"{mode!r}. Expected one of: raw_counts, scaled_tpm, "
-        "length_scaled_tpm, dtu_scaled_tpm"
-    )
+    return "no"
 
 
-def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[str], bool]:
+def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) -> List[str]:
     """
-    Build argument list for a *per-BioProject* run of the R script.
-
-    Returns:
-      (args, tximport_only_mode_flag)
+    Build BASE argument list for a *global* run.
     """
     if cfg.tx2gene is None:
         raise ValueError("tx2gene is required for post-processing but cfg.tx2gene is None.")
@@ -48,350 +33,251 @@ def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[s
     args: List[str] = [
         "Rscript",
         str(R_SCRIPT_PATH),
+        "--search-dir", str(cfg.outdir),
+        "--tx2gene", str(cfg.tx2gene),
+        "--out-dir", str(out_dir),
+        "--prefix", "hulk",
+        "--counts-from-abundance", counts_from_abundance,
+    ]
+
+    if mode:
+        args.extend(["--mode", mode])
+
+    if getattr(cfg, "tximport_ignore_tx_version", False):
+        args.append("--ignore-tx-version")
+
+    use_matrix = getattr(cfg, "expr_use_matrix", "vst") or "vst"
+    args.extend(["--use-matrix", use_matrix])
+
+    if not getattr(cfg, "drop_nonvarying_genes", True):
+        args.append("--no-drop-nonvarying")
+
+    var_thresh = getattr(cfg, "deseq2_var_threshold", 0.1)
+    args.extend(["--var-threshold", str(var_thresh)])
+
+    top_n = getattr(cfg, "top_n_vars", 500)
+    args.extend(["--top-n", str(top_n)])
+
+    target_files = getattr(cfg, "target_genes_files", [])
+    if target_files:
+        joined_targets = ",".join(str(tf) for tf in target_files)
+        args.extend(["--target-genes", joined_targets])
+
+    deseq2_enabled = bool(getattr(cfg, "deseq2_vst_enabled", True))
+    txi_only_mode = bool(getattr(cfg, "tximport_only_mode", False))
+
+    if (not deseq2_enabled) or txi_only_mode:
+        args.append("--tximport-only")
+
+    # --- CRITICAL FIX ---
+    # Dispersion plot MUST be generated during Phase 1 (Compute) because it needs the DESeq2 object.
+    # It cannot be generated in Phase 2 (Plots Only) which only uses the VST matrix.
+    if getattr(cfg, "plot_dispersion", False):
+        args.append("--dispersion")
+
+    # Always force update in global mode (Phase 1).
+    args.append("--force-txi")
+
+    return args
+
+
+def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[str], bool]:
+    """
+    Build argument list for a *per-BioProject* run.
+    """
+    counts_from_abundance = _map_counts_from_abundance(getattr(cfg, "tximport_mode", None))
+    args: List[str] = [
+        "Rscript", str(R_SCRIPT_PATH),
         "--search-dir", str(cfg.outdir),
         "--tx2gene", str(cfg.tx2gene),
         "--out-dir", str(out_dir),
         "--prefix", bp_id,
         "--bioproject", bp_id,
         "--counts-from-abundance", counts_from_abundance,
+        "--force-txi"
     ]
 
     if getattr(cfg, "tximport_ignore_tx_version", False):
         args.append("--ignore-tx-version")
 
-    # Matrix for Seidr exports: "vst" | "normalized"
     use_matrix = getattr(cfg, "expr_use_matrix", "vst")
     if use_matrix not in {"vst", "normalized"}:
         use_matrix = "vst"
     args.extend(["--use-matrix", use_matrix])
 
-    # Drop non-varying genes?  (R flag is inverse: --no-drop-nonvarying)
     if not getattr(cfg, "drop_nonvarying_genes", True):
         args.append("--no-drop-nonvarying")
 
-    # Optional target gene list (also applies in BP mode)
-    if getattr(cfg, "target_genes_file", None):
-        args.extend(["--target-genes", str(cfg.target_genes_file)])
+    var_thresh = getattr(cfg, "deseq2_var_threshold", 0.1)
+    args.extend(["--var-threshold", str(var_thresh)])
 
-    # Decide mode:
-    # - plots-only       -> use existing VST, just plots
-    # - tximport-only    -> gene counts only
-    # - full DESeq2+VST  -> full treatment, incl. plots if requested
+    top_n = getattr(cfg, "top_n_vars", 500)
+    args.extend(["--top-n", str(top_n)])
+
+    target_files = getattr(cfg, "target_genes_files", [])
+    if target_files:
+        joined_targets = ",".join(str(tf) for tf in target_files)
+        args.extend(["--target-genes", joined_targets])
+
     deseq2_enabled = bool(getattr(cfg, "deseq2_vst_enabled", True))
     plots_only_mode = bool(getattr(cfg, "plots_only_mode", False))
     tximport_only_mode = bool(getattr(cfg, "tximport_only_mode", False))
 
     if plots_only_mode:
         args.append("--plots-only")
-        # plots-only implicitly needs DESeq2/VST to have been run before.
-
     elif (not deseq2_enabled) or tximport_only_mode:
-        # Pure tximport-only, this is where the R script writes tximport_counts.tsv
         args.append("--tximport-only")
-        # Do NOT pass any plot flags; R quits right after writing counts.
         return args, True
 
-    # Full DESeq2+VST pipeline (BP-specific "full treatment")
+    # Re-add plot flags for BP
     if deseq2_enabled:
-        if getattr(cfg, "plot_pca", False):
-            args.append("--pca")
-        if getattr(cfg, "plot_heatmap", False):
-            args.append("--heatmap")
-        if getattr(cfg, "plot_var_heatmap", False):
-            # R script will automatically disable var-heatmap in --bioproject mode
-            args.append("--var-heatmap")
+        if getattr(cfg, "plot_pca", False): args.append("--pca")
+        if getattr(cfg, "plot_heatmap", False): args.append("--heatmap")
+        if getattr(cfg, "plot_var_heatmap", False): args.append("--var-heatmap")
+        if getattr(cfg, "plot_sample_cor", False): args.append("--sample-cor")
+        if getattr(cfg, "plot_dispersion", False): args.append("--dispersion")
 
     return args, False
 
 
-def run_postprocessing_bp(bp, cfg: Config, *, r_script: Path | None = None) -> Path | None:
-    """
-    Run the R post-processing script for a single BioProject.
-
-    Behaviour:
-      - If DESeq2 is enabled (and not tximport-only):
-          → full DESeq2 + VST + Seidr-style exports
-          → BP-level PCA / expression heatmap (if plot flags enabled)
-          → returns None (no gene_counts.tsv from R in this mode)
-      - If DESeq2 is disabled OR tximport-only mode is set:
-          → tximport-only; R writes <prefix>.tximport_counts.tsv
-          → we move that to <BP>/gene_counts.tsv and return that Path.
-    """
+def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) -> None:
     log_path = bp.log_path
-    errors = cfg.error_warnings
-
-    if cfg.tx2gene is None:
-        log_err(
-            errors,
-            log_path,
-            f"[{bp.id}] [post-processing] tx2gene not provided; skipping R post-processing.",
-        )
-        return None
-
-    script_path = Path(r_script) if r_script is not None else R_SCRIPT_PATH
-    if not script_path.exists():
-        log_err(
-            errors,
-            log_path,
-            f"[{bp.id}] [post-processing] R script not found at {script_path}.",
-        )
-        return None
-
-    out_dir = bp.path
+    out_dir = bp.path / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
-
     try:
         args, is_txi_only = _build_r_args_for_bp(bp.id, cfg, out_dir)
-    except Exception as e:
-        log_err(
-            errors,
-            log_path,
-            f"[{bp.id}] [post-processing] Failed to build R command: {e}",
-        )
-        return None
-
-    # Ensure correct script path is set
-    args[1] = str(script_path)
-
-    try:
-        mode_str = "tximport-only" if is_txi_only else "full DESeq2/VST"
-        log(f"[{bp.id}] [post-processing] Running R script ({mode_str})…", log_path)
+        script_path = r_script if r_script else R_SCRIPT_PATH
+        args[1] = str(script_path)
         with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write(f"\n[{bp.id}] [post-processing] R command:\n")
-            fh.write("  " + " ".join(args) + "\n\n")
+            fh.write(f"\n[post-processing] {bp.id} command:\n  {' '.join(args)}\n\n")
             fh.flush()
-            result = subprocess.run(
-                args,
-                stdout=fh,
-                stderr=fh,
-                text=True,
-                check=False,
-            )
-        if result.returncode != 0:
-            log_err(
-                errors,
-                log_path,
-                f"[{bp.id}] [post-processing] R script exited with code {result.returncode}",
-            )
-            return None
-    except FileNotFoundError as e:
-        log_err(
-            errors,
-            log_path,
-            f"[{bp.id}] [post-processing] Failed to execute Rscript: {e}",
-        )
-        return None
-    except Exception as e:
-        log_err(
-            errors,
-            log_path,
-            f"[{bp.id}] [post-processing] Unexpected error while running R script: {e}",
-        )
-        return None
-
-    # If we were in tximport-only mode, the R script wrote tximport counts
-    if is_txi_only:
-        counts_file = out_dir / f"{bp.id}.tximport_counts.tsv"
-        if not counts_file.exists():
-            log_err(
-                errors,
-                log_path,
-                f"[{bp.id}] [post-processing] Expected counts file not found: {counts_file}",
-            )
-            return None
-
-        final_path = bp.path / "gene_counts.tsv"
-        try:
-            counts_file.replace(final_path)
-        except Exception:
-            import shutil
-            try:
-                shutil.copy2(counts_file, final_path)
-            except Exception as e:
-                log_err(
-                    errors,
-                    log_path,
-                    f"[{bp.id}] [post-processing] Failed to move counts file: {e}",
-                )
-                return None
-
-        log(f"[{bp.id}] Gene counts written: {final_path}", log_path)
-        return final_path
-
-    # Full DESeq2/VST mode: no gene_counts.tsv here, but all the juicy stuff
-    # (VST, normalized counts, PCA/heatmaps, Seidr exports) is in out_dir.
-    log(f"[{bp.id}] R post-processing (DESeq2/VST) completed.", log_path)
-    return None
-
-def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) -> List[str]:
-
-    """
-    Build argument list for a *global* run of the R post-processing
-    script (no --bioproject restriction).
-    """
-    if cfg.tx2gene is None:
-        raise ValueError("tx2gene is required for post-processing but cfg.tx2gene is None.")
-
-    counts_from_abundance = _map_counts_from_abundance(getattr(cfg, "tximport_mode", None))
-
-    args: List[str] = [
-        "Rscript",
-        str(R_SCRIPT_PATH),
-        "--search-dir", str(cfg.outdir),
-        "--tx2gene", str(cfg.tx2gene),
-        "--out-dir", str(out_dir),
-        "--prefix", "hulk",  # arbitrary; R script default is 'seidr_input'
-        "--counts-from-abundance", counts_from_abundance,
-    ]
-
-    # Mode hint for the R script (SRR vs FASTQ)
-    if mode:
-        args.extend(["--mode", mode])
-
-    # tximport ignore version
-    if getattr(cfg, "tximport_ignore_tx_version", False):
-        args.append("--ignore-tx-version")
-
-    # Which expression matrix to export for Seidr: vst | normalized
-    use_matrix = getattr(cfg, "expr_use_matrix", "vst")
-    if use_matrix not in {"vst", "normalized"}:
-        use_matrix = "vst"
-    args.extend(["--use-matrix", use_matrix])
-
-    # Should we drop non-varying genes in the Seidr exports?
-    # R flag is *inverse* semantics: --no-drop-nonvarying
-    if not getattr(cfg, "drop_nonvarying_genes", True):
-        args.append("--no-drop-nonvarying")
-
-    # Optional target genes file (used for targeted plots, var heatmap, etc.)
-    if getattr(cfg, "target_genes_file", None):
-        args.extend(["--target-genes", str(cfg.target_genes_file)])
-
-    # Determine high-level mode: tximport-only vs full DESeq2/plots.
-    # NOTE: plotting only occurs when DESeq2 is enabled.
-    deseq2_enabled = bool(getattr(cfg, "deseq2_vst_enabled", True))
-    txi_only_mode = bool(getattr(cfg, "tximport_only_mode", False))
-    plots_only_mode = bool(getattr(cfg, "plots_only_mode", False))
-
-    if plots_only_mode:
-        # Use existing VST file only (no tximport/DESeq2).
-        args.append("--plots-only")
-        # In this mode we still honour plot flags below.
-    elif (not deseq2_enabled) or txi_only_mode:
-        # Only run tximport and write counts table; no DESeq2, VST, or Seidr exports.
-        args.append("--tximport-only")
-        # We intentionally DO NOT pass any plot flags in this mode.
-        return args
-
-    # At this point: DESeq2/VST is enabled and we're not in tximport-only mode.
-
-    # Plot flags (global-level)
-    if deseq2_enabled:
-        if getattr(cfg, "plot_pca", False):
-            args.append("--pca")
-        if getattr(cfg, "plot_heatmap", False):
-            args.append("--heatmap")
-        if getattr(cfg, "plot_var_heatmap", False):
-            args.append("--var-heatmap")
+            subprocess.run(args, stdout=fh, stderr=fh, text=True, check=False)
+    except Exception:
+        pass
 
 
-    return args
-
-
-def run_postprocessing(dataset: Dataset, cfg: Config, *, r_script: Path | None = None) -> None:
-    """
-    Run the R post-processing script once at the global level, using
-    parameters stored in Config.
-
-    - SEARCH_DIR is cfg.outdir (root that contains <BP>/<SRR>/abundance.tsv)
-    - tx2gene comes from cfg.tx2gene
-    - Output is written under <outdir>/shared/post_processing
-    - tximport options come from cfg.tximport_mode and cfg.tximport_ignore_tx_version
-    - DESeq2 + VST + Seidr exports/plots are controlled by:
-        cfg.deseq2_vst_enabled
-        cfg.expr_use_matrix
-        cfg.drop_nonvarying_genes
-        cfg.plot_pca
-        cfg.plot_heatmap
-        cfg.plot_var_heatmap
-        cfg.plots_only_mode
-        cfg.tximport_only_mode
-
-    Plotting only happens if cfg.deseq2_vst_enabled is True.
-    """
+def run_postprocessing(dataset: Dataset, cfg: Config, *, r_script: Path | None = None, skip_bp: bool = False) -> None:
     log_path = cfg.log
     error_warnings: List[str] = cfg.error_warnings
 
     if cfg.tx2gene is None:
-        log_err(
-            error_warnings,
-            log_path,
-            "[post-processing] tx2gene not provided; skipping R post-processing.",
-        )
+        log_err(error_warnings, log_path, "[post-processing] tx2gene not provided; skipping.")
         return
 
     script_path = Path(r_script) if r_script is not None else R_SCRIPT_PATH
     if not script_path.exists():
-        log_err(
-            error_warnings,
-            log_path,
-            f"[post-processing] R script not found at {script_path}. "
-            "Place your R script there or pass an explicit path.",
-        )
+        log_err(error_warnings, log_path, f"[post-processing] R script not found at {script_path}.")
         return
 
-    # Where to put all outputs from the R script
+    # ------------------------------------------------------------------
+    # 1. Global Analysis
+    # ------------------------------------------------------------------
     out_dir = cfg.shared
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build command-line arguments
     try:
-        r_mode = getattr(dataset, "mode", None)  # "SRR" or "FASTQ"
-        args = _build_r_args_global(cfg, out_dir, mode=r_mode)
-
+        r_mode = getattr(dataset, "mode", None)
+        base_args = _build_r_args_global(cfg, out_dir, mode=r_mode)
     except Exception as e:
-        log_err(
-            error_warnings,
-            log_path,
-            f"[post-processing] Failed to build R command: {e}",
-        )
+        log_err(error_warnings, log_path, f"[post-processing] Failed to build command: {e}")
         return
 
-    # Replace script path in args (in case user overrode r_script argument)
-    args[1] = str(script_path)
+    base_args[1] = str(script_path)
 
-    # Run Rscript, streaming stdout/stderr into the main HULK log
-    try:
-        log("[post-processing] Running R script for global tximport/DESeq2/VST/plots…", log_path)
-        with open(log_path, "a", encoding="utf-8") as fh:
-            fh.write("\n[post-processing] R command:\n")
-            fh.write("  " + " ".join(args) + "\n\n")
-            fh.flush()
-            result = subprocess.run(
-                args,
-                stdout=fh,
-                stderr=fh,
-                text=True,
-                check=False,
+    # Determine Active Plots for Phase 2
+    active_plots = []
+    if getattr(cfg, "plot_pca", False): active_plots.append("--pca")
+    if getattr(cfg, "plot_heatmap", False): active_plots.append("--heatmap")
+    if getattr(cfg, "plot_var_heatmap", False): active_plots.append("--var-heatmap")
+    if getattr(cfg, "plot_sample_cor", False): active_plots.append("--sample-cor")
+
+    # NOTE: Dispersion is handled in Phase 1 (Compute), so we do NOT add it here.
+
+    # --- PHASE 1: COMPUTATION (Single Threaded, High RAM) ---
+    skip_compute = getattr(cfg, "plots_only_mode", False)
+
+    if not skip_compute:
+        log("[post-processing] Phase 1: Calculating Expression Matrices (Global)...", log_path)
+        try:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"\n[post-processing] Global Compute Command:\n  {' '.join(base_args)}\n\n")
+                fh.flush()
+                res = subprocess.run(base_args, stdout=fh, stderr=fh, text=True, check=False)
+            if res.returncode != 0:
+                log_err(error_warnings, log_path, f"[post-processing] Global Compute failed (code {res.returncode})")
+                return
+        except Exception as e:
+            log_err(error_warnings, log_path, f"[post-processing] Compute execution failed: {e}")
+            return
+    else:
+        log("[post-processing] Phase 1: Skipped (Fast Mode).", log_path)
+
+    # --- PHASE 2: PLOTTING (Throttled Concurrency) ---
+    if active_plots:
+        SAFE_PLOT_WORKERS = 2
+        log(f"[post-processing] Phase 2: Generating {len(active_plots)} plot types (Concurrency: {SAFE_PLOT_WORKERS})...",
+            log_path)
+
+        # Remove --force-txi (we want to load cache), remove --dispersion (it's done), Add --plots-only
+        plot_base_args = [a for a in base_args if a not in ("--force-txi", "--dispersion")]
+        plot_base_args.append("--plots-only")
+
+        with ThreadPoolExecutor(max_workers=SAFE_PLOT_WORKERS) as executor:
+            future_to_plot = {}
+            for plot_flag in active_plots:
+                cmd = plot_base_args + [plot_flag]
+
+                def run_plot_job(c, name):
+                    with open(log_path, "a", encoding="utf-8") as fh:
+                        fh.write(f"\n[post-processing] Starting Plot: {name}\n")
+                        fh.flush()
+                        return subprocess.run(c, stdout=fh, stderr=fh, text=True, check=False)
+
+                f = executor.submit(run_plot_job, cmd, plot_flag)
+                future_to_plot[f] = plot_flag
+
+            for future in as_completed(future_to_plot):
+                p_flag = future_to_plot[future]
+                try:
+                    res = future.result()
+                    if res.returncode != 0:
+                        log_err(error_warnings, log_path,
+                                f"[post-processing] Plot {p_flag} failed (code {res.returncode})")
+                except Exception as e:
+                    log_err(error_warnings, log_path, f"[post-processing] Plot {p_flag} execution error: {e}")
+
+        log("[post-processing] Global plotting finished.", log_path)
+
+    # ------------------------------------------------------------------
+    # 3. Per-BioProject Run (Fully Concurrent)
+    # ------------------------------------------------------------------
+    if skip_bp:
+        log("[post-processing] Skipping per-BioProject analysis.", log_path)
+        return
+
+    if not dataset.bioprojects:
+        return
+
+    max_workers_bp = max(1, int(cfg.max_threads))
+    log(f"[post-processing] Starting analysis for {len(dataset.bioprojects)} BioProjects (Concurrency: {max_workers_bp})...",
+        log_path)
+
+    with ThreadPoolExecutor(max_workers=max_workers_bp) as executor:
+        future_to_bp = {}
+        for bp_id in dataset.bioprojects:
+            bp_obj = SimpleNamespace(
+                id=bp_id,
+                path=cfg.outdir / bp_id,
+                log_path=cfg.outdir / bp_id / "log.txt"
             )
-        if result.returncode != 0:
-            log_err(
-                error_warnings,
-                log_path,
-                f"[post-processing] R script exited with code {result.returncode}",
-            )
-        else:
-            log("[post-processing] R post-processing completed successfully.", log_path)
-    except FileNotFoundError as e:
-        # Typically Rscript not found
-        log_err(
-            error_warnings,
-            log_path,
-            f"[post-processing] Failed to execute Rscript: {e}",
-        )
-    except Exception as e:
-        log_err(
-            error_warnings,
-            log_path,
-            f"[post-processing] Unexpected error while running R script: {e}",
-        )
+            bp_obj.path.mkdir(parents=True, exist_ok=True)
+            f = executor.submit(run_postprocessing_bp, bp_obj, cfg, r_script=script_path)
+            future_to_bp[f] = bp_id
+
+        for future in as_completed(future_to_bp):
+            try:
+                future.result()
+            except Exception:
+                pass
+
+    log("[post-processing] All analyses finished.", log_path)

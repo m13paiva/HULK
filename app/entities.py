@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional, List, Tuple
 
-_FASTQ_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz",".trim.fastq")
+_FASTQ_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz", ".trim.fastq")
 
 
 def _is_fastq_path(p: Path) -> bool:
@@ -18,7 +18,14 @@ def _is_fastq_path(p: Path) -> bool:
     name = p.name.lower()
     return any(name.endswith(suf) for suf in _FASTQ_SUFFIXES)
 
+
 # ------------------------------- Config -------------------------------
+import os
+import json
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+
 class Config:
     """
     Central configuration object.
@@ -28,40 +35,45 @@ class Config:
     CFG_DEFAULT_NAME = ".hulk.json"
 
     def __init__(
-        self,
-        *,
-        input_path: Optional[Path] = None,
-        reference_path: Optional[Path] = None,
-        outdir: Path,
-        min_threads: int = 4,
-        max_threads: int = 10,
-        verbose: bool = False,
-        force: bool = False,
-        dry_run: bool = False,
-        tx2gene: Optional[Path] = None,
-        keep_fastq: bool = False,
-        # NEW: sequencing technology (FASTQ mode)
-        seq_tech: Optional[str] = None,
-        # Existing feature / tool config
-        trim_window_size: int = 4,
-        trim_mean_quality: int = 20,
-        align_method: str = "kallisto",
-        kallisto_bootstrap: int = 100,
-        tximport_mode: str = "raw_counts",
-        tximport_ignore_tx_version: bool = False,
-        cache_gb: Optional[int] = None,    # -c/--cache (GiB)
-        no_cache: bool = False,            # --no-cache
-        # NEW: DESeq2 / expression matrix / plotting options (used by Seidr subcmd)
-        deseq2_vst_enabled: bool = True,   # main toggle for DESeq2+VST stage
-        expr_use_matrix: str = "vst",      # "vst" or "normalized"
-        drop_nonvarying_genes: bool = True,
-        plot_pca: bool = False,
-        plot_heatmap: bool = False,
-        plot_var_heatmap: bool = False,
-        plots_only_mode: bool = False,
-        tximport_only_mode: bool = False,
-        target_genes_file: Optional[Path] = None,
-        bioproject_filter: Optional[str] = None,
+            self,
+            *,
+            input_path: Optional[Path] = None,
+            reference_path: Optional[Path] = None,
+            outdir: Path,
+            min_threads: int = 4,
+            max_threads: int = 10,
+            verbose: bool = False,
+            force: bool = False,
+            dry_run: bool = False,
+            tx2gene: Optional[Path] = None,
+            keep_fastq: bool = False,
+            # NEW: sequencing technology (FASTQ mode)
+            seq_tech: Optional[str] = None,
+            # Existing feature / tool config
+            trim_window_size: int = 4,
+            trim_mean_quality: int = 20,
+            align_method: str = "kallisto",
+            kallisto_bootstrap: int = 100,
+            tximport_mode: str = "raw_counts",
+            tximport_ignore_tx_version: bool = False,
+            cache_gb: Optional[int] = None,  # -c/--cache (GiB)
+            no_cache: bool = False,  # --no-cache
+
+            # NEW: Multiple target files & Rem Missing & DESeq2 sourced from JSON
+            rem_missing_bps: bool = False,
+            target_genes_files: Optional[List[Path]] = None,
+
+            # Plotting options (Flags passed from runtime CLI or loaded defaults)
+            plot_pca: bool = True,
+            plot_heatmap: bool = True,
+            plot_var_heatmap: bool = True,
+            plot_sample_cor: bool = True,  # NEW
+            plot_dispersion: bool = True,  # NEW
+            top_n_vars: int = 500,  # NEW
+
+            plots_only_mode: bool = False,
+            tximport_only_mode: bool = False,
+            bioproject_filter: Optional[str] = None,
     ):
         # --------------------------- Runtime (CLI) ---------------------------
         self.input_path = Path(input_path).expanduser().resolve() if input_path is not None else None
@@ -75,6 +87,9 @@ class Config:
         self.tx2gene = Path(tx2gene).expanduser().resolve() if tx2gene else None
         self.keep_fastq = keep_fastq
         self.error_warnings: List[str] = []
+
+        # The danger flag
+        self.rem_missing_bps = rem_missing_bps
 
         # Sequencing tech (mostly relevant in FASTQ mode; passed from CLI)
         self.seq_tech: Optional[str] = seq_tech
@@ -104,33 +119,51 @@ class Config:
             "ignore_tx_version": self.tximport_ignore_tx_version,
         }
 
-        # DESeq2 / expression exports / plotting (used by R script & Seidr subcommand)
-        self.deseq2_vst_enabled: bool = bool(deseq2_vst_enabled)
+        # --------------------------- DESeq2 / Expression ---------------------
+        # Now loaded primarily from persisted config, unless overridden
+        deseq2_cfg = self.persisted_cfg.get("deseq2", {})
 
-        self.expr_use_matrix: str = (expr_use_matrix or "vst").lower()
-        if self.expr_use_matrix not in {"vst", "normalized"}:
-            self.expr_use_matrix = "vst"
+        self.deseq2_vst_enabled: bool = bool(deseq2_cfg.get("enabled", True))
+        self.deseq2_var_threshold: float = float(deseq2_cfg.get("var_threshold", 0.1))
 
-        self.drop_nonvarying_genes: bool = bool(drop_nonvarying_genes)
+        # Matrix type is hardcoded to vst for now
+        self.expr_use_matrix: str = "vst"
+        self.drop_nonvarying_genes: bool = True
+
+        # Plot Flags
         self.plot_pca: bool = bool(plot_pca)
         self.plot_heatmap: bool = bool(plot_heatmap)
         self.plot_var_heatmap: bool = bool(plot_var_heatmap)
+        self.plot_sample_cor: bool = bool(plot_sample_cor)  # NEW
+        self.plot_dispersion: bool = bool(plot_dispersion)  # NEW
+        self.top_n_vars: int = int(top_n_vars)  # NEW
+
         self.plots_only_mode: bool = bool(plots_only_mode)
         self.tximport_only_mode: bool = bool(tximport_only_mode)
-        self.target_genes_file = Path(target_genes_file).expanduser().resolve() if target_genes_file else None
+
+        # Handle multiple target files
+        self.target_genes_files: List[Path] = []
+        if target_genes_files:
+            for tf in target_genes_files:
+                self.target_genes_files.append(Path(tf).expanduser().resolve())
+
         self.bioproject_filter = bioproject_filter
 
         # Bundle for the Seidr subcommand / expression-network step
         self.expr_network_opts: Dict[str, Any] = {
             "deseq2_vst_enabled": self.deseq2_vst_enabled,
+            "deseq2_var_threshold": self.deseq2_var_threshold,
             "use_matrix": self.expr_use_matrix,
             "drop_nonvarying": self.drop_nonvarying_genes,
             "pca": self.plot_pca,
             "heatmap": self.plot_heatmap,
             "var_heatmap": self.plot_var_heatmap,
+            "sample_cor": self.plot_sample_cor,  # NEW
+            "dispersion": self.plot_dispersion,  # NEW
+            "top_n": self.top_n_vars,  # NEW
             "plots_only": self.plots_only_mode,
             "tximport_only": self.tximport_only_mode,
-            "target_genes": str(self.target_genes_file) if self.target_genes_file else None,
+            "target_genes_files": [str(x) for x in self.target_genes_files],
             "bioproject": self.bioproject_filter,
         }
 
@@ -179,7 +212,6 @@ class Config:
         if tool == "tximport":
             return dict(self.tximport_opts)
         if tool == "align":
-            # seq_tech is optional; align/quant code can branch on it if needed
             return {
                 "method": self.align_method,
                 "bootstrap": self.kallisto_bootstrap,
@@ -192,11 +224,6 @@ class Config:
 
     @property
     def cache_high_gb(self) -> int:
-        """
-        High watermark for cache in GiB.
-        If --no-cache, returns 0.
-        If -c/--cache was given, use that. Otherwise default = 300.
-        """
         if self.no_cache:
             return 0
         if self.cache_gb is not None:
@@ -205,63 +232,13 @@ class Config:
 
     @property
     def cache_low_gb(self) -> int:
-        """
-        Low watermark in GiB: 80% of high, or 0 if cache_high_gb <= 0.
-        """
         high = self.cache_high_gb
         if high <= 0:
             return 0
         return max(1, int(high * 0.8))
 
-    def summary(self) -> str:
-        lines = [
-            f"Output dir:   {self.outdir}",
-            f"Threads:      min={self.min_threads}, max={self.max_threads}",
-            f"Force:        {self.force}",
-            f"Verbose:      {self.verbose}",
-            f"Dry run:      {self.dry_run}",
-            f"Keep FASTQ:   {self.keep_fastq}",
-            f"Seq. tech:    {self.seq_tech or '-'}",
-            f"Trim:         ws={self.trim_window_size}, mq={self.trim_mean_quality}",
-            f"Align:        method={self.align_method}, boot={self.kallisto_bootstrap}",
-            f"tximport:     mode={self.tximport_mode}, ignore_ver={self.tximport_ignore_tx_version}",
-            f"DESeq2/VST:   enabled={self.deseq2_vst_enabled}, "
-            f"matrix={self.expr_use_matrix}, drop_nonzvar={self.drop_nonvarying_genes}",
-            f"Plots:        PCA={self.plot_pca}, HM={self.plot_heatmap}, "
-            f"VarHM={self.plot_var_heatmap}, plots_only={self.plots_only_mode}, "
-            f"txi_only={self.tximport_only_mode}",
-        ]
-        if self.bioproject_filter or self.target_genes_file:
-            lines.append(
-                f"Expr scope:   bioproject={self.bioproject_filter or '-'}, "
-                f"target_genes={self.target_genes_file or '-'}"
-            )
-        lines.append(
-            f"Cache:        no_cache={self.no_cache}, high={self.cache_high_gb} GiB, low={self.cache_low_gb} GiB",
-        )
-        if self.tx2gene:
-            lines.append(f"tx2gene:      {self.tx2gene}")
-        return "\n".join(lines)
-
-    def prepare_directories(self) -> None:
-        if self.outdir.exists() and self.force:
-            shutil.rmtree(self.outdir)
-        self.outdir.mkdir(parents=True, exist_ok=True)
-
-        if self.shared.exists() and self.force:
-            shutil.rmtree(self.shared)
-        self.shared.mkdir(parents=True, exist_ok=True)
-
-        if self.cache.exists() and self.force:
-            shutil.rmtree(self.cache)
-        self.cache.mkdir(parents=True, exist_ok=True)
-
-        with open(self.log, "w", encoding="utf-8") as f:
-            f.write(f"\n===== HULK start {datetime.now().isoformat()} =====\n")
-
     def __repr__(self) -> str:
-        return f"<Config output={self.outdir} threads={self.min_threads}-{self.max_threads}>"
-
+        return f"<Config output={self.outdir} threads={self.max_threads}>"
 
 # ------------------------------- Sample -------------------------------
 
@@ -360,7 +337,6 @@ class Sample:
         return f"<Sample id={self.id} type={self.type} status={self.status}>"
 
 
-
 # ------------------------------ BioProject ----------------------------
 
 class BioProject:
@@ -432,79 +408,6 @@ class BioProject:
     def get_sample_ids(self):
         return [sample.id for sample in self.samples]
 
-    def run_postprocessing(
-            self,
-            cfg: "Config"
-    ) -> None:
-        """
-        Per-BioProject post-processing:
-            • MultiQC (fastp + kallisto)
-            • R-based expression post-processing (tximport / DESeq2 / plots)
-            • Read metrics (fastp + run_info.json)
-        """
-        bp_dir = self.path
-        log_path = cfg.log
-        errors = cfg.error_warnings
-        if not bp_dir.exists():
-            from .utils import log
-            log(f"[{self.id}] No output directory found; skipping post-processing", log_path)
-            return
-
-        # Internal imports — prevent circular import loops
-        from .utils import log, log_err
-        from .qc import run_multiqc, build_bp_metrics
-        from .post_processing import run_postprocessing_bp
-
-        run_ids = [s.id for s in self.samples]
-
-        # ─────────────────────────────────────────
-        # 1) MultiQC
-        # ─────────────────────────────────────────
-        try:
-            mqc_data = run_multiqc(
-                self,
-                cfg,
-                modules=("kallisto", "fastp"),
-            )
-            if mqc_data is None:
-                log(f"[{self.id}] MultiQC returned no output", log_path)
-        except Exception as e:
-            log_err(errors, log_path, f"[{self.id}] MultiQC failed: {e}")
-            mqc_data = None
-
-        # ─────────────────────────────────────────
-        # 2) R-based BP-level expression post-processing
-        #     - tximport-only if DESeq2 is off / tximport-only mode
-        #     - full DESeq2+VST+plots ("full treatment") if DESeq2 enabled
-        # ─────────────────────────────────────────
-        try:
-            if getattr(cfg, "tx2gene", None) is not None:
-                counts_path = run_postprocessing_bp(self, cfg)
-                if counts_path is not None:
-                    log(f"[{self.id}] Gene counts complete: {counts_path}", log_path)
-                else:
-                    # Full DESeq2/VST mode or no counts file; still a success if R didn’t error.
-                    log(f"[{self.id}] R post-processing complete (no dedicated gene_counts.tsv).", log_path)
-            else:
-                log(f"[{self.id}] No tx2gene provided; skipping R-based post-processing.", log_path)
-        except Exception as e:
-            log_err(errors, log_path, f"[{self.id}] R-based BP post-processing failed: {e}")
-
-        # ─────────────────────────────────────────
-        # 3) Read metrics table
-        # ─────────────────────────────────────────
-        try:
-            build_bp_metrics(
-                self,
-                cfg,
-                out_tsv=bp_dir / "read_metrics.tsv",
-            )
-            log(f"[{self.id}] Read metrics table written.", log_path)
-        except Exception as e:
-            log_err(errors, log_path, f"[{self.id}] Failed to build read metrics: {e}")
-
-        log(f"[{self.id}] === BioProject post-processing complete ===", log_path)
-
 
 # ------------------------------- Dataset ------------------------------
 
@@ -513,6 +416,7 @@ class Dataset:
     Single-mode collection of samples for a run.
     mode: "SRR" (grouped by BioProject) or "FASTQ" (local fastqs)
     """
+
     def __init__(self, config: "Config", mode: str):
         self.config = config
         self.mode = mode.upper()
@@ -554,12 +458,12 @@ class Dataset:
         return bp
 
     def add_srr(
-        self,
-        bioproject_id: str,
-        srr_id: str,
-        *,
-        metadata: Optional[Dict[str, Any]] = None,
-        status: str = "pending",
+            self,
+            bioproject_id: str,
+            srr_id: str,
+            *,
+            metadata: Optional[Dict[str, Any]] = None,
+            status: str = "pending",
     ) -> Sample:
         bp = self.get_or_create_bioproject(bioproject_id)
         s = bp.add_srr(srr_id, metadata=metadata, status=status)
@@ -708,6 +612,55 @@ class Dataset:
             raise ValueError(
                 f"No FASTQ files found in any subdirectory of: {directory}"
             )
+
+        return ds
+
+    @classmethod
+    def reconstruct_from_output(cls, cfg: Config) -> 'Dataset':
+        """
+        Scans the output directory defined in Config to reconstruct a Dataset object
+        based on finished processing results (presence of abundance.tsv).
+        """
+        if not cfg.outdir.exists():
+            raise FileNotFoundError(f"Output directory not found: {cfg.outdir}")
+
+        all_files = cfg.outdir.rglob("abundance.tsv")
+
+        # Exclude unwanted directories
+        blacklist_markers = {"multiqc", "mqc", "shared", "cache", "logs", "slurm_logs"}
+        found_files = []
+        for f in all_files:
+            if not any(marker in part for part in f.parts for marker in blacklist_markers):
+                found_files.append(f)
+
+        if not found_files:
+            raise FileNotFoundError(f"No valid processed samples (abundance.tsv) found in {cfg.outdir}")
+
+        # Determine mode
+        detected_mode = "SRR"
+        for f in found_files:
+            # Check structure for FASTQ mode: .../fastq_samples/<sample_id>/abundance.tsv
+            # f.parent = sample_id, f.parent.parent = "fastq_samples"
+            if f.parent.parent.name == "fastq_samples":
+                detected_mode = "FASTQ"
+                break
+
+        ds = cls(config=cfg, mode=detected_mode)
+
+        for f in found_files:
+            sample_dir = f.parent
+            bp_dir = sample_dir.parent
+            s_id = sample_dir.name
+            bp_id = bp_dir.name
+
+            if detected_mode == "FASTQ":
+                # For FASTQ mode, we rely on add_fastq
+                # Pass 'fastq_paths=[]' because we are post-processing,
+                # we don't need the original fastqs to run DESeq2.
+                ds.add_fastq(sample_id=s_id, fastq_paths=[], outdir=bp_dir, status="done")
+            else:
+                # For SRR mode, use add_srr to auto-wire the BioProject
+                ds.add_srr(bioproject_id=bp_id, srr_id=s_id, status="done")
 
         return ds
 
