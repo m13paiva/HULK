@@ -1,18 +1,109 @@
 from __future__ import annotations
 
-from pathlib import Path
 
+import shutil
+import click
+from pathlib import Path
+from datetime import datetime
 from .utils import log
 from .align import build_transcriptome_index
 from .qc import run_multiqc_global
 from .entities import Config, Dataset
 from .orchestrator import run_download_and_process
-from .post_processing import run_postprocessing as run_r_postprocessing
+from .post_processing import run_postprocessing as run__postprocessing
 
+
+def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
+    """
+    Sets up the output directory structure and log files.
+
+    If 'rem-missing-bps' is enabled, this function performs a targeted
+    purge of BioProject folders in the output directory that do not match
+    the current input dataset.
+    """
+
+    # ------------------------------------------------------------------
+    # 1. The Purge (rem-missing-bps)
+    # ------------------------------------------------------------------
+    # We do this BEFORE creating new directories to ensure a clean slate,
+    # but only if the output dir actually exists.
+    if cfg.rem_missing_bps and cfg.outdir.exists():
+
+        # SRA Mode check: FASTQ mode usually doesn't output BioProject folders like this.
+        if getattr(dataset, "mode", "SRA") != "SRA":
+            log("[WARNING] --rem-missing-bps ignored: Only applicable in SRA mode.", None)
+        else:
+            expected_bps = set(getattr(dataset, "bioprojects", []))
+
+            # SAFETY CHECK: If the input table is empty, do NOT wipe the folder.
+            if not expected_bps:
+                click.secho(
+                    "\n[SAFETY ABORT] Input table contains no BioProjects. "
+                    "Skipping --rem-missing-bps to prevent total deletion of output directory.",
+                    fg="red", bold=True
+                )
+            else:
+                click.secho(f"\n[CLEANUP] Scanning {cfg.outdir} for extraneous BioProjects...", fg="yellow")
+
+                # Folders we NEVER delete automatically
+                blacklist = {"shared", "fastq_samples", "logs", "slurm_logs", "multiqc_data"}
+
+                # List existing directories
+                existing_items = [p for p in cfg.outdir.iterdir() if p.is_dir()]
+
+                for folder in existing_items:
+                    # Skip blacklisted or MultiQC folders
+                    if folder.name in blacklist or folder.name.endswith("_mqc"):
+                        continue
+
+                    if folder.name not in expected_bps:
+                        msg = f"[DANGER] Deleting extraneous BioProject folder: {folder.name}"
+                        click.secho(msg, fg="red", bold=True)
+
+                        if not cfg.dry_run:
+                            try:
+                                shutil.rmtree(folder)
+                            except Exception as ex:
+                                click.secho(f"Failed to remove {folder}: {ex}", fg="red")
+
+    # ------------------------------------------------------------------
+    # 2. Standard Directory Setup (Moved from Config)
+    # ------------------------------------------------------------------
+
+    # Create Root Output
+    cfg.outdir.mkdir(parents=True, exist_ok=True)
+
+    # Clean/Create Shared Directory
+    if cfg.shared.exists() and cfg.force:
+        # If forcing, we might want to clear shared logs/cache,
+        # though usually we just want to overwrite.
+        # Kept strict cleaning as per your previous code:
+        try:
+            shutil.rmtree(cfg.shared)
+        except Exception as e:
+            click.secho(f"Warning: Could not clear shared dir: {e}", fg="yellow")
+
+    cfg.shared.mkdir(parents=True, exist_ok=True)
+
+    # Clean/Create Cache Directory
+    if cfg.cache.exists() and cfg.force:
+        try:
+            shutil.rmtree(cfg.cache)
+        except Exception:
+            pass
+    cfg.cache.mkdir(parents=True, exist_ok=True)
+
+    # Initialize Log
+    # We do this last to ensure the 'shared' dir exists
+    if not cfg.dry_run:
+        with open(cfg.log, "w", encoding="utf-8") as f:
+            f.write(f"\n===== HULK start {datetime.now().isoformat()} =====\n")
+            if cfg.rem_missing_bps:
+                f.write("!! WARNING: Run started with --rem-missing-bps (Destructive Mode) !!\n")
 
 def pipeline(data: "Dataset", cfg: "Config") -> None:
 
-    cfg.prepare_directories()
+    prepare_runtime_environment(cfg,data)
     data.update_status()
     outdir: Path = cfg.outdir
     shared: Path = cfg.shared
@@ -81,7 +172,7 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     if getattr(cfg, "tx2gene", None) is not None:
         # This will respect cfg.deseq2_vst_enabled and the plot flags.
         # If DESeq2 is disabled, it will automatically fall back to tximport-only.
-        run_r_postprocessing(data, cfg)
+        run__postprocessing(data, cfg, skip_bp=True)
 
     # Warnings, if any
     if getattr(cfg, "error_warnings", None):

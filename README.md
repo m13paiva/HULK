@@ -24,7 +24,6 @@
 - [Citation](#citation)
 - [Links](#links)
 
----
 
 ## Features
 
