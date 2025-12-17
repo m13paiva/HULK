@@ -10,7 +10,7 @@ suppressPackageStartupMessages({
   library(tidyr)
   library(ggplot2)
   library(ComplexHeatmap)
-  library(grid) # Required for gpar()
+  library(grid)
 })
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
@@ -32,10 +32,18 @@ option_list <- list(
   make_option(c("--use-matrix"), dest = "use_matrix", type = "character", default = "vst"),
   make_option(c("--no-drop-nonvarying"), dest = "drop_nonvarying", action = "store_false", default = TRUE),
   make_option(c("--var-threshold"), dest = "var_threshold", type = "numeric", default = 0.1),
+
+  # CONFIGURABLE TOP N
   make_option(c("--top-n"), dest = "top_n", type = "integer", default = 500),
+
   make_option(c("--pca"), dest = "pca", action = "store_true", default = FALSE),
   make_option(c("--heatmap"), dest = "heatmap", action = "store_true", default = FALSE),
   make_option(c("--var-heatmap"), dest = "var_heatmap", action = "store_true", default = FALSE),
+
+  # NEW PLOT FLAGS
+  make_option(c("--sample-cor"), dest = "sample_cor", action = "store_true", default = FALSE),
+  make_option(c("--dispersion"), dest = "dispersion", action = "store_true", default = FALSE),
+
   make_option(c("--plots-only"), dest = "plots_only", action = "store_true", default = FALSE),
   make_option(c("--tximport-only"), dest = "tximport_only", action = "store_true", default = FALSE),
   make_option(c("--target-genes"), dest = "target_genes", type = "character", default = NULL),
@@ -50,9 +58,6 @@ if (!is.null(opt$target_genes)) {
   raw_list <- strsplit(opt$target_genes, ",")[[1]]
   TARGET_GENES_LIST <- trimws(raw_list)
   TARGET_GENES_LIST <- TARGET_GENES_LIST[TARGET_GENES_LIST != ""]
-
-  message(sprintf("DEBUG: Parsed %d target gene file(s):", length(TARGET_GENES_LIST)))
-  for (f in TARGET_GENES_LIST) message(sprintf("  - %s", f))
 }
 
 # Map options
@@ -61,10 +66,12 @@ EXCLUDE_DIRS  <- opt$exclude_dir
 TX2GENE_PATH  <- opt$tx2gene
 OUT_DIR       <- opt$out_dir
 BIOPROJECT_ID <- opt$bioproject
-TOP_N         <- opt$top_n
+TOP_N         <- opt$top_n    # Using user-defined N
 DO_PCA        <- isTRUE(opt$pca)
 DO_HEATMAP    <- isTRUE(opt$heatmap)
 DO_VAR_HM     <- isTRUE(opt$var_heatmap)
+DO_SAMPLE_COR <- isTRUE(opt$sample_cor)
+DO_DISP       <- isTRUE(opt$dispersion)
 PLOTS_ONLY    <- isTRUE(opt$plots_only)
 MODE          <- toupper(opt$mode %||% "SRR")
 PER_BP_MODE   <- !is.null(BIOPROJECT_ID)
@@ -85,16 +92,20 @@ vst_tsv  <- file.path(deseq2_dir, "vst.tsv")
 norm_tsv <- file.path(deseq2_dir, "normalized_counts.tsv")
 sf_tsv   <- file.path(deseq2_dir, "size_factors.tsv")
 
-pca_pdf     <- file.path(plots_dir, "PCA.pdf")
+# Seidr Paths
+seidr_genes <- file.path(deseq2_dir, "genes.txt")
+seidr_expr  <- file.path(deseq2_dir, "expression.tsv")
+
+pca_pdf    <- file.path(plots_dir, "PCA.pdf")
 heatmap_pdf <- file.path(plots_dir, "expression_heatmap_global.pdf")
-var_hm_pdf  <- file.path(plots_dir, "variance_heatmap.pdf")
+var_hm_pdf <- file.path(plots_dir, "variance_heatmap.pdf")
+scor_pdf   <- file.path(plots_dir, "sample_correlation.pdf")
+disp_pdf   <- file.path(plots_dir, "deseq2_dispersion.pdf")
 
 msg <- function(...) cat(sprintf(...), "\n", sep = "")
 
-# --- Improved File Finder with Exclusion Logic ---
 find_files <- function(dir, excludes) {
   all_files <- list.files(dir, pattern="^abundance\\.tsv$", recursive=TRUE, full.names=TRUE)
-
   if (length(excludes) > 0) {
       keep <- !vapply(all_files, function(f) {
           any(sapply(excludes, function(e) grepl(e, f)))
@@ -117,157 +128,155 @@ read_targets <- function(p) {
 # --- Plotting Function ---
 make_plots <- function(vst_mat, info) {
 
-  # --- DIAGNOSTIC BLOCK ---
-  msg("\n--- DIAGNOSTICS: BioProject Alignment ---")
-
-  vst_samples <- colnames(vst_mat)
-  info_samples <- info$sample
-  common <- intersect(vst_samples, info_samples)
-
-  msg("Samples in VST Matrix (Loaded): %d", length(vst_samples))
-  msg("Samples in Directory Scan (On Disk): %d", length(info_samples))
-  msg("Overlapping Samples: %d", length(common))
-
+  # Diagnostics
+  msg("\n--- DIAGNOSTICS ---")
+  common <- intersect(colnames(vst_mat), info$sample)
   info <- info[match(common, info$sample), ]
   vst_mat <- vst_mat[, common, drop=FALSE]
+  msg("Aligned Samples: %d", ncol(vst_mat))
+  msg("-------------------\n")
 
-  counts <- info %>% group_by(bioproject) %>% summarize(n_samples = n())
-  msg("\nBioProjects in Matrix: %d", nrow(counts))
-
-  singletons <- counts %>% filter(n_samples < 2)
-  if(nrow(singletons) > 0) {
-      msg("\nWARNING: %d BioProjects have < 2 matched samples (undefined variance):", nrow(singletons))
-      print(as.data.frame(singletons))
+  # Filter Low Variance
+  if(!PLOTS_ONLY && (DO_PCA || DO_HEATMAP || DO_VAR_HM || DO_SAMPLE_COR)) {
+      msg("Filtering genes with variance < %s...", opt$var_threshold)
+      all_vars <- apply(vst_mat, 1, var, na.rm=TRUE)
+      keep_genes <- !is.na(all_vars) & (all_vars >= opt$var_threshold)
+      vst_mat <- vst_mat[keep_genes, , drop=FALSE]
+      if(nrow(vst_mat) == 0) {
+        msg("WARNING: No genes remaining after filter.")
+        return()
+      }
+      msg("Genes Remaining: %d", nrow(vst_mat))
   }
-  msg("------------------------------------------\n")
-  # --- END DIAGNOSTICS ---
 
-  if(!DO_PCA && !DO_HEATMAP && !DO_VAR_HM) return()
+  if(!DO_PCA && !DO_HEATMAP && !DO_VAR_HM && !DO_SAMPLE_COR) return()
 
-  # Top N
+  # Top N Selection
   vars <- apply(vst_mat, 1, var, na.rm=TRUE)
   top <- order(vars, decreasing=TRUE)[seq_len(min(TOP_N, length(vars)))]
   vst_top <- vst_mat[top, , drop=FALSE]
 
-  # --- PCA ---
+  # 1. PCA
   if(DO_PCA && ncol(vst_top)>1) {
     pca <- prcomp(t(vst_top[apply(vst_top,1,var)>0,]), center=TRUE)
     df <- as.data.frame(pca$x[,1:2]) %>% tibble::rownames_to_column("sample") %>%
       left_join(info, by="sample")
-
     col_by <- if(PER_BP_MODE || MODE=="FASTQ") "sample" else "bioproject"
     p <- ggplot(df, aes(x=PC1, y=PC2, color=.data[[col_by]])) +
          geom_point(size=2) + theme_bw() + labs(title="PCA (VST)")
-
     ggsave(pca_pdf, p, width=6, height=5)
-    pca_tsv <- sub("\\.pdf$", ".tsv", pca_pdf)
-    readr::write_tsv(df, pca_tsv)
-    msg("[PCA] Saved plot to %s and data to %s", pca_pdf, pca_tsv)
+    readr::write_tsv(df, sub("\\.pdf$", ".tsv", pca_pdf))
+    msg("[PCA] Saved %s", pca_pdf)
   }
 
-  # Heatmap Setup
+  # Heatmap Helper
   if(PER_BP_MODE || MODE=="FASTQ") {
     grp_vec <- info$sample; title <- "Samples"
   } else {
     grp_vec <- info$bioproject; title <- "BioProject"
   }
 
-  draw_hm <- function(m, t, f) {
-    grDevices::pdf(f, width=12, height=8) # Increased size slightly
-
-    # VISUAL UPDATE: Font size 6pt
+  draw_hm <- function(m, t, f, raster=FALSE) {
+    grDevices::pdf(f, width=12, height=8)
     ht <- ComplexHeatmap::Heatmap(m, name="vst",
-      show_row_names=(nrow(m)<150),  # Show more rows if possible
+      show_row_names=(nrow(m)<150),
       show_column_names=FALSE,
       column_split=grp_vec, column_title=t,
       row_names_gp = gpar(fontsize = 6),
-      column_title_gp = gpar(fontsize = 8, fontface="bold")
+      column_title_gp = gpar(fontsize = 8, fontface="bold"),
+      use_raster = raster
     )
     ComplexHeatmap::draw(ht)
     grDevices::dev.off()
 
-    mat_file <- sub("\\.pdf$", ".tsv", f)
     out_df <- as.data.frame(m) %>% tibble::rownames_to_column("gene_id")
-    readr::write_tsv(out_df, mat_file)
-    msg("[Heatmap] Saved plot to %s", f)
+    readr::write_tsv(out_df, sub("\\.pdf$", ".tsv", f))
+    msg("[Heatmap] Saved %s", f)
   }
 
-  if(DO_HEATMAP) {
-      msg("[Heatmap] Generating Global Heatmap")
-      draw_hm(vst_top, "Global Expression", heatmap_pdf)
-  }
+  # 2. GLOBAL HEATMAP
+  if(DO_HEATMAP) draw_hm(vst_top, "Global Expression", heatmap_pdf)
 
-  # --- TARGETED HEATMAPS ---
-  targets_vec <- NULL
-  bases <- NULL
-  if (!is.null(TARGET_GENES_LIST)) {
-    targets_vec <- as.character(unlist(TARGET_GENES_LIST))
-    bases <- make.unique(tools::file_path_sans_ext(basename(targets_vec)), sep="_")
-  }
-
-  if(DO_HEATMAP && !is.null(targets_vec)) {
-    msg("[TargetPlot] Processing %d target lists for Expression...", length(targets_vec))
-    for(i in seq_along(targets_vec)) {
-      g <- read_targets(targets_vec[i]); idx <- which(rownames(vst_mat) %in% g)
-      if(length(idx) > 0) {
-        f <- file.path(plots_dir, sprintf("expression_heatmap_%s.pdf", bases[i]))
-        draw_hm(vst_mat[idx, , drop=FALSE], paste("Targeted:", bases[i]), f)
-      }
-    }
-  }
-
-  # --- VARIANCE HEATMAPS ---
-  draw_var_hm <- function(genes, t, f) {
-    df <- t(vst_mat[genes, , drop=FALSE]) %>% as.data.frame() %>%
-      tibble::rownames_to_column("sample") %>% left_join(info, by="sample") %>%
-      tidyr::pivot_longer(cols = all_of(genes), names_to="gene", values_to="vst")
-
-    var_mat <- df %>% group_by(gene, bioproject) %>%
-      summarise(var_vst = stats::var(vst, na.rm = TRUE), .groups = "drop") %>%
-      pivot_wider(names_from = bioproject, values_from = var_vst) %>%
-      column_to_rownames("gene") %>% as.matrix()
-
-    # Detect and remove all-NA columns
-    na_cols <- colSums(is.na(var_mat)) == nrow(var_mat)
-    if (any(na_cols)) {
-        var_mat <- var_mat[, !na_cols, drop=FALSE]
-    }
-
-    if (ncol(var_mat) == 0) return()
-
-    grDevices::pdf(f, width = 10, height = 8)
-
-    # VISUAL UPDATE: Font size 6pt for Rows AND Columns
-    ht <- ComplexHeatmap::Heatmap(var_mat, name="var(VST)",
-        show_row_names=(nrow(var_mat)<150),
-        show_column_names=TRUE, # Always show BP names
-        row_names_gp = gpar(fontsize = 6),
-        column_names_gp = gpar(fontsize = 6),
-        column_title = t
-    )
-    ComplexHeatmap::draw(ht)
-    grDevices::dev.off()
-
-    mat_file <- sub("\\.pdf$", ".tsv", f)
-    out_df <- as.data.frame(var_mat) %>% tibble::rownames_to_column("gene_id")
-    readr::write_tsv(out_df, mat_file)
-    msg("[VarHeatmap] Saved plot to %s", f)
-  }
-
-  if(DO_VAR_HM) {
-    msg("[VarHeatmap] Generating Global Variance Heatmap")
-    draw_var_hm(rownames(vst_top), "Global Variance", var_hm_pdf)
-
-    if (!is.null(targets_vec)) {
-      msg("[VarHeatmap] Processing %d target lists for Variance...", length(targets_vec))
-      for(i in seq_along(targets_vec)) {
-        g <- read_targets(targets_vec[i]); idx <- rownames(vst_mat)[rownames(vst_mat) %in% g]
+  # 3. TARGETED HEATMAPS
+  if(DO_HEATMAP && !is.null(TARGET_GENES_LIST)) {
+     targets_vec <- as.character(unlist(TARGET_GENES_LIST))
+     bases <- make.unique(tools::file_path_sans_ext(basename(targets_vec)), sep="_")
+     for(i in seq_along(targets_vec)) {
+        g <- read_targets(targets_vec[i]); idx <- which(rownames(vst_mat) %in% g)
         if(length(idx) > 0) {
-          f <- file.path(plots_dir, sprintf("variance_heatmap_%s.pdf", bases[i]))
-          draw_var_hm(idx, paste("Targeted Var:", bases[i]), f)
+           f <- file.path(plots_dir, sprintf("expression_heatmap_%s.pdf", bases[i]))
+           draw_hm(vst_mat[idx, , drop=FALSE], paste("Targeted:", bases[i]), f)
         }
+     }
+  }
+
+  # 4. SAMPLE CORRELATION
+  if(DO_SAMPLE_COR) {
+      msg("[SampleCor] Computing Pearson correlation...")
+      cor_mat <- cor(vst_mat)
+
+      grDevices::pdf(scor_pdf, width=10, height=8)
+      ht <- ComplexHeatmap::Heatmap(cor_mat,
+         name="Pearson",
+         show_row_names = (ncol(cor_mat) < 80),
+         show_column_names = (ncol(cor_mat) < 80),
+         column_title = "Sample-to-Sample Correlation",
+         row_names_gp = gpar(fontsize = 6),
+         column_names_gp = gpar(fontsize = 6),
+         use_raster = TRUE
+      )
+      ComplexHeatmap::draw(ht)
+      grDevices::dev.off()
+
+      readr::write_tsv(as.data.frame(cor_mat) %>% tibble::rownames_to_column("sample"), sub("\\.pdf$", ".tsv", scor_pdf))
+      msg("[SampleCor] Saved %s", scor_pdf)
+  }
+
+  # 5. VARIANCE HEATMAP
+  if(DO_VAR_HM) {
+      draw_var_hm <- function(genes, t, f) {
+        df <- t(vst_mat[genes, , drop=FALSE]) %>% as.data.frame() %>%
+          tibble::rownames_to_column("sample") %>% left_join(info, by="sample") %>%
+          tidyr::pivot_longer(cols = all_of(genes), names_to="gene", values_to="vst")
+
+        var_mat <- df %>% group_by(gene, bioproject) %>%
+          summarise(var_vst = stats::var(vst, na.rm = TRUE), .groups = "drop") %>%
+          pivot_wider(names_from = bioproject, values_from = var_vst) %>%
+          column_to_rownames("gene") %>% as.matrix()
+
+        na_cols <- colSums(is.na(var_mat)) == nrow(var_mat)
+        if (any(na_cols)) var_mat <- var_mat[, !na_cols, drop=FALSE]
+        if (ncol(var_mat) == 0) return()
+
+        grDevices::pdf(f, width = 10, height = 8)
+        ht <- ComplexHeatmap::Heatmap(var_mat, name="var(VST)",
+            show_row_names=(nrow(var_mat)<150),
+            show_column_names=TRUE,
+            row_names_gp = gpar(fontsize = 6),
+            column_names_gp = gpar(fontsize = 6),
+            column_title = t
+        )
+        ComplexHeatmap::draw(ht)
+        grDevices::dev.off()
+
+        readr::write_tsv(as.data.frame(var_mat) %>% tibble::rownames_to_column("gene_id"), sub("\\.pdf$", ".tsv", f))
+        msg("[VarHeatmap] Saved %s", f)
       }
-    }
+
+      msg("[VarHeatmap] Generating Global Variance Heatmap")
+      draw_var_hm(rownames(vst_top), "Global Variance", var_hm_pdf)
+
+      if (!is.null(TARGET_GENES_LIST)) {
+         targets_vec <- as.character(unlist(TARGET_GENES_LIST))
+         bases <- make.unique(tools::file_path_sans_ext(basename(targets_vec)), sep="_")
+         for(i in seq_along(targets_vec)) {
+            g <- read_targets(targets_vec[i]); idx <- rownames(vst_mat)[rownames(vst_mat) %in% g]
+            if(length(idx) > 0) {
+               f <- file.path(plots_dir, sprintf("variance_heatmap_%s.pdf", bases[i]))
+               draw_var_hm(idx, paste("Targeted Var:", bases[i]), f)
+            }
+         }
+      }
   }
 }
 
@@ -296,29 +305,47 @@ if(PLOTS_ONLY) {
 
 # Pipeline
 if(file.exists(txi_rds) && !opt$force_txi) {
-    msg("[tximport] LOADING CACHED DATA (txi.rds).")
+    msg("[tximport] LOADING CACHED DATA.")
     txi <- readRDS(txi_rds)
 } else {
-    msg("[tximport] RECALCULATING from %d files found on disk...", length(files))
+    msg("[tximport] RECALCULATING from %d files...", length(files))
     txi <- tximport(files, type="kallisto", tx2gene=read_tx2gene(TX2GENE_PATH),
            countsFromAbundance=opt$counts_from_abundance, ignoreTxVersion=opt$ignore_tx_version)
 }
 if(!file.exists(txi_rds)) saveRDS(txi, txi_rds)
 
+# --- SAVE TXIMPORT COUNTS (Always) ---
+msg("[tximport] Saving raw counts to %s", txi_tsv)
+readr::write_tsv(as.data.frame(txi$counts) %>% tibble::rownames_to_column("gene"), txi_tsv)
+
 if(opt$tximport_only) {
-  readr::write_tsv(as.data.frame(txi$counts) %>% tibble::rownames_to_column("gene"), txi_tsv)
   quit(status=0)
 }
 
 coldata <- info[match(colnames(txi$counts), info$sample),]
 dds <- DESeqDataSetFromTximport(txi, colData=coldata, design=~1)
 dds <- dds[rowSums(counts(dds))>0,]
-msg("[DESeq2] Estimating size factors using type='poscounts'...")
+msg("[DESeq2] Estimating size factors (poscounts)...")
 dds <- estimateSizeFactors(dds, type="poscounts")
+
+# 6. DISPERSION PLOT
+if(DO_DISP) {
+    msg("[DESeq2] Estimating Dispersions & Plotting...")
+    dds <- estimateDispersions(dds)
+    grDevices::pdf(disp_pdf, width=6, height=6)
+    plotDispEsts(dds, main="DESeq2 Dispersion Estimates")
+    grDevices::dev.off()
+    msg("[DispPlot] Saved %s", disp_pdf)
+}
 
 vst_mat <- assay(vst(dds, blind=TRUE))
 vst_out <- tibble::rownames_to_column(as.data.frame(t(vst_mat)), "sample")
 readr::write_tsv(vst_out, vst_tsv)
+
+# --- SAVE SEIDR READY OUTPUTS ---
+msg("[Seidr] Saving genes list and expression matrix...")
+writeLines(rownames(vst_mat), seidr_genes)
+readr::write_tsv(as.data.frame(vst_mat) %>% tibble::rownames_to_column("gene"), seidr_expr)
 
 make_plots(vst_mat, coldata)
 msg("Done.")

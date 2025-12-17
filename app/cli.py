@@ -340,7 +340,7 @@ def _print_config_summary(dataset: Dataset, cfg: Config) -> None:
     mode = _val(getattr(dataset, 'mode', 'Unknown'))
     print(f"Mode:                 {mode}")
     print(f"Samples (total):      {_val(total)}")
-    if mode !="SRA":
+    if mode != "SRA":
         print(f"BioProjects (total):  {_val(bps_len)}")
     if done is not None:
         print(f"Samples (done):       {_val(done)}")
@@ -376,6 +376,7 @@ def _print_config_summary(dataset: Dataset, cfg: Config) -> None:
     deseq_status = "ENABLED" if cfg.deseq2_vst_enabled else "DISABLED"
     print(f"DESeq2/VST:           {deseq_status} (Var Threshold: {cfg.deseq2_var_threshold})")
     print(f"Plots:                PCA={cfg.plot_pca}, HM={cfg.plot_heatmap}, VarHM={cfg.plot_var_heatmap}")
+    print(f"Adv. Plots:           SampleCor={cfg.plot_sample_cor}, Disp={cfg.plot_dispersion}, TopN={cfg.top_n_vars}")
 
     print("=====================================\n")
 
@@ -422,11 +423,15 @@ def _run_pipeline(
     txi_ignore = bool(txi_cfg.get("ignore_tx_version", False))
 
     # ---- Plot defaults ----
-    global_pca = bool(plot_cfg.get("global_pca", False))
-    global_heatmap = bool(plot_cfg.get("global_heatmap", False))
-    global_var_heatmap = bool(plot_cfg.get("global_var_heatmap", False))
-    bp_pca = bool(plot_cfg.get("bp_pca", False))
-    bp_heatmap = bool(plot_cfg.get("bp_heatmap", False))
+    # Default to TRUE for globals if not found in JSON
+    global_pca = bool(plot_cfg.get("global_pca", True))
+    global_heatmap = bool(plot_cfg.get("global_heatmap", True))
+    global_var_heatmap = bool(plot_cfg.get("global_var_heatmap", True))
+    bp_pca = bool(plot_cfg.get("bp_pca", True))
+    bp_heatmap = bool(plot_cfg.get("bp_heatmap", True))
+    sample_cor = bool(plot_cfg.get("sample_cor", True))
+    dispersion = bool(plot_cfg.get("dispersion", True))
+    top_n = int(plot_cfg.get("top_n", 500))
 
     plot_pca = global_pca or bp_pca
     plot_heatmap = global_heatmap or bp_heatmap
@@ -458,6 +463,11 @@ def _run_pipeline(
         plot_pca=plot_pca,
         plot_heatmap=plot_heatmap,
         plot_var_heatmap=plot_var_heatmap,
+
+        # New Params
+        plot_sample_cor=sample_cor,
+        plot_dispersion=dispersion,
+        top_n_vars=top_n,
 
         seq_tech=seq_tech,
         target_genes_files=target_genes_files,
@@ -566,9 +576,6 @@ def _run_pipeline(
         _print_trailing_newlines(len(getattr(dataset, "bioprojects", None)))
     sys.exit(0)
 
-
-# ---------------------------- Subcommands ----------------------------
-
 @click.group(cls=HulkCommand, help="Run the HULK pipeline with explicit options.")
 def run_cmd(**kwargs):
     pass
@@ -657,13 +664,18 @@ def deseq2(enabled: bool | None, var_threshold: float | None, reset_defaults: bo
 @click.option("--global-var-heatmap", type=bool, default=True)
 @click.option("--bp-pca", type=bool, default=False)
 @click.option("--bp-heatmap", type=bool, default=False)
+@click.option("--sample-cor", type=bool, default=False, help="Plot sample-sample correlation heatmap.")
+@click.option("--dispersion", type=bool, default=False, help="Plot DESeq2 dispersion estimates.")
+@click.option("--top-n", type=int, default=500, help="Number of top variable genes.")
 @click.option("--reset-defaults", is_flag=True)
-def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, reset_defaults):
+def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sample_cor, dispersion, top_n,
+         reset_defaults):
     if reset_defaults:
         p = _cfg_reset("plot")
         click.secho(f"Reset plot settings at {p}", fg="green")
         return
-    if all(x is None for x in [global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap]):
+    if all(x is None for x in
+           [global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sample_cor, dispersion, top_n]):
         click.echo("Try: hulk plot -h")
         return
     payload = {}
@@ -672,11 +684,14 @@ def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, res
     if global_var_heatmap is not None: payload["global_var_heatmap"] = bool(global_var_heatmap)
     if bp_pca is not None: payload["bp_pca"] = bool(bp_pca)
     if bp_heatmap is not None: payload["bp_heatmap"] = bool(bp_heatmap)
+    if sample_cor is not None: payload["sample_cor"] = bool(sample_cor)
+    if dispersion is not None: payload["dispersion"] = bool(dispersion)
+    if top_n is not None: payload["top_n"] = int(top_n)
+
     p = _cfg_update("plot", payload)
     click.secho(f"Saved plot settings to {p}", fg="green")
 
-
-@cli.command("report", cls=HulkCommand, help="Regenerate plots and matrices from existing output (Safe to run while another instance of HULK runs on the same dataset.")
+@cli.command("report", cls=HulkCommand, help="Regenerate (or generate snapshots while hulk is running) plots and matrices using saved settings.")
 @click.option("-o", "--output", "output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
               default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
 @click.option("-g", "--gene-counts", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
@@ -684,47 +699,32 @@ def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, res
 @click.option("--target-genes", "target_genes_files", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               multiple=True, help="Target gene list(s) for targeted heatmaps/matrices.")
 @click.option("--no-bp-postprocessing", is_flag=True, help="Skip per-BioProject analysis (only run Global).")
-@click.option("--fast", is_flag=True, help="Skip DESeq2 recalculation and only replot existing matrices (Fast Mode).")
+@click.option("--fast", is_flag=True, help="Skip DESeq2 recalculation (Fast Mode).")
 def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, fast):
     """
-    Scans an existing output directory and re-runs the post-processing step.
-
-    By default, it RECALCULATES the expression matrices (tximport -> DESeq2)
-    to ensure all currently finished samples are included.
-
-    Use --fast to skip recalculation and just replot the existing vst.tsv.
+    Scans output directory and runs post-processing using settings defined in 'hulk plot'.
     """
-    click.secho("\n[Report] Scanning output directory for finished samples...", fg="yellow")
-    click.secho("[Report] Note: It is safe to run this command while the main pipeline is active.", fg="blue")
+    click.secho("\n[Report] Scanning output directory...", fg="yellow")
 
-    # 1. LOAD PERSISTED SETTINGS
+    # 1. LOAD PERSISTED SETTINGS (The Source of Truth)
     persisted = _cfg_load()
     plot_cfg = persisted.get("plot", {})
 
-    global_pca = bool(plot_cfg.get("global_pca", False))
-    global_heatmap = bool(plot_cfg.get("global_heatmap", False))
-    global_var_heatmap = bool(plot_cfg.get("global_var_heatmap", False))
-    bp_pca = bool(plot_cfg.get("bp_pca", False))
-    bp_heatmap = bool(plot_cfg.get("bp_heatmap", False))
-
-    # Combine flags for Config
-    plot_pca = global_pca or bp_pca
-    plot_heatmap = global_heatmap or bp_heatmap
-    plot_var_heatmap = global_var_heatmap
-
-    # 2. Initialize Config
-    # CRITICAL CHANGE: plots_only_mode is now False by default (unless --fast is passed)
-    # This ensures we actually READ the new abundance files and update the matrix.
+    # Load defaults from JSON, fallback to False if missing
+    # This forces the user to use 'hulk plot' to set these up.
     cfg = Config(
         outdir=output_dir,
         tx2gene=tx2gene_path,
         target_genes_files=list(target_genes_files) if target_genes_files else None,
-        plots_only_mode=fast,  # False = Recalculate VST; True = Just Plot
+        plots_only_mode=fast,
 
-        # Pass the valid settings
-        plot_pca=plot_pca,
-        plot_heatmap=plot_heatmap,
-        plot_var_heatmap=plot_var_heatmap
+        # Load directly from persistence
+        plot_pca=plot_cfg.get("global_pca", True),  # Default True if never set
+        plot_heatmap=plot_cfg.get("global_heatmap", True),
+        plot_var_heatmap=plot_cfg.get("global_var_heatmap", True),
+        plot_sample_cor=plot_cfg.get("sample_cor", True),
+        plot_dispersion=plot_cfg.get("dispersion", True),
+        top_n_vars=plot_cfg.get("top_n", 500)
     )
 
     # Fallback for tx2gene lookup
@@ -765,6 +765,7 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, f
         click.secho(f"[Error] {e}", fg="red")
     except Exception as e:
         click.secho(f"[Error] Unexpected failure: {e}", fg="red")
+
 
 def main():
     os.environ.setdefault("COLUMNS", str(WIDE_HELP))

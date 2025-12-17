@@ -20,6 +20,12 @@ def _is_fastq_path(p: Path) -> bool:
 
 
 # ------------------------------- Config -------------------------------
+import os
+import json
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+
 class Config:
     """
     Central configuration object.
@@ -58,9 +64,13 @@ class Config:
             target_genes_files: Optional[List[Path]] = None,
 
             # Plotting options (Flags passed from runtime CLI or loaded defaults)
-            plot_pca: bool = False,
-            plot_heatmap: bool = False,
-            plot_var_heatmap: bool = False,
+            plot_pca: bool = True,
+            plot_heatmap: bool = True,
+            plot_var_heatmap: bool = True,
+            plot_sample_cor: bool = True,  # NEW
+            plot_dispersion: bool = True,  # NEW
+            top_n_vars: int = 500,  # NEW
+
             plots_only_mode: bool = False,
             tximport_only_mode: bool = False,
             bioproject_filter: Optional[str] = None,
@@ -110,20 +120,24 @@ class Config:
         }
 
         # --------------------------- DESeq2 / Expression ---------------------
-        # Now loaded primarily from persisted config, unless overridden (which we aren't doing in CLI anymore)
+        # Now loaded primarily from persisted config, unless overridden
         deseq2_cfg = self.persisted_cfg.get("deseq2", {})
 
         self.deseq2_vst_enabled: bool = bool(deseq2_cfg.get("enabled", True))
         self.deseq2_var_threshold: float = float(deseq2_cfg.get("var_threshold", 0.1))
 
-        # Matrix type is hardcoded to vst for now based on previous logic,
-        # but could be expanded if you actually needed it.
+        # Matrix type is hardcoded to vst for now
         self.expr_use_matrix: str = "vst"
-        self.drop_nonvarying_genes: bool = True  # Hardcoded or could be added to deseq2 cfg
+        self.drop_nonvarying_genes: bool = True
 
+        # Plot Flags
         self.plot_pca: bool = bool(plot_pca)
         self.plot_heatmap: bool = bool(plot_heatmap)
         self.plot_var_heatmap: bool = bool(plot_var_heatmap)
+        self.plot_sample_cor: bool = bool(plot_sample_cor)  # NEW
+        self.plot_dispersion: bool = bool(plot_dispersion)  # NEW
+        self.top_n_vars: int = int(top_n_vars)  # NEW
+
         self.plots_only_mode: bool = bool(plots_only_mode)
         self.tximport_only_mode: bool = bool(tximport_only_mode)
 
@@ -144,9 +158,11 @@ class Config:
             "pca": self.plot_pca,
             "heatmap": self.plot_heatmap,
             "var_heatmap": self.plot_var_heatmap,
+            "sample_cor": self.plot_sample_cor,  # NEW
+            "dispersion": self.plot_dispersion,  # NEW
+            "top_n": self.top_n_vars,  # NEW
             "plots_only": self.plots_only_mode,
             "tximport_only": self.tximport_only_mode,
-            # Pass the list of files as a list of strings
             "target_genes_files": [str(x) for x in self.target_genes_files],
             "bioproject": self.bioproject_filter,
         }
@@ -223,7 +239,6 @@ class Config:
 
     def __repr__(self) -> str:
         return f"<Config output={self.outdir} threads={self.max_threads}>"
-
 
 # ------------------------------- Sample -------------------------------
 
