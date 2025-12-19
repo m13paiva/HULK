@@ -23,6 +23,12 @@ def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
     Per-BioProject post-processing logic.
     """
     log_path = cfg.log
+
+    # --- EARLY EXIT IF DISABLED ---
+    if cfg.no_bp_postprocessing:
+        log(f"[{bp.id}] Skipping BioProject post-processing (MultiQC, R, Metrics) due to flag.", log_path)
+        return
+
     errors = cfg.error_warnings
 
     # 1. MultiQC

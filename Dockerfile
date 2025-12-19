@@ -18,12 +18,21 @@ ENV LC_ALL=en_US.UTF-8
 ARG ENV_FILE=environment.yml
 ARG ENV_NAME=bulk_rna_seq
 
-# copy env file and build env
+# 1. Install Main Environment (Python + R + Tools)
+#    Make sure 'seidr' is REMOVED from environment.yml before building!
 COPY ${ENV_FILE} /tmp/environment.yml
 RUN conda env create -f /tmp/environment.yml && conda clean -a
 
-# make sure binaries from env are visible system-wide
-ENV PATH="/opt/conda/envs/${ENV_NAME}/bin:${PATH}"
+# 2. Install Seidr in an Isolated Environment
+#    CHANGE: Use 'libgfortran=3' (no -ng) to get the legacy .so.3 library
+RUN conda create -n seidr_env -c bioconda -c conda-forge -c defaults \
+    seidr \
+    "libgfortran=3" \
+    && conda clean -a
+
+# 3. Update PATH to include BOTH environments
+#    Seidr binaries will be found here: /opt/conda/envs/seidr_env/bin
+ENV PATH="/opt/conda/envs/${ENV_NAME}/bin:/opt/conda/envs/seidr_env/bin:${PATH}"
 
 # --- MultiQC config (kept outside /app since it's a mount) ---
 RUN mkdir -p /opt/multiqc
@@ -34,7 +43,7 @@ ENV MULTIQC_CONFIG_PATH=/opt/multiqc/multiqc_config.yaml
 WORKDIR /usr/local/src/hulk
 COPY . .
 
-# install package in editable mode
+# install package in editable mode (Install into MAIN env)
 RUN /opt/conda/envs/${ENV_NAME}/bin/pip install -e .
 
 # --- Runtime workdir ---
@@ -44,9 +53,5 @@ WORKDIR /app
 RUN mkdir -p /opt/hulk
 COPY app/config/hulk_smash.mp4 /opt/hulk/hulk_smash.mp4
 
-# include your video inside the image
-COPY app/config/hulk_smash.mp4 /app/hulk_smash.mp4
-
 # entrypoint is the CLI installed by pip (points to app.cli:main)
 ENTRYPOINT ["hulk"]
-

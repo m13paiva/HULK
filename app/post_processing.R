@@ -344,8 +344,16 @@ readr::write_tsv(vst_out, vst_tsv)
 
 # --- SAVE SEIDR READY OUTPUTS ---
 msg("[Seidr] Saving genes list and expression matrix...")
+
+# 1. Save Gene List
 writeLines(rownames(vst_mat), seidr_genes)
-readr::write_tsv(as.data.frame(vst_mat) %>% tibble::rownames_to_column("gene"), seidr_expr)
+
+# 2. Save Transposed Matrix (Samples x Genes)
+# We strictly exclude row names (Sample IDs) and column names (Gene IDs) from the file
+# to ensure the matrix is purely numeric and dimensions match exactly.
+# Seidr will map columns to the lines in 'genes.txt'.
+vst_t <- t(vst_mat)
+readr::write_tsv(as.data.frame(vst_t), seidr_expr, col_names = FALSE)
 
 make_plots(vst_mat, coldata)
 msg("Done.")

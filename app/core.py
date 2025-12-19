@@ -5,101 +5,67 @@ import shutil
 import click
 from pathlib import Path
 from datetime import datetime
-from .utils import log
+from .utils import log, log_err
 from .align import build_transcriptome_index
 from .qc import run_multiqc_global
 from .entities import Config, Dataset
 from .orchestrator import run_download_and_process
 from .post_processing import run_postprocessing as run__postprocessing
+from .seidr import run_seidr
 
 
 def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
     """
     Sets up the output directory structure and log files.
-
-    If 'rem-missing-bps' is enabled, this function performs a targeted
-    purge of BioProject folders in the output directory that do not match
-    the current input dataset.
     """
+    import shutil # ensure import is available
 
-    # ------------------------------------------------------------------
-    # 1. The Purge (rem-missing-bps)
-    # ------------------------------------------------------------------
-    # We do this BEFORE creating new directories to ensure a clean slate,
-    # but only if the output dir actually exists.
+    # 1. The Purge (rem-missing-bps) - UNCHANGED logic
     if cfg.rem_missing_bps and cfg.outdir.exists():
-
-        # SRA Mode check: FASTQ mode usually doesn't output BioProject folders like this.
         if getattr(dataset, "mode", "SRA") != "SRA":
-            log("[WARNING] --rem-missing-bps ignored: Only applicable in SRA mode.", None)
+            print("[WARNING] --rem-missing-bps ignored: Only applicable in SRA mode.") # Changed log call to print/click
         else:
             expected_bps = set(getattr(dataset, "bioprojects", []))
-
-            # SAFETY CHECK: If the input table is empty, do NOT wipe the folder.
             if not expected_bps:
-                click.secho(
-                    "\n[SAFETY ABORT] Input table contains no BioProjects. "
-                    "Skipping --rem-missing-bps to prevent total deletion of output directory.",
-                    fg="red", bold=True
-                )
+                print("\n[SAFETY ABORT] Input table empty. Skipping cleanup.")
             else:
-                click.secho(f"\n[CLEANUP] Scanning {cfg.outdir} for extraneous BioProjects...", fg="yellow")
-
-                # Folders we NEVER delete automatically
+                print(f"\n[CLEANUP] Scanning {cfg.outdir}...")
                 blacklist = {"shared", "fastq_samples", "logs", "slurm_logs", "multiqc_data"}
-
-                # List existing directories
                 existing_items = [p for p in cfg.outdir.iterdir() if p.is_dir()]
 
                 for folder in existing_items:
-                    # Skip blacklisted or MultiQC folders
                     if folder.name in blacklist or folder.name.endswith("_mqc"):
                         continue
-
                     if folder.name not in expected_bps:
-                        msg = f"[DANGER] Deleting extraneous BioProject folder: {folder.name}"
-                        click.secho(msg, fg="red", bold=True)
-
+                        print(f"[DANGER] Deleting extraneous BioProject folder: {folder.name}")
                         if not cfg.dry_run:
                             try:
                                 shutil.rmtree(folder)
                             except Exception as ex:
-                                click.secho(f"Failed to remove {folder}: {ex}", fg="red")
+                                print(f"Failed to remove {folder}: {ex}")
 
-    # ------------------------------------------------------------------
-    # 2. Standard Directory Setup (Moved from Config)
-    # ------------------------------------------------------------------
-
-    # Create Root Output
+    # 2. Standard Directory Setup
     cfg.outdir.mkdir(parents=True, exist_ok=True)
 
-    # Clean/Create Shared Directory
-    if cfg.shared.exists() and cfg.force:
-        # If forcing, we might want to clear shared logs/cache,
-        # though usually we just want to overwrite.
-        # Kept strict cleaning as per your previous code:
-        try:
-            shutil.rmtree(cfg.shared)
-        except Exception as e:
-            click.secho(f"Warning: Could not clear shared dir: {e}", fg="yellow")
-
+    # --- CHANGED BLOCK START ---
+    # We DO NOT delete 'shared' on force anymore.
+    # This preserves the cache and the main log history.
     cfg.shared.mkdir(parents=True, exist_ok=True)
-
-    # Clean/Create Cache Directory
-    if cfg.cache.exists() and cfg.force:
-        try:
-            shutil.rmtree(cfg.cache)
-        except Exception:
-            pass
     cfg.cache.mkdir(parents=True, exist_ok=True)
+    # --- CHANGED BLOCK END ---
 
     # Initialize Log
-    # We do this last to ensure the 'shared' dir exists
     if not cfg.dry_run:
-        with open(cfg.log, "w", encoding="utf-8") as f:
-            f.write(f"\n===== HULK start {datetime.now().isoformat()} =====\n")
+        # Open in Append mode ('a') so we don't wipe history even on force
+        mode = 'a'
+        with open(cfg.log, mode, encoding="utf-8") as f:
+            f.write(f"\n\n{'='*60}\n")
+            f.write(f"===== HULK start {datetime.now().isoformat()} =====\n")
+            if cfg.force:
+                 f.write("!! Run mode: FORCE (Overwriting sample data) !!\n")
             if cfg.rem_missing_bps:
-                f.write("!! WARNING: Run started with --rem-missing-bps (Destructive Mode) !!\n")
+                f.write("!! Run mode: REM_MISSING_BPS (Destructive Cleanup) !!\n")
+            f.write(f"{'='*60}\n")
 
 def pipeline(data: "Dataset", cfg: "Config") -> None:
 
@@ -166,13 +132,30 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     )
 
     # Global MultiQC
-    run_multiqc_global(outdir, shared, "multiqc_shared", log_path, modules=("kallisto", "fastp"))
+    if not cfg.no_global_postprocessing:
+        try:
+            log("Generating Global MultiQC report...", log_path)
+            # Pass 'dataset' to trigger global aggregation mode
+            run_multiqc_global(outdir, shared, "multiqc_shared", log_path, modules=("kallisto", "fastp"))
+        except Exception as e:
+            log_err(cfg.error_warnings, log_path, f"Global MultiQC failed: {e}")
+    else:
+        log("Skipping Global MultiQC (--no-global-postprocessing).", log_path)
+
 
     # Post-processing (R-based: tximport + DESeq2/VST + plots/exports)
     if getattr(cfg, "tx2gene", None) is not None:
         # This will respect cfg.deseq2_vst_enabled and the plot flags.
         # If DESeq2 is disabled, it will automatically fall back to tximport-only.
         run__postprocessing(data, cfg, skip_bp=True)
+
+    try:
+        run_seidr(cfg)
+    except Exception as e:
+        log_err(cfg.error_warnings, log_path, f"[Seidr] Pipeline step failed: {e}")
+
+        # End of pipeline
+    log("Pipeline finished.", log_path)
 
     # Warnings, if any
     if getattr(cfg, "error_warnings", None):

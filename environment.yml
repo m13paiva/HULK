@@ -31,4 +31,3 @@ dependencies:
   - bioconductor-tximport     # tximport (R)
   - bioconductor-complexheatmap
   - r-circlize                # dependency of ComplexHeatmap
-

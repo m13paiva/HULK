@@ -20,11 +20,6 @@ def _is_fastq_path(p: Path) -> bool:
 
 
 # ------------------------------- Config -------------------------------
-import os
-import json
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-
 
 class Config:
     """
@@ -47,33 +42,37 @@ class Config:
             dry_run: bool = False,
             tx2gene: Optional[Path] = None,
             keep_fastq: bool = False,
-            # NEW: sequencing technology (FASTQ mode)
             seq_tech: Optional[str] = None,
-            # Existing feature / tool config
+
+            # Tool config
             trim_window_size: int = 4,
             trim_mean_quality: int = 20,
             align_method: str = "kallisto",
             kallisto_bootstrap: int = 100,
             tximport_mode: str = "raw_counts",
             tximport_ignore_tx_version: bool = False,
-            cache_gb: Optional[int] = None,  # -c/--cache (GiB)
-            no_cache: bool = False,  # --no-cache
+            cache_gb: Optional[int] = None,
+            no_cache: bool = False,
 
-            # NEW: Multiple target files & Rem Missing & DESeq2 sourced from JSON
+            # Analysis flow
             rem_missing_bps: bool = False,
             target_genes_files: Optional[List[Path]] = None,
 
-            # Plotting options (Flags passed from runtime CLI or loaded defaults)
+            # Plotting options
             plot_pca: bool = True,
             plot_heatmap: bool = True,
             plot_var_heatmap: bool = True,
-            plot_sample_cor: bool = True,  # NEW
-            plot_dispersion: bool = True,  # NEW
-            top_n_vars: int = 500,  # NEW
+            plot_sample_cor: bool = True,
+            plot_dispersion: bool = True,
+            top_n_vars: int = 500,
 
             plots_only_mode: bool = False,
             tximport_only_mode: bool = False,
             bioproject_filter: Optional[str] = None,
+
+            # Post-processing flags
+            no_bp_postprocessing: bool = False,
+            no_global_postprocessing: bool = False,
     ):
         # --------------------------- Runtime (CLI) ---------------------------
         self.input_path = Path(input_path).expanduser().resolve() if input_path is not None else None
@@ -87,19 +86,15 @@ class Config:
         self.tx2gene = Path(tx2gene).expanduser().resolve() if tx2gene else None
         self.keep_fastq = keep_fastq
         self.error_warnings: List[str] = []
-
-        # The danger flag
         self.rem_missing_bps = rem_missing_bps
-
-        # Sequencing tech (mostly relevant in FASTQ mode; passed from CLI)
         self.seq_tech: Optional[str] = seq_tech
 
         # --------------------------- Persistent JSON ---------------------------
         self.cfg_path = self._resolve_cfg_path()
         self.persisted_cfg = self._load_json_cfg(self.cfg_path)
 
-        # --------------------------- Tool options (effective) ------------------
-        # trim
+        # --------------------------- Tool options ---------------------------
+        # Trim
         self.trim_window_size = int(trim_window_size)
         self.trim_mean_quality = int(trim_mean_quality)
         self.trim_opts: Dict[str, Any] = {
@@ -107,11 +102,11 @@ class Config:
             "mean_quality": self.trim_mean_quality,
         }
 
-        # align
+        # Align
         self.align_method = (align_method or "kallisto").lower()
         self.kallisto_bootstrap = int(kallisto_bootstrap)
 
-        # tximport
+        # Tximport
         self.tximport_mode = tximport_mode or "raw_counts"
         self.tximport_ignore_tx_version = bool(tximport_ignore_tx_version)
         self.tximport_opts: Dict[str, Any] = {
@@ -120,13 +115,9 @@ class Config:
         }
 
         # --------------------------- DESeq2 / Expression ---------------------
-        # Now loaded primarily from persisted config, unless overridden
         deseq2_cfg = self.persisted_cfg.get("deseq2", {})
-
         self.deseq2_vst_enabled: bool = bool(deseq2_cfg.get("enabled", True))
         self.deseq2_var_threshold: float = float(deseq2_cfg.get("var_threshold", 0.1))
-
-        # Matrix type is hardcoded to vst for now
         self.expr_use_matrix: str = "vst"
         self.drop_nonvarying_genes: bool = True
 
@@ -134,14 +125,18 @@ class Config:
         self.plot_pca: bool = bool(plot_pca)
         self.plot_heatmap: bool = bool(plot_heatmap)
         self.plot_var_heatmap: bool = bool(plot_var_heatmap)
-        self.plot_sample_cor: bool = bool(plot_sample_cor)  # NEW
-        self.plot_dispersion: bool = bool(plot_dispersion)  # NEW
-        self.top_n_vars: int = int(top_n_vars)  # NEW
+        self.plot_sample_cor: bool = bool(plot_sample_cor)
+        self.plot_dispersion: bool = bool(plot_dispersion)
+        self.top_n_vars: int = int(top_n_vars)
 
         self.plots_only_mode: bool = bool(plots_only_mode)
         self.tximport_only_mode: bool = bool(tximport_only_mode)
 
-        # Handle multiple target files
+        # Post-processing control
+        self.no_bp_postprocessing = no_bp_postprocessing
+        self.no_global_postprocessing = no_global_postprocessing
+
+        # Handle multiple target files (CLI overrides Persisted)
         self.target_genes_files: List[Path] = []
         if target_genes_files:
             for tf in target_genes_files:
@@ -149,26 +144,24 @@ class Config:
 
         self.bioproject_filter = bioproject_filter
 
-        # Bundle for the Seidr subcommand / expression-network step
-        self.expr_network_opts: Dict[str, Any] = {
-            "deseq2_vst_enabled": self.deseq2_vst_enabled,
-            "deseq2_var_threshold": self.deseq2_var_threshold,
-            "use_matrix": self.expr_use_matrix,
-            "drop_nonvarying": self.drop_nonvarying_genes,
-            "pca": self.plot_pca,
-            "heatmap": self.plot_heatmap,
-            "var_heatmap": self.plot_var_heatmap,
-            "sample_cor": self.plot_sample_cor,  # NEW
-            "dispersion": self.plot_dispersion,  # NEW
-            "top_n": self.top_n_vars,  # NEW
-            "plots_only": self.plots_only_mode,
-            "tximport_only": self.tximport_only_mode,
-            "target_genes_files": [str(x) for x in self.target_genes_files],
-            "bioproject": self.bioproject_filter,
-        }
+        # --------------------------- Seidr / Network ---------------------------
+        seidr_cfg = self.persisted_cfg.get("seidr", {})
 
-        # cache
-        self.cache_gb: Optional[int] = cache_gb  # may be None → auto
+        self.seidr_enabled = bool(seidr_cfg.get("enabled", True))
+        self.seidr_preset = seidr_cfg.get("preset", "BALANCED").upper()
+        self.seidr_algos = seidr_cfg.get("algorithms", [])  # If empty, runner uses preset
+        self.seidr_backbone = float(seidr_cfg.get("backbone", 1.28))
+        self.seidr_workers = int(seidr_cfg.get("workers", 2))
+        self.seidr_target_mode = seidr_cfg.get("target_mode", "targeted_only")
+
+        # Persisted defaults for targets (if any)
+        self.seidr_persisted_targets = [Path(t) for t in seidr_cfg.get("targets", [])]
+
+        # Effective Seidr Targets: CLI targets take precedence if present
+        self.seidr_targets = self.target_genes_files if self.target_genes_files else self.seidr_persisted_targets
+
+        # Cache
+        self.cache_gb: Optional[int] = cache_gb
         self.no_cache: bool = bool(no_cache)
 
         # --------------------------- Directory setup ---------------------------
@@ -218,8 +211,22 @@ class Config:
                 "seq_tech": self.seq_tech,
             }
         if tool == "seidr":
-            # Options used by the Seidr subcommand / R pipeline
-            return dict(self.expr_network_opts)
+            # Paths are standard in the pipeline flow:
+            return {
+                "enabled": self.seidr_enabled,
+                "preset": self.seidr_preset,
+                "algorithms": self.seidr_algos,
+                "backbone": self.seidr_backbone,
+                "workers": self.seidr_workers,
+                "target_mode": self.seidr_target_mode,
+                "targets": [str(t) for t in self.seidr_targets],
+                # Standard input locations generated by post_processing.R
+                "genes_file": self.shared / "deseq2" / "genes.txt",
+                "expression_file": self.shared / "deseq2" / "expression.tsv",
+                "outdir": self.shared / "seidr",
+                "aggregate": "irp",
+                "no_full": False
+            }
         return self.persisted_cfg.get(tool, {})
 
     @property
@@ -278,8 +285,12 @@ class Sample:
 
         # per-sample log
         self.log_path = self.outdir / f"{self.id}_log.txt"
+
+        # Always ensure directory exists
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Only create header if file doesn't exist
         if not self.log_path.exists():
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.log_path, "w") as f:
                 f.write(f"# Log for Sample {self.id}\n")
 
