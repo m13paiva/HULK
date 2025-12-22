@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 import pandas as pd
 
-from .entities import Config  # Import for type hinting
+from .entities import Config
 
 # --- CONSTANTS ---
 
@@ -77,8 +77,20 @@ def _resolve_binaries(needed_algos: List[str], bin_dir: Optional[Path]) -> Dict[
 
 def _import_scores(seidr_bin: str, algo_name: str, outdir: Path, prefix: str,
                    tsv_in: Path, genes: Path, fmt: str, threads: int) -> Path:
+    """
+    Imports the TSV scores into Seidr binary format (.sf).
+    Also checks if this step is already done to avoid redundant imports.
+    """
     sf_path = outdir / f"{prefix}{algo_name.lower()}_scores.sf"
 
+    # Checkpoint for the import step itself
+    if sf_path.exists() and sf_path.stat().st_size > 0:
+        # We assume if the SF exists, the import succeeded.
+        # Seidr import is fast/atomic enough that we don't usually need a separate marker,
+        # but if you are paranoid, we could add one.
+        return sf_path
+
+    # NO "-c" flag. Your input matrix is headerless.
     cmd = [seidr_bin, "import", "-n", algo_name, "-o", str(sf_path),
            "-F", fmt, "-i", str(tsv_in), "-g", str(genes)]
 
@@ -92,20 +104,27 @@ def _import_scores(seidr_bin: str, algo_name: str, outdir: Path, prefix: str,
         cmd.extend(["-r", "-z", "-O", str(threads)])
 
     _run_cmd(cmd)
+
+    if not sf_path.exists():
+        raise RuntimeError(f"Import failed for {algo_name}. Output {sf_path} missing.")
+
     return sf_path
 
 
 def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path, label: str, no_full: bool):
     print(f"[Seidr] Exporting {label} results...")
 
+    # Check if export already happened? Maybe. But export is fast.
+
     res = subprocess.run([seidr, "view", "--column-headers", str(bb_sf)], capture_output=True, text=True)
     if not res.stdout.strip():
-        print(f"[Warn] No edges found in {bb_sf}")
+        print(f"[Warn] No edges found in {bb_sf}. Backbone threshold too strict?")
         return
 
     try:
         df = pd.read_csv(io.StringIO(res.stdout), sep="\t", engine="c")
-    except Exception:
+    except Exception as e:
+        print(f"[Error] Failed to parse Seidr output: {e}")
         return
 
     def clean(x):
@@ -115,13 +134,11 @@ def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path
     for c in numeric_cols:
         df[c] = df[c].apply(clean)
 
-    # Edge list
     agg_col = df.columns[-1]
     simple = df[["Source", "Target", agg_col]].copy().rename(columns={agg_col: "weight"})
     simple["direction"] = df["Interaction"] if "Interaction" in df.columns else "Undirected"
     simple.to_csv(outdir / f"network_{label}_edges.tsv", sep="\t", index=False)
 
-    # Algorithm subset
     keepers = ["Source", "Target"]
     if "Interaction" in df.columns: keepers.append("Interaction")
     for alg in algorithms:
@@ -160,42 +177,75 @@ def _build_network_task(
             bin_name, m_flag, m_val = ALGO_MAP[algo]
             out_tsv = outdir / f"{prefix}{algo.lower()}_scores.tsv"
 
-            if out_tsv.exists() and out_tsv.stat().st_size > 0:
-                print(f"   [Skip] {algo} output exists.")
+            # --- THE FIX: MARKER SYSTEM ---
+            # We use a hidden file to mark that this specific algorithm FINISHED successfully.
+            # TSV output alone is not proof of success (it could be a crash artifact).
+            done_marker = outdir / f".{prefix}{algo.lower()}.done"
+
+            # 1. Check if we have a finished run
+            if out_tsv.exists() and done_marker.exists():
+                print(f"[Seidr] Found verified cache for {algo}. Skipping calculation.")
+                # We trust the TSV, so we proceed to import
+                return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, fmt, threads)
+
+            # 2. Cleanup artifacts
+            # If TSV exists but marker does not, it's trash.
+            if out_tsv.exists():
+                print(f"[Seidr] Found incomplete/corrupt output for {algo}. Deleting...")
+                out_tsv.unlink()
+            if done_marker.exists():
+                done_marker.unlink()  # orphaned marker (rare, but possible)
+
+            # 3. Construct Command
+            cmd = [tools[bin_name]]
+            cmd.extend(["-i", str(expression_file), "-g", str(genes_file), "-o", str(out_tsv)])
+
+            if m_flag: cmd.extend([m_flag, m_val])
+
+            if bin_name not in ["correlation", "pcor"]:
+                cmd.extend(["-O", str(threads)])
             else:
-                cmd = [tools[bin_name]]
-                cmd.extend(["-i", str(expression_file), "-g", str(genes_file), "-o", str(out_tsv)])
-                if m_flag: cmd.extend([m_flag, m_val])
+                cmd.append("--no-scale")
 
-                if bin_name not in ["correlation", "pcor"]:
-                    cmd.extend(["-O", str(threads)])
-                else:
-                    cmd.append("--no-scale")
+            if targeted:
+                if not target_file: raise ValueError("Targeted mode without file")
+                cmd.insert(1, "-t")
+                cmd.insert(2, str(target_file))
 
-                if targeted:
-                    if not target_file: raise ValueError("Targeted mode without file")
-                    cmd.insert(1, "-t")
-                    cmd.insert(2, str(target_file))
+            if algo in ["CLR", "ARACNE"]:
+                if not prerequisite_file: raise ValueError(f"{algo} needs MI output")
+                cmd.extend(["-M", str(prerequisite_file)])
 
-                if algo in ["CLR", "ARACNE"]:
-                    if not prerequisite_file: raise ValueError(f"{algo} needs MI output")
-                    cmd.extend(["-M", str(prerequisite_file)])
+            # 4. Run & Mark Success
+            _run_cmd(cmd)
 
-                _run_cmd(cmd)
+            if not out_tsv.exists():
+                raise FileNotFoundError(f"{algo} reported success but {out_tsv} is missing.")
 
+            # Create the success marker
+            done_marker.touch()
+
+            # 5. Import
             return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, fmt, threads)
 
         except Exception as e:
             print(f"[Error] {algo} failed: {e}")
+            # Ensure we don't leave a fake success marker
+            done_marker_path = outdir / f".{prefix}{algo.lower()}.done"
+            if done_marker_path.exists():
+                done_marker_path.unlink()
             return None
 
     # 1. Dependency: MI
     mi_sf_path = None
+    # We need the path to the TSV for CLR/ARACNE, even if we skip the calculation
     mi_tsv_path = outdir / f"{prefix}mi_scores.tsv"
 
     if any(x in algorithms for x in ["MI", "CLR", "ARACNE"]):
-        print(f"[Seidr] Running MI prereq for {label}...")
+        print(f"[Seidr] Checking MI requirement for {label}...")
         mi_sf_path = run_algo_task("MI")
+
+        # If run_algo_task succeeded (cached or fresh), mi_tsv_path is valid
         if "MI" in algorithms and mi_sf_path:
             sf_files.append(mi_sf_path)
 
@@ -203,11 +253,17 @@ def _build_network_task(
     parallel_algos = [a for a in algorithms if a != "MI"]
 
     if parallel_algos:
-        print(f"[Seidr] Launching {len(parallel_algos)} algorithms in parallel...")
+        print(f"[Seidr] Launching {len(parallel_algos)} algorithms...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {}
             for algo in parallel_algos:
                 prereq = mi_tsv_path if algo in ["CLR", "ARACNE"] else None
+
+                # Check prerequisites existence if we are about to use them
+                if prereq and not prereq.exists():
+                    print(f"[Error] Cannot run {algo}: MI output missing.")
+                    continue
+
                 future = executor.submit(run_algo_task, algo, prereq)
                 future_map[future] = algo
 
@@ -218,28 +274,33 @@ def _build_network_task(
 
     # 3. Aggregate
     if not sf_files:
-        print("[Error] No algorithms finished successfully.")
+        print(f"[Error] No algorithms finished successfully for {label}.")
         return
 
     net_sf = outdir / f"network_{label}.sf"
+    # Aggregate is fast, just re-run it to be safe or check output timestamp
+    if net_sf.exists(): net_sf.unlink()
+
+    print(f"[Seidr] Aggregating {len(sf_files)} networks...")
     agg_cmd = [seidr, "aggregate", "-o", str(net_sf), "-m", aggregate_mode] + [str(s) for s in sf_files]
     _run_cmd(agg_cmd)
 
     # 4. Backbone
     print(f"[Seidr] Pruning (Backbone {backbone})...")
+    bb_sf = outdir / f"network_{label}.bb.sf"
+    if bb_sf.exists(): bb_sf.unlink()
+
     _run_cmd([seidr, "backbone", "-F", str(backbone), str(net_sf)])
 
-    bb_sf = outdir / f"network_{label}.bb.sf"
     if bb_sf.exists():
         _export_results(outdir, algorithms, seidr, bb_sf, label, no_full)
+    else:
+        print("[Warn] Backbone file not created. Threshold might be too strict.")
 
 
 # --- MAIN RUNNER ---
 
 def run_seidr(cfg: Config) -> None:
-    """
-    Main entry point called by the pipeline. Uses settings from the Config object.
-    """
     opts = cfg.get_tool_opts("seidr")
 
     if not opts.get("enabled", False):
@@ -252,19 +313,10 @@ def run_seidr(cfg: Config) -> None:
     targets = [Path(t) for t in opts.get("targets", [])]
     target_mode = opts.get("target_mode", "both")
 
-    # Resolve Algorithms
+    # Defaults
     algos = opts.get("algorithms", [])
     if not algos:
         algos = PRESETS.get(opts.get("preset", "BALANCED"), PRESETS["BALANCED"])
-
-    # Basic Validation
-    if not genes_file.exists():
-        print(f"[Seidr] SKIPPING: Genes file not found at {genes_file}")
-        print("[Seidr] Ensure post-processing ran successfully with DESeq2 enabled.")
-        return
-    if not expression_file.exists():
-        print(f"[Seidr] SKIPPING: Expression matrix not found at {expression_file}")
-        return
 
     # 2. Setup Output
     outdir.mkdir(parents=True, exist_ok=True)
@@ -277,7 +329,7 @@ def run_seidr(cfg: Config) -> None:
         return
 
     print("\n" + "=" * 60)
-    print("STARTING SEIDR NETWORK INFERENCE")
+    print("STARTING SEIDR NETWORK INFERENCE (Smart-Resume Enabled)")
     print(f"Algorithms: {', '.join(algos)}")
     print(f"Threads: {cfg.max_threads} | Workers: {opts['workers']}")
     print("=" * 60 + "\n")
@@ -304,7 +356,6 @@ def run_seidr(cfg: Config) -> None:
     if targets and target_mode in ["both", "targeted_only"]:
         for t_file in targets:
             if t_file.exists():
-                #Use filename stem directly (e.g. 'apoptosis' -> 'network_apoptosis.sf')
                 label = t_file.stem
                 _build_network_task(label=label, targeted=True, target_file=t_file, **task_args)
             else:

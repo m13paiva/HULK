@@ -31,16 +31,14 @@ option_list <- list(
   make_option(c("--force-txi"), dest = "force_txi", action = "store_true", default = FALSE),
   make_option(c("--use-matrix"), dest = "use_matrix", type = "character", default = "vst"),
   make_option(c("--no-drop-nonvarying"), dest = "drop_nonvarying", action = "store_false", default = TRUE),
-  make_option(c("--var-threshold"), dest = "var_threshold", type = "numeric", default = 0.1),
 
-  # CONFIGURABLE TOP N
+  # USER CONTROLLED THRESHOLD
+  make_option(c("--var-threshold"), dest = "var_threshold", type = "numeric", default = 0.05),
+
   make_option(c("--top-n"), dest = "top_n", type = "integer", default = 500),
-
   make_option(c("--pca"), dest = "pca", action = "store_true", default = FALSE),
   make_option(c("--heatmap"), dest = "heatmap", action = "store_true", default = FALSE),
   make_option(c("--var-heatmap"), dest = "var_heatmap", action = "store_true", default = FALSE),
-
-  # NEW PLOT FLAGS
   make_option(c("--sample-cor"), dest = "sample_cor", action = "store_true", default = FALSE),
   make_option(c("--dispersion"), dest = "dispersion", action = "store_true", default = FALSE),
 
@@ -66,7 +64,7 @@ EXCLUDE_DIRS  <- opt$exclude_dir
 TX2GENE_PATH  <- opt$tx2gene
 OUT_DIR       <- opt$out_dir
 BIOPROJECT_ID <- opt$bioproject
-TOP_N         <- opt$top_n    # Using user-defined N
+TOP_N         <- opt$top_n
 DO_PCA        <- isTRUE(opt$pca)
 DO_HEATMAP    <- isTRUE(opt$heatmap)
 DO_VAR_HM     <- isTRUE(opt$var_heatmap)
@@ -89,7 +87,6 @@ txi_rds  <- file.path(tximport_dir, "txi.rds")
 txi_tsv  <- file.path(tximport_dir, "tximport_counts.tsv")
 dds_rds  <- file.path(deseq2_dir, "dds.rds")
 vst_tsv  <- file.path(deseq2_dir, "vst.tsv")
-norm_tsv <- file.path(deseq2_dir, "normalized_counts.tsv")
 sf_tsv   <- file.path(deseq2_dir, "size_factors.tsv")
 
 # Seidr Paths
@@ -127,33 +124,14 @@ read_targets <- function(p) {
 
 # --- Plotting Function ---
 make_plots <- function(vst_mat, info) {
-
-  # Diagnostics
-  msg("\n--- DIAGNOSTICS ---")
-  common <- intersect(colnames(vst_mat), info$sample)
-  info <- info[match(common, info$sample), ]
-  vst_mat <- vst_mat[, common, drop=FALSE]
-  msg("Aligned Samples: %d", ncol(vst_mat))
-  msg("-------------------\n")
-
-  # Filter Low Variance
-  if(!PLOTS_ONLY && (DO_PCA || DO_HEATMAP || DO_VAR_HM || DO_SAMPLE_COR)) {
-      msg("Filtering genes with variance < %s...", opt$var_threshold)
-      all_vars <- apply(vst_mat, 1, var, na.rm=TRUE)
-      keep_genes <- !is.na(all_vars) & (all_vars >= opt$var_threshold)
-      vst_mat <- vst_mat[keep_genes, , drop=FALSE]
-      if(nrow(vst_mat) == 0) {
-        msg("WARNING: No genes remaining after filter.")
-        return()
-      }
-      msg("Genes Remaining: %d", nrow(vst_mat))
-  }
+  # vst_mat here is ALREADY filtered by the global logic below
 
   if(!DO_PCA && !DO_HEATMAP && !DO_VAR_HM && !DO_SAMPLE_COR) return()
 
-  # Top N Selection
+  # Visualization Top N (Only for Plotting, doesn't affect Seidr)
   vars <- apply(vst_mat, 1, var, na.rm=TRUE)
-  top <- order(vars, decreasing=TRUE)[seq_len(min(TOP_N, length(vars)))]
+  n_plot <- min(TOP_N, nrow(vst_mat))
+  top <- order(vars, decreasing=TRUE)[seq_len(n_plot)]
   vst_top <- vst_mat[top, , drop=FALSE]
 
   # 1. PCA
@@ -163,7 +141,7 @@ make_plots <- function(vst_mat, info) {
       left_join(info, by="sample")
     col_by <- if(PER_BP_MODE || MODE=="FASTQ") "sample" else "bioproject"
     p <- ggplot(df, aes(x=PC1, y=PC2, color=.data[[col_by]])) +
-         geom_point(size=2) + theme_bw() + labs(title="PCA (VST)")
+         geom_point(size=2) + theme_bw() + labs(title=sprintf("PCA (Top %d Var Genes)", n_plot))
     ggsave(pca_pdf, p, width=6, height=5)
     readr::write_tsv(df, sub("\\.pdf$", ".tsv", pca_pdf))
     msg("[PCA] Saved %s", pca_pdf)
@@ -194,10 +172,10 @@ make_plots <- function(vst_mat, info) {
     msg("[Heatmap] Saved %s", f)
   }
 
-  # 2. GLOBAL HEATMAP
-  if(DO_HEATMAP) draw_hm(vst_top, "Global Expression", heatmap_pdf)
+  # 2. GLOBAL HEATMAP (Top N)
+  if(DO_HEATMAP) draw_hm(vst_top, "Global Expression (Top N)", heatmap_pdf)
 
-  # 3. TARGETED HEATMAPS
+  # 3. TARGETED HEATMAPS (Full Filtered Matrix)
   if(DO_HEATMAP && !is.null(TARGET_GENES_LIST)) {
      targets_vec <- as.character(unlist(TARGET_GENES_LIST))
      bases <- make.unique(tools::file_path_sans_ext(basename(targets_vec)), sep="_")
@@ -210,7 +188,7 @@ make_plots <- function(vst_mat, info) {
      }
   }
 
-  # 4. SAMPLE CORRELATION
+  # 4. SAMPLE CORRELATION (Full Filtered Matrix)
   if(DO_SAMPLE_COR) {
       msg("[SampleCor] Computing Pearson correlation...")
       cor_mat <- cor(vst_mat)
@@ -265,22 +243,13 @@ make_plots <- function(vst_mat, info) {
 
       msg("[VarHeatmap] Generating Global Variance Heatmap")
       draw_var_hm(rownames(vst_top), "Global Variance", var_hm_pdf)
-
-      if (!is.null(TARGET_GENES_LIST)) {
-         targets_vec <- as.character(unlist(TARGET_GENES_LIST))
-         bases <- make.unique(tools::file_path_sans_ext(basename(targets_vec)), sep="_")
-         for(i in seq_along(targets_vec)) {
-            g <- read_targets(targets_vec[i]); idx <- rownames(vst_mat)[rownames(vst_mat) %in% g]
-            if(length(idx) > 0) {
-               f <- file.path(plots_dir, sprintf("variance_heatmap_%s.pdf", bases[i]))
-               draw_var_hm(idx, paste("Targeted Var:", bases[i]), f)
-            }
-         }
-      }
   }
 }
 
-# Main
+# ==============================================================================
+# MAIN PIPELINE
+# ==============================================================================
+
 files <- find_files(SEARCH_DIR, EXCLUDE_DIRS)
 info <- tibble(sample=basename(dirname(files)), bioproject=basename(dirname(dirname(files))))
 names(files) <- info$sample
@@ -290,20 +259,21 @@ if(PER_BP_MODE) {
   files <- files[info$sample]
 }
 
+# --- LOAD / CALCULATE ---
+
 if(PLOTS_ONLY) {
-  if (!file.exists(vst_tsv)) stop("VST file missing.")
+  if (!file.exists(vst_tsv)) stop("VST file missing for fast mode.")
   vst_df <- readr::read_tsv(vst_tsv, col_types=cols())
   if ("sample" %in% colnames(vst_df)) {
       mat <- as.matrix(vst_df[,-1]); rownames(mat) <- vst_df$sample; vst_mat <- t(mat)
   } else {
       mat <- as.matrix(vst_df); rownames(mat) <- info$sample; vst_mat <- t(mat)
   }
-
+  # Note: Fast mode assumes existing VST file is already filtered.
   make_plots(vst_mat, info)
   quit(status=0)
 }
 
-# Pipeline
 if(file.exists(txi_rds) && !opt$force_txi) {
     msg("[tximport] LOADING CACHED DATA.")
     txi <- readRDS(txi_rds)
@@ -318,17 +288,17 @@ if(!file.exists(txi_rds)) saveRDS(txi, txi_rds)
 msg("[tximport] Saving raw counts to %s", txi_tsv)
 readr::write_tsv(as.data.frame(txi$counts) %>% tibble::rownames_to_column("gene"), txi_tsv)
 
-if(opt$tximport_only) {
-  quit(status=0)
-}
+if(opt$tximport_only) quit(status=0)
 
 coldata <- info[match(colnames(txi$counts), info$sample),]
 dds <- DESeqDataSetFromTximport(txi, colData=coldata, design=~1)
+
+# FILTER 1: ZERO COUNTS
 dds <- dds[rowSums(counts(dds))>0,]
 msg("[DESeq2] Estimating size factors (poscounts)...")
 dds <- estimateSizeFactors(dds, type="poscounts")
 
-# 6. DISPERSION PLOT
+# DISPERSION PLOT
 if(DO_DISP) {
     msg("[DESeq2] Estimating Dispersions & Plotting...")
     dds <- estimateDispersions(dds)
@@ -338,22 +308,43 @@ if(DO_DISP) {
     msg("[DispPlot] Saved %s", disp_pdf)
 }
 
+# --- VST TRANSFORM ---
 vst_mat <- assay(vst(dds, blind=TRUE))
+
+# FILTER 2: VARIANCE THRESHOLD (Global)
+if (opt$drop_nonvarying) {
+    msg("[Filter] Removing low-variance genes (threshold < %.2f)...", opt$var_threshold)
+    all_vars <- apply(vst_mat, 1, var, na.rm=TRUE)
+    keep_genes <- !is.na(all_vars) & (all_vars >= opt$var_threshold)
+    vst_mat <- vst_mat[keep_genes, , drop=FALSE]
+    msg("[Filter] Genes Remaining: %d", nrow(vst_mat))
+
+    if(nrow(vst_mat) == 0) {
+        msg("[Error] No genes left after filtering. Try lowering --var-threshold.")
+        quit(status=0)
+    }
+}
+
+# Save the Filtered VST Matrix (with headers/rownames for debugging/other tools)
 vst_out <- tibble::rownames_to_column(as.data.frame(t(vst_mat)), "sample")
 readr::write_tsv(vst_out, vst_tsv)
 
-# --- SAVE SEIDR READY OUTPUTS ---
-msg("[Seidr] Saving genes list and expression matrix...")
+# ==============================================================================
+# SEIDR OUTPUT
+# ==============================================================================
+msg("[Seidr] Saving %d genes for Network Inference...", nrow(vst_mat))
 
-# 1. Save Gene List
+# 1. Gene List (Rows correspond to matrix rows)
 writeLines(rownames(vst_mat), seidr_genes)
 
-# 2. Save Transposed Matrix (Samples x Genes)
-# We strictly exclude row names (Sample IDs) and column names (Gene IDs) from the file
-# to ensure the matrix is purely numeric and dimensions match exactly.
-# Seidr will map columns to the lines in 'genes.txt'.
-vst_t <- t(vst_mat)
-readr::write_tsv(as.data.frame(vst_t), seidr_expr, col_names = FALSE)
+# 2. Expression Matrix (Genes x Samples)
+#    - No Header, No Rownames, Just the Numbers.
+#    - Rows match genes.txt
+#    - Columns are samples (order technically doesn't matter for inference, but they are consistent)
+readr::write_tsv(as.data.frame(vst_mat), seidr_expr, col_names = FALSE)
 
+# ==============================================================================
+# PLOTS
+# ==============================================================================
 make_plots(vst_mat, coldata)
 msg("Done.")
