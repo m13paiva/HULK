@@ -330,18 +330,22 @@ vst_out <- tibble::rownames_to_column(as.data.frame(t(vst_mat)), "sample")
 readr::write_tsv(vst_out, vst_tsv)
 
 # ==============================================================================
-# SEIDR OUTPUT
+# SEIDR OUTPUT - FIXING THE "STOD" ERROR
 # ==============================================================================
 msg("[Seidr] Saving %d genes for Network Inference...", nrow(vst_mat))
 
-# 1. Gene List (Rows correspond to matrix rows)
+# 1. Gene List
 writeLines(rownames(vst_mat), seidr_genes)
 
-# 2. Expression Matrix (Genes x Samples)
-#    - No Header, No Rownames, Just the Numbers.
-#    - Rows match genes.txt
-#    - Columns are samples (order technically doesn't matter for inference, but they are consistent)
-readr::write_tsv(as.data.frame(vst_mat), seidr_expr, col_names = FALSE)
+# 2. Expression Matrix - Force pure numeric matrix with NO trailing tabs
+# We use write.table with explicit settings to avoid 'readr''s "helpful" formatting
+utils::write.table(vst_mat,
+            file = seidr_expr,
+            sep = "\t",
+            quote = FALSE,
+            row.names = FALSE,
+            col.names = FALSE,
+            eol = "\n")
 
 # ==============================================================================
 # PLOTS
