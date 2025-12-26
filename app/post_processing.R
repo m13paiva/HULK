@@ -31,17 +31,13 @@ option_list <- list(
   make_option(c("--force-txi"), dest = "force_txi", action = "store_true", default = FALSE),
   make_option(c("--use-matrix"), dest = "use_matrix", type = "character", default = "vst"),
   make_option(c("--no-drop-nonvarying"), dest = "drop_nonvarying", action = "store_false", default = TRUE),
-
-  # USER CONTROLLED THRESHOLD
   make_option(c("--var-threshold"), dest = "var_threshold", type = "numeric", default = 0.05),
-
   make_option(c("--top-n"), dest = "top_n", type = "integer", default = 500),
   make_option(c("--pca"), dest = "pca", action = "store_true", default = FALSE),
   make_option(c("--heatmap"), dest = "heatmap", action = "store_true", default = FALSE),
   make_option(c("--var-heatmap"), dest = "var_heatmap", action = "store_true", default = FALSE),
   make_option(c("--sample-cor"), dest = "sample_cor", action = "store_true", default = FALSE),
   make_option(c("--dispersion"), dest = "dispersion", action = "store_true", default = FALSE),
-
   make_option(c("--plots-only"), dest = "plots_only", action = "store_true", default = FALSE),
   make_option(c("--tximport-only"), dest = "tximport_only", action = "store_true", default = FALSE),
   make_option(c("--target-genes"), dest = "target_genes", type = "character", default = NULL),
@@ -49,14 +45,6 @@ option_list <- list(
 )
 
 opt <- parse_args(OptionParser(option_list = option_list))
-
-# --- Parse Comma-Separated List ---
-TARGET_GENES_LIST <- NULL
-if (!is.null(opt$target_genes)) {
-  raw_list <- strsplit(opt$target_genes, ",")[[1]]
-  TARGET_GENES_LIST <- trimws(raw_list)
-  TARGET_GENES_LIST <- TARGET_GENES_LIST[TARGET_GENES_LIST != ""]
-}
 
 # Map options
 SEARCH_DIR    <- opt$search_dir
@@ -75,6 +63,14 @@ MODE          <- toupper(opt$mode %||% "SRR")
 PER_BP_MODE   <- !is.null(BIOPROJECT_ID)
 
 if (MODE == "FASTQ" && DO_VAR_HM) DO_VAR_HM <- FALSE
+
+# --- Parse Comma-Separated List ---
+TARGET_GENES_LIST <- NULL
+if (!is.null(opt$target_genes)) {
+  raw_list <- strsplit(opt$target_genes, ",")[[1]]
+  TARGET_GENES_LIST <- trimws(raw_list)
+  TARGET_GENES_LIST <- TARGET_GENES_LIST[TARGET_GENES_LIST != ""]
+}
 
 # Paths
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
@@ -124,11 +120,8 @@ read_targets <- function(p) {
 
 # --- Plotting Function ---
 make_plots <- function(vst_mat, info) {
-  # vst_mat here is ALREADY filtered by the global logic below
-
   if(!DO_PCA && !DO_HEATMAP && !DO_VAR_HM && !DO_SAMPLE_COR) return()
 
-  # Visualization Top N (Only for Plotting, doesn't affect Seidr)
   vars <- apply(vst_mat, 1, var, na.rm=TRUE)
   n_plot <- min(TOP_N, nrow(vst_mat))
   top <- order(vars, decreasing=TRUE)[seq_len(n_plot)]
@@ -148,11 +141,8 @@ make_plots <- function(vst_mat, info) {
   }
 
   # Heatmap Helper
-  if(PER_BP_MODE || MODE=="FASTQ") {
-    grp_vec <- info$sample; title <- "Samples"
-  } else {
-    grp_vec <- info$bioproject; title <- "BioProject"
-  }
+  grp_vec <- if(PER_BP_MODE || MODE=="FASTQ") info$sample else info$bioproject
+  title   <- if(PER_BP_MODE || MODE=="FASTQ") "Samples" else "BioProject"
 
   draw_hm <- function(m, t, f, raster=FALSE) {
     grDevices::pdf(f, width=12, height=8)
@@ -172,10 +162,10 @@ make_plots <- function(vst_mat, info) {
     msg("[Heatmap] Saved %s", f)
   }
 
-  # 2. GLOBAL HEATMAP (Top N)
+  # 2. GLOBAL HEATMAP
   if(DO_HEATMAP) draw_hm(vst_top, "Global Expression (Top N)", heatmap_pdf)
 
-  # 3. TARGETED HEATMAPS (Full Filtered Matrix)
+  # 3. TARGETED HEATMAPS
   if(DO_HEATMAP && !is.null(TARGET_GENES_LIST)) {
      targets_vec <- as.character(unlist(TARGET_GENES_LIST))
      bases <- make.unique(tools::file_path_sans_ext(basename(targets_vec)), sep="_")
@@ -188,11 +178,10 @@ make_plots <- function(vst_mat, info) {
      }
   }
 
-  # 4. SAMPLE CORRELATION (Full Filtered Matrix)
+  # 4. SAMPLE CORRELATION
   if(DO_SAMPLE_COR) {
       msg("[SampleCor] Computing Pearson correlation...")
       cor_mat <- cor(vst_mat)
-
       grDevices::pdf(scor_pdf, width=10, height=8)
       ht <- ComplexHeatmap::Heatmap(cor_mat,
          name="Pearson",
@@ -205,7 +194,6 @@ make_plots <- function(vst_mat, info) {
       )
       ComplexHeatmap::draw(ht)
       grDevices::dev.off()
-
       readr::write_tsv(as.data.frame(cor_mat) %>% tibble::rownames_to_column("sample"), sub("\\.pdf$", ".tsv", scor_pdf))
       msg("[SampleCor] Saved %s", scor_pdf)
   }
@@ -236,11 +224,9 @@ make_plots <- function(vst_mat, info) {
         )
         ComplexHeatmap::draw(ht)
         grDevices::dev.off()
-
         readr::write_tsv(as.data.frame(var_mat) %>% tibble::rownames_to_column("gene_id"), sub("\\.pdf$", ".tsv", f))
         msg("[VarHeatmap] Saved %s", f)
       }
-
       msg("[VarHeatmap] Generating Global Variance Heatmap")
       draw_var_hm(rownames(vst_top), "Global Variance", var_hm_pdf)
   }
@@ -269,7 +255,6 @@ if(PLOTS_ONLY) {
   } else {
       mat <- as.matrix(vst_df); rownames(mat) <- info$sample; vst_mat <- t(mat)
   }
-  # Note: Fast mode assumes existing VST file is already filtered.
   make_plots(vst_mat, info)
   quit(status=0)
 }
@@ -284,7 +269,6 @@ if(file.exists(txi_rds) && !opt$force_txi) {
 }
 if(!file.exists(txi_rds)) saveRDS(txi, txi_rds)
 
-# --- SAVE TXIMPORT COUNTS (Always) ---
 msg("[tximport] Saving raw counts to %s", txi_tsv)
 readr::write_tsv(as.data.frame(txi$counts) %>% tibble::rownames_to_column("gene"), txi_tsv)
 
@@ -293,12 +277,10 @@ if(opt$tximport_only) quit(status=0)
 coldata <- info[match(colnames(txi$counts), info$sample),]
 dds <- DESeqDataSetFromTximport(txi, colData=coldata, design=~1)
 
-# FILTER 1: ZERO COUNTS
 dds <- dds[rowSums(counts(dds))>0,]
 msg("[DESeq2] Estimating size factors (poscounts)...")
 dds <- estimateSizeFactors(dds, type="poscounts")
 
-# DISPERSION PLOT
 if(DO_DISP) {
     msg("[DESeq2] Estimating Dispersions & Plotting...")
     dds <- estimateDispersions(dds)
@@ -308,10 +290,8 @@ if(DO_DISP) {
     msg("[DispPlot] Saved %s", disp_pdf)
 }
 
-# --- VST TRANSFORM ---
 vst_mat <- assay(vst(dds, blind=TRUE))
 
-# FILTER 2: VARIANCE THRESHOLD (Global)
 if (opt$drop_nonvarying) {
     msg("[Filter] Removing low-variance genes (threshold < %.2f)...", opt$var_threshold)
     all_vars <- apply(vst_mat, 1, var, na.rm=TRUE)
@@ -325,27 +305,27 @@ if (opt$drop_nonvarying) {
     }
 }
 
-# Save the Filtered VST Matrix (with headers/rownames for debugging/other tools)
+# Save standard VST (Samples x Genes) for normal usage
 vst_out <- tibble::rownames_to_column(as.data.frame(t(vst_mat)), "sample")
 readr::write_tsv(vst_out, vst_tsv)
 
 # ==============================================================================
-# SEIDR OUTPUT - FIXING THE "STOD" ERROR
+# SEIDR OUTPUT - FAST & CLEAN
 # ==============================================================================
 msg("[Seidr] Saving %d genes for Network Inference...", nrow(vst_mat))
 
 # 1. Gene List
-writeLines(rownames(vst_mat), seidr_genes)
+clean_genes <- gsub("\\s+", "_", rownames(vst_mat))
+writeLines(clean_genes, seidr_genes)
 
-# 2. Expression Matrix - Force pure numeric matrix with NO trailing tabs
-# We use write.table with explicit settings to avoid 'readr''s "helpful" formatting
-utils::write.table(vst_mat,
-            file = seidr_expr,
-            sep = "\t",
-            quote = FALSE,
-            row.names = FALSE,
-            col.names = FALSE,
-            eol = "\n")
+# 2. Expression Matrix (Samples x Genes)
+# - Transpose to get Samples as Rows
+# - write_tsv with col_names=FALSE creates pure tab-separated numbers
+seidr_mat <- t(vst_mat)
+readr::write_tsv(as.data.frame(seidr_mat),
+                 file = seidr_expr,
+                 col_names = FALSE,
+                 na = "0")
 
 # ==============================================================================
 # PLOTS

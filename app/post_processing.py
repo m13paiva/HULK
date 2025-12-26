@@ -69,13 +69,13 @@ def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) ->
     if (not deseq2_enabled) or txi_only_mode:
         args.append("--tximport-only")
 
-    # --- CRITICAL FIX ---
-    # Dispersion plot MUST be generated during Phase 1 (Compute) because it needs the DESeq2 object.
-    # It cannot be generated in Phase 2 (Plots Only) which only uses the VST matrix.
+    # --- DISPERSION PLOT ---
+    # Generated during Phase 1 (Compute) because it needs the DESeq2 object.
     if getattr(cfg, "plot_dispersion", False):
         args.append("--dispersion")
 
-    # Always force update in global mode (Phase 1).
+    # Always force update in global mode (Phase 1)
+    # This ensures R recalculates and overwrites files.
     args.append("--force-txi")
 
     return args
@@ -141,7 +141,10 @@ def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[s
 
 
 def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) -> None:
-    log_path = bp.log_path
+    log_path = cfg.log  # Using cfg.log is safer if bp.log_path isn't guaranteed
+    if hasattr(bp, 'log_path'):
+        log_path = bp.log_path
+
     out_dir = bp.path / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -155,13 +158,14 @@ def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) ->
     except Exception:
         pass
 
+
 def run_postprocessing(
         dataset: Dataset,
         cfg: Config,
         *,
         r_script: Path | None = None,
-        skip_bp: bool | None = None,  # Changed to Optional
-        skip_global: bool | None = None  # New Argument
+        skip_bp: bool | None = None,
+        skip_global: bool | None = None
 ) -> None:
     log_path = cfg.log
     error_warnings: List[str] = cfg.error_warnings
@@ -202,9 +206,9 @@ def run_postprocessing(
         if getattr(cfg, "plot_var_heatmap", False): active_plots.append("--var-heatmap")
         if getattr(cfg, "plot_sample_cor", False): active_plots.append("--sample-cor")
 
-        # Dispersion is handled in Phase 1 (Compute)
-
         # --- PHASE 1: COMPUTATION ---
+        # If plots_only_mode is False (default or --force), we RUN this.
+        # This phase generates the Seidr inputs and VST matrix.
         skip_compute = getattr(cfg, "plots_only_mode", False)
 
         if not skip_compute:
@@ -231,6 +235,8 @@ def run_postprocessing(
             log(f"[post-processing] Phase 2: Generating {len(active_plots)} plot types (Concurrency: {SAFE_PLOT_WORKERS})...",
                 log_path)
 
+            # We reuse base_args but remove computation-specific flags just to be safe/clean
+            # Phase 2 relies on reading the files generated in Phase 1.
             plot_base_args = [a for a in base_args if a not in ("--force-txi", "--dispersion")]
             plot_base_args.append("--plots-only")
 
@@ -272,12 +278,11 @@ def run_postprocessing(
     if not dataset.bioprojects:
         return
 
-    max_workers_bp = max(1, int(cfg.max_threads))
+    max_workers_bp = max(1, int(getattr(cfg, "max_threads", 4)))
     log(f"[post-processing] Starting analysis for {len(dataset.bioprojects)} BioProjects (Concurrency: {max_workers_bp})...",
         log_path)
 
     with ThreadPoolExecutor(max_workers=max_workers_bp) as executor:
-        # ... (rest of BP logic remains identical) ...
         future_to_bp = {}
         for bp_id in dataset.bioprojects:
             bp_obj = SimpleNamespace(
