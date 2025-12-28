@@ -2,7 +2,6 @@ from __future__ import annotations
 
 
 import shutil
-import click
 from pathlib import Path
 from datetime import datetime
 from .utils import log, log_err
@@ -13,19 +12,23 @@ from .orchestrator import run_download_and_process
 from .post_processing import run_postprocessing as run__postprocessing
 from .seidr import run_seidr
 
-
 def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
     """
     Sets up the output directory structure and log files.
     """
-    import shutil # ensure import is available
 
-    # 1. The Purge (rem-missing-bps) - UNCHANGED logic
+    # 1. The Purge (rem-missing-bps)
     if cfg.rem_missing_bps and cfg.outdir.exists():
-        if getattr(dataset, "mode", "SRA") != "SRA":
-            print("[WARNING] --rem-missing-bps ignored: Only applicable in SRA mode.") # Changed log call to print/click
+        # We standardized on "SRA" in the Dataset class, so we check for that here.
+        if getattr(dataset, "mode", "SRR") != "SRR":
+            print("[WARNING] --rem-missing-bps ignored: Only applicable in SRA mode.")
         else:
-            expected_bps = set(getattr(dataset, "bioprojects", []))
+            # --- CRITICAL FIX ---
+            # Extract the ID strings from the BioProject objects.
+            # Comparing objects directly to folder strings caused the "delete everything" bug.
+            raw_bps = getattr(dataset, "bioprojects", [])
+            expected_bps = {str(bp.id) for bp in raw_bps if hasattr(bp, "id")}
+
             if not expected_bps:
                 print("\n[SAFETY ABORT] Input table empty. Skipping cleanup.")
             else:
@@ -36,6 +39,8 @@ def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
                 for folder in existing_items:
                     if folder.name in blacklist or folder.name.endswith("_mqc"):
                         continue
+
+                    # Now we compare String vs String
                     if folder.name not in expected_bps:
                         print(f"[DANGER] Deleting extraneous BioProject folder: {folder.name}")
                         if not cfg.dry_run:
@@ -47,25 +52,23 @@ def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
     # 2. Standard Directory Setup
     cfg.outdir.mkdir(parents=True, exist_ok=True)
 
-    # --- CHANGED BLOCK START ---
-    # We DO NOT delete 'shared' on force anymore.
-    # This preserves the cache and the main log history.
+    # We explicitly create these to ensure they exist.
+    # We DO NOT delete 'shared' on force anymore to preserve cache/plots.
     cfg.shared.mkdir(parents=True, exist_ok=True)
     cfg.cache.mkdir(parents=True, exist_ok=True)
-    # --- CHANGED BLOCK END ---
 
     # Initialize Log
     if not cfg.dry_run:
         # Open in Append mode ('a') so we don't wipe history even on force
         mode = 'a'
         with open(cfg.log, mode, encoding="utf-8") as f:
-            f.write(f"\n\n{'='*60}\n")
+            f.write(f"\n\n{'=' * 60}\n")
             f.write(f"===== HULK start {datetime.now().isoformat()} =====\n")
             if cfg.force:
-                 f.write("!! Run mode: FORCE (Overwriting sample data) !!\n")
+                f.write("!! Run mode: FORCE (Overwriting sample data) !!\n")
             if cfg.rem_missing_bps:
                 f.write("!! Run mode: REM_MISSING_BPS (Destructive Cleanup) !!\n")
-            f.write(f"{'='*60}\n")
+            f.write(f"{'=' * 60}\n")
 
 def pipeline(data: "Dataset", cfg: "Config") -> None:
 

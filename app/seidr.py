@@ -31,7 +31,7 @@ ALGO_MAP = {
     "PEARSON": ("correlation", "-m", "pearson", "lm"),
     "SPEARMAN": ("correlation", "-m", "spearman", "lm"),
     "PCOR": ("pcor", None, None, "lm"),
-    "MI": ("mi", "-m", "RAW", "lm"),  # Reverted to RAW, marked as Lower Matrix
+    "MI": ("mi", "-m", "RAW", "lm"),
     "CLR": ("mi", "-m", "CLR", "lm"),
     "ARACNE": ("mi", "-m", "ARACNE", "lm"),
     "GENIE3": ("genie3", None, None, "m"),
@@ -225,7 +225,8 @@ def _build_network_task(
         targeted: bool,
         target_file: Optional[Path],
         no_full: bool,
-        log_path: Path
+        log_path: Path,
+        force: bool  # <--- Added FORCE argument
 ) -> None:
     prefix = f"{label}_"
     seidr = tools["seidr"]
@@ -243,12 +244,14 @@ def _build_network_task(
             out_tsv = outdir / f"{prefix}{algo.lower()}_scores.tsv"
             done_marker = outdir / f".{prefix}{algo.lower()}.done"
 
-            if out_tsv.exists() and done_marker.exists():
+            # Check FORCE here: If not force and markers exist, skip.
+            if not force and out_tsv.exists() and done_marker.exists():
                 msg = f"[Seidr] Found verified cache for {algo}. Skipping."
                 print(msg)
                 log(msg, log_path)
                 return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, current_fmt, threads, log_path)
 
+            # Cleanup before run (Force Mode or corrupt cache)
             if out_tsv.exists(): out_tsv.unlink()
             if done_marker.exists(): done_marker.unlink()
 
@@ -338,7 +341,9 @@ def _build_network_task(
         return
 
     net_sf = outdir / f"network_{label}.sf"
-    if net_sf.exists(): net_sf.unlink()
+
+    # Always re-aggregate if force is on or file missing
+    if force and net_sf.exists(): net_sf.unlink()
 
     msg = f"[Seidr] Aggregating {len(sf_files)} networks..."
     print(msg)
@@ -363,7 +368,7 @@ def _build_network_task(
     log(msg, log_path)
 
     bb_sf = outdir / f"network_{label}.bb.sf"
-    if bb_sf.exists(): bb_sf.unlink()
+    if force and bb_sf.exists(): bb_sf.unlink()
 
     try:
         cmd = [seidr, "backbone", "-F", str(backbone), str(net_sf)]
@@ -385,7 +390,7 @@ def _build_network_task(
 
 # --- MAIN RUNNER ---
 
-def run_seidr(cfg: Config) -> None:
+def run_seidr(cfg: Config, force: bool = False) -> None:  # <--- Added FORCE
     log_path = Path(getattr(cfg, "log", "seidr.log"))
     opts = cfg.get_tool_opts("seidr")
 
@@ -419,6 +424,8 @@ def run_seidr(cfg: Config) -> None:
     log(sep, log_path)
 
     header = "STARTING SEIDR NETWORK INFERENCE"
+    if force:
+        header += " (FORCE MODE)"
     print(header)
     log(header, log_path)
 
@@ -434,7 +441,8 @@ def run_seidr(cfg: Config) -> None:
         "algorithms": algos,
         "tools": tools,
         "no_full": opts.get("no_full", False),
-        "log_path": log_path
+        "log_path": log_path,
+        "force": force  # <--- Passed down
     }
 
     if not targets or target_mode in ["both", "main_only"]:

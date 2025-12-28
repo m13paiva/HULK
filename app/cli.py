@@ -772,10 +772,12 @@ def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sam
               default=None, show_default="targeted_only",
               help="Execution scope for targeted analysis.")
 @click.option("--reset-defaults", is_flag=True, help="Reset Seidr options to defaults.")
-def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, reset_defaults):
+@click.option("--run", is_flag=True, help="Run Seidr analysis immediately using saved settings.")
+@click.option("-f", "--force", is_flag=True, help="Force recalculation (ignore cache) if running.")
+def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, reset_defaults, run, force):
     """
     Configure defaults for the Seidr inference step.
-    Use this to set up how networks are built when running 'hulk ...'.
+    Use --run to execute the Seidr analysis immediately based on the saved configuration.
     """
     if reset_defaults:
         p = _cfg_reset("seidr")
@@ -807,7 +809,7 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
     p = _cfg_update("seidr", seidr_cfg)
     click.secho(f"Seidr settings saved to {p}", fg="green")
 
-    # Print summary for user verification
+    # Print summary
     click.echo("\nCurrent Seidr Configuration:")
     click.echo(f"  Enabled:     {seidr_cfg.get('enabled', True)}")
     if "algorithms" in seidr_cfg:
@@ -819,6 +821,33 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
     saved_targets = seidr_cfg.get("targets", [])
     if saved_targets:
         click.echo(f"  Default Targets: {len(saved_targets)} files")
+
+    # --- EXECUTION BLOCK ---
+    if run or force:
+        # Load necessary paths from 'general' section to build Config
+        general_cfg = current_cfg.get("general", {})
+        saved_outdir = general_cfg.get("outdir")
+        saved_tx2gene = general_cfg.get("tx2gene")
+
+        if not saved_outdir:
+            click.secho("\n[Error] Cannot run Seidr: 'outdir' not found in configuration. Run 'hulk report' first.",
+                        fg="red")
+            return
+
+        click.secho(f"\n[Seidr] Executing analysis... (Force={force})", fg="magenta", bold=True)
+
+        # Construct simplified Config
+        cfg = Config(
+            outdir=Path(saved_outdir),
+            tx2gene=Path(saved_tx2gene) if saved_tx2gene else None
+        )
+
+        try:
+            from .seidr import run_seidr
+            run_seidr(cfg, force=force)
+            click.secho("[Seidr] Done.", fg="green")
+        except Exception as e:
+            click.secho(f"[Error] Seidr execution failed: {e}", fg="red")
 
 @cli.command("report", cls=HulkCommand,
              help="Regenerate (or generate snapshots while hulk is running) plots and matrices using saved settings.")
@@ -832,6 +861,7 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
 @click.option("--no-global-postprocessing", is_flag=True, help="Skip Global analysis (only run BioProjects).")
 @click.option("--fast", is_flag=True, help="Skip DESeq2 recalculation (Fast Mode).")
 @click.option("-f", "--force", is_flag=True, help="Force full recalculation (overwrites existing matrices).")
+
 def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, no_global_postprocessing, fast, force):
     """
     Scans output directory and runs post-processing using settings defined in 'hulk plot'.
