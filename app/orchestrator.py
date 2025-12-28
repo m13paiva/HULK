@@ -69,18 +69,26 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
 
     terminal = {"done", "failed", "skipped"}
 
+    # Track which bars are finished and closed to stop updating them
+    closed_bars = set()
+
     # -------------------------------
     # Create bars with initial offset
     # -------------------------------
     for bp in bioprojects:
         total = len(bp.samples)
 
+        # Handle empty BioProjects gracefully
+        if total == 0:
+            closed_bars.add(bp.id)
+            continue
+
         bar = tqdm(
             total=total,
             desc=pad_desc(bp.id),
             unit="Sample",
             position=pos,
-            leave=True,
+            leave=True,  # Bar remains visible after closing (completed state)
             mininterval=0,
         )
 
@@ -105,8 +113,19 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
         already_postprocessed = set()
 
         while True:
-            all_finished = True
+            # If all bars are closed, we are done
+            if len(closed_bars) == len(bp_bars):
+                break
+
             for bp in bioprojects:
+                # Skip bars that are already finished and closed
+                if bp.id in closed_bars:
+                    continue
+
+                # Safety check if bp wasn't initialized (e.g. empty)
+                if bp.id not in bp_bars:
+                    continue
+
                 done_now = sum(
                     1 for s in bp.samples
                     if getattr(s, "status", None) in terminal
@@ -119,32 +138,32 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
                     last_done[bp.id] = done_now
 
                 # All samples terminal -> run postprocessing ONCE per run
-                if done_now == len(bp.samples) and bp.id not in already_postprocessed:
-                    # optional: keep status for humans
-                    bp.status = "done"
-                    try:
-                        _finalize_bioproject(bp, cfg)
+                if done_now >= len(bp.samples):
+                    # 1. Run Post-processing (if not already done)
+                    if bp.id not in already_postprocessed:
+                        bp.status = "done"
+                        try:
+                            _finalize_bioproject(bp, cfg)
+                        except Exception as e:
+                            # Log error but don't crash the monitor thread
+                            if hasattr(bp, 'log_path'):
+                                log(f"[{bp.id}] Postprocessing failed: {e}", bp.log_path)
+                        finally:
+                            already_postprocessed.add(bp.id)
 
-                    except Exception as e:
-                        log(f"[{bp.id}] Postprocessing failed: {e}", bp.log_path)
-                    finally:
-                        already_postprocessed.add(bp.id)
-
-                if done_now < len(bp.samples):
-                    all_finished = False
-
-            if all_finished:
-                break
+                    # 2. Close the bar (NEW LOGIC)
+                    bp_bars[bp.id].close()
+                    closed_bars.add(bp.id)
 
             time.sleep(poll_secs)
 
-        # close at end
-        for bar in bp_bars.values():
-            bar.close()
+        # Ensure all bars are explicitly closed at exit (redundant safety)
+        for bid, bar in bp_bars.items():
+            if bid not in closed_bars:
+                bar.close()
 
     t = Thread(target=_monitor, daemon=True)
     t.start()
-
 
     return bp_bars, t
 
