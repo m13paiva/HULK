@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Any
 import pandas as pd
 
 from .entities import Config
-from .utils import log, run_cmd
+from .utils import log
 
 # --- CONSTANTS ---
 
@@ -24,20 +24,23 @@ ENV_OVERRIDES["LC_ALL"] = "C"
 ENV_OVERRIDES["LC_NUMERIC"] = "C"
 ENV_OVERRIDES["LANG"] = "C"
 
+# ALGO_MAP Structure: (BinaryName, ModeFlag, ModeValue, ImportFormat)
+# ImportFormat 'lm' = Lower Triangular (Symmetric)
+# ImportFormat 'm'  = Dense Matrix (Asymmetric/Directed)
 ALGO_MAP = {
-    "PEARSON": ("correlation", "-m", "pearson"),
-    "SPEARMAN": ("correlation", "-m", "spearman"),
-    "PCOR": ("pcor", None, None),
-    "MI": ("mi", "-m", "RAW"),
-    "CLR": ("mi", "-m", "CLR"),
-    "ARACNE": ("mi", "-m", "ARACNE"),
-    "GENIE3": ("genie3", None, None),
-    "TIGRESS": ("tigress", None, None),
-    "SVM": ("svm-ensemble", "-k", "POLY"),
-    "LLR": ("llr-ensemble", None, None),
-    "PLSNET": ("plsnet", None, None),
-    "NARROMI": ("narromi", "-m", "interior-point"),
-    "ELNET": ("el-ensemble", None, None),
+    "PEARSON": ("correlation", "-m", "pearson", "lm"),
+    "SPEARMAN": ("correlation", "-m", "spearman", "lm"),
+    "PCOR": ("pcor", None, None, "lm"),
+    "MI": ("mi", "-m", "RAW", "lm"),  # Reverted to RAW, marked as Lower Matrix
+    "CLR": ("mi", "-m", "CLR", "lm"),
+    "ARACNE": ("mi", "-m", "ARACNE", "lm"),
+    "GENIE3": ("genie3", None, None, "m"),
+    "TIGRESS": ("tigress", None, None, "m"),
+    "SVM": ("svm-ensemble", "-k", "POLY", "m"),
+    "LLR": ("llr-ensemble", None, None, "m"),
+    "PLSNET": ("plsnet", None, None, "m"),
+    "NARROMI": ("narromi", "-m", "interior-point", "m"),
+    "ELNET": ("el-ensemble", None, None, "m"),
 }
 
 PRESETS = {
@@ -120,15 +123,13 @@ def _import_scores(seidr_bin: str, algo_name: str, outdir: Path, prefix: str,
     elif algo_name in ["CLR", "ARACNE"]:
         cmd.extend(["-r", "-u", "-z", "-O", str(threads)])
     else:
+        # Asymmetric methods
         cmd.extend(["-r", "-z", "-O", str(threads)])
 
-    # Use run_cmd here (safe logging) but PASS THE ENV to prevent import stod errors
-    # Note: run_cmd in your utils might not accept env.
-    # If run_cmd doesn't support env, we must use subprocess directly here too.
-    # Assuming run_cmd is simple, let's use subprocess to be safe against stod.
     cmd_str = " ".join(cmd)
     log(f"[EXEC] {cmd_str}", log_path)
     try:
+        # CRITICAL: env=ENV_OVERRIDES prevents locale issues during import parsing
         subprocess.run(
             cmd,
             cwd=str(outdir),
@@ -228,13 +229,17 @@ def _build_network_task(
 ) -> None:
     prefix = f"{label}_"
     seidr = tools["seidr"]
-    fmt = "el" if targeted else "m"
 
     sf_files = []
 
     def run_algo_task(algo: str, prerequisite_file: Optional[Path] = None) -> Optional[Path]:
         try:
-            bin_name, m_flag, m_val = ALGO_MAP[algo]
+            # Unpack the 4-tuple from ALGO_MAP
+            bin_name, m_flag, m_val, default_fmt = ALGO_MAP[algo]
+
+            # Determine format: 'el' if targeted, otherwise the algo specific format ('lm' or 'm')
+            current_fmt = "el" if targeted else default_fmt
+
             out_tsv = outdir / f"{prefix}{algo.lower()}_scores.tsv"
             done_marker = outdir / f".{prefix}{algo.lower()}.done"
 
@@ -242,7 +247,7 @@ def _build_network_task(
                 msg = f"[Seidr] Found verified cache for {algo}. Skipping."
                 print(msg)
                 log(msg, log_path)
-                return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, fmt, threads, log_path)
+                return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, current_fmt, threads, log_path)
 
             if out_tsv.exists(): out_tsv.unlink()
             if done_marker.exists(): done_marker.unlink()
@@ -275,7 +280,8 @@ def _build_network_task(
 
             done_marker.touch()
 
-            return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, fmt, threads, log_path)
+            # Import using the correct format logic
+            return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, current_fmt, threads, log_path)
 
         except Exception as e:
             msg = f"[Error] {algo} failed: {e}"

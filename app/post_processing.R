@@ -46,57 +46,50 @@ option_list <- list(
 
 opt <- parse_args(OptionParser(option_list = option_list))
 
-# Map options
-SEARCH_DIR    <- opt$search_dir
-EXCLUDE_DIRS  <- opt$exclude_dir
-TX2GENE_PATH  <- opt$tx2gene
-OUT_DIR       <- opt$out_dir
-BIOPROJECT_ID <- opt$bioproject
-TOP_N         <- opt$top_n
-DO_PCA        <- isTRUE(opt$pca)
-DO_HEATMAP    <- isTRUE(opt$heatmap)
-DO_VAR_HM     <- isTRUE(opt$var_heatmap)
-DO_SAMPLE_COR <- isTRUE(opt$sample_cor)
-DO_DISP       <- isTRUE(opt$dispersion)
-PLOTS_ONLY    <- isTRUE(opt$plots_only)
-MODE          <- toupper(opt$mode %||% "SRR")
-PER_BP_MODE   <- !is.null(BIOPROJECT_ID)
-
-if (MODE == "FASTQ" && DO_VAR_HM) DO_VAR_HM <- FALSE
-
-# --- Parse Comma-Separated List ---
-TARGET_GENES_LIST <- NULL
-if (!is.null(opt$target_genes)) {
-  raw_list <- strsplit(opt$target_genes, ",")[[1]]
-  TARGET_GENES_LIST <- trimws(raw_list)
-  TARGET_GENES_LIST <- TARGET_GENES_LIST[TARGET_GENES_LIST != ""]
-}
-
-# Paths
-dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
-plots_dir  <- file.path(OUT_DIR, "plots")
-deseq2_dir <- file.path(OUT_DIR, "deseq2")
-tximport_dir <- file.path(OUT_DIR, "tximport")
-invisible(lapply(list(plots_dir, deseq2_dir, tximport_dir), dir.create, showWarnings=FALSE, recursive=TRUE))
-
-txi_rds  <- file.path(tximport_dir, "txi.rds")
-txi_tsv  <- file.path(tximport_dir, "tximport_counts.tsv")
-dds_rds  <- file.path(deseq2_dir, "dds.rds")
-vst_tsv  <- file.path(deseq2_dir, "vst.tsv")
-sf_tsv   <- file.path(deseq2_dir, "size_factors.tsv")
-
-# Seidr Paths
-seidr_genes <- file.path(deseq2_dir, "genes.txt")
-seidr_expr  <- file.path(deseq2_dir, "expression.tsv")
-
-pca_pdf    <- file.path(plots_dir, "PCA.pdf")
-heatmap_pdf <- file.path(plots_dir, "expression_heatmap_global.pdf")
-var_hm_pdf <- file.path(plots_dir, "variance_heatmap.pdf")
-scor_pdf   <- file.path(plots_dir, "sample_correlation.pdf")
-disp_pdf   <- file.path(plots_dir, "deseq2_dispersion.pdf")
+# --- CRITICAL LOCALE FIX ---
+# Force "C" locale for numbers to guarantee dot decimals regardless of system issues
+Sys.setlocale("LC_NUMERIC", "C")
+options(scipen = 999)
+options(OutDec = ".")
 
 msg <- function(...) cat(sprintf(...), "\n", sep = "")
 
+# --- MANUAL WRITER FUNCTION ---
+# Explicitly forces format to avoid locale issues
+write_seidr_manual <- function(mat, outfile) {
+  msg("[ManualWrite] Starting manual write to %s", outfile)
+
+  # 1. Replace NA with 0
+  mat[is.na(mat)] <- 0
+
+  # 2. Open connection
+  con <- file(outfile, "w")
+  on.exit(close(con))
+
+  rows <- nrow(mat)
+  cols <- ncol(mat)
+
+  msg("[ManualWrite] Processing %d rows x %d cols...", rows, cols)
+
+  for (i in seq_len(rows)) {
+    vals <- mat[i, ]
+    # Force decimal mark to "." explicitly
+    vals_fmt <- formatC(vals, format = "f", digits = 6, decimal.mark = ".")
+    line_str <- paste(vals_fmt, collapse = "\t")
+    cat(line_str, "\n", file = con, sep = "")
+    if (i %% 50 == 0) cat(".")
+  }
+  cat("\n")
+  msg("[ManualWrite] Finished writing.")
+
+  # --- DEBUG: READ BACK CHECK ---
+  # This prints the start of the file to the log so you can see if it's broken
+  msg("[DEBUG] Verifying first 100 characters of output file:")
+  raw_head <- readLines(outfile, n = 1, warn = FALSE)
+  msg("'%s'", substr(raw_head, 1, 100))
+}
+
+# ... [Rest of setup functions unchanged] ...
 find_files <- function(dir, excludes) {
   all_files <- list.files(dir, pattern="^abundance\\.tsv$", recursive=TRUE, full.names=TRUE)
   if (length(excludes) > 0) {
@@ -117,6 +110,47 @@ read_targets <- function(p) {
   if(is.null(p)||!file.exists(p)) return(NULL)
   unique(trimws(readLines(p, warn=FALSE)))
 }
+
+# Maps etc...
+SEARCH_DIR    <- opt$search_dir
+EXCLUDE_DIRS  <- opt$exclude_dir
+TX2GENE_PATH  <- opt$tx2gene
+OUT_DIR       <- opt$out_dir
+BIOPROJECT_ID <- opt$bioproject
+TOP_N         <- opt$top_n
+DO_PCA        <- isTRUE(opt$pca)
+DO_HEATMAP    <- isTRUE(opt$heatmap)
+DO_VAR_HM     <- isTRUE(opt$var_heatmap)
+DO_SAMPLE_COR <- isTRUE(opt$sample_cor)
+DO_DISP       <- isTRUE(opt$dispersion)
+PLOTS_ONLY    <- isTRUE(opt$plots_only)
+MODE          <- toupper(opt$mode %||% "SRR")
+PER_BP_MODE   <- !is.null(BIOPROJECT_ID)
+
+if (MODE == "FASTQ" && DO_VAR_HM) DO_VAR_HM <- FALSE
+
+# Paths
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+plots_dir  <- file.path(OUT_DIR, "plots")
+deseq2_dir <- file.path(OUT_DIR, "deseq2")
+tximport_dir <- file.path(OUT_DIR, "tximport")
+invisible(lapply(list(plots_dir, deseq2_dir, tximport_dir), dir.create, showWarnings=FALSE, recursive=TRUE))
+
+txi_rds  <- file.path(tximport_dir, "txi.rds")
+txi_tsv  <- file.path(tximport_dir, "tximport_counts.tsv")
+dds_rds  <- file.path(deseq2_dir, "dds.rds")
+vst_tsv  <- file.path(deseq2_dir, "vst.tsv")
+sf_tsv   <- file.path(deseq2_dir, "size_factors.tsv")
+
+seidr_genes <- file.path(deseq2_dir, "genes.txt")
+seidr_expr  <- file.path(deseq2_dir, "expression.tsv")
+
+pca_pdf    <- file.path(plots_dir, "PCA.pdf")
+heatmap_pdf <- file.path(plots_dir, "expression_heatmap_global.pdf")
+var_hm_pdf <- file.path(plots_dir, "variance_heatmap.pdf")
+scor_pdf   <- file.path(plots_dir, "sample_correlation.pdf")
+disp_pdf   <- file.path(plots_dir, "deseq2_dispersion.pdf")
+
 
 # --- Plotting Function ---
 make_plots <- function(vst_mat, info) {
@@ -310,7 +344,7 @@ vst_out <- tibble::rownames_to_column(as.data.frame(t(vst_mat)), "sample")
 readr::write_tsv(vst_out, vst_tsv)
 
 # ==============================================================================
-# SEIDR OUTPUT - FAST & CLEAN
+# SEIDR OUTPUT - MANUAL WRITE (Samples x Genes) with DEBUG
 # ==============================================================================
 msg("[Seidr] Saving %d genes for Network Inference...", nrow(vst_mat))
 
@@ -318,14 +352,9 @@ msg("[Seidr] Saving %d genes for Network Inference...", nrow(vst_mat))
 clean_genes <- gsub("\\s+", "_", rownames(vst_mat))
 writeLines(clean_genes, seidr_genes)
 
-# 2. Expression Matrix (Samples x Genes)
-# - Transpose to get Samples as Rows
-# - write_tsv with col_names=FALSE creates pure tab-separated numbers
+# 2. Expression Matrix
 seidr_mat <- t(vst_mat)
-readr::write_tsv(as.data.frame(seidr_mat),
-                 file = seidr_expr,
-                 col_names = FALSE,
-                 na = "0")
+write_seidr_manual(seidr_mat, seidr_expr)
 
 # ==============================================================================
 # PLOTS
