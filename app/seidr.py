@@ -210,7 +210,6 @@ def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path
     if not no_full:
         df.to_csv(outdir / f"network_{label}_edges_full.tsv", sep="\t", index=False)
 
-
 def _build_network_task(
         outdir: Path,
         genes_file: Path,
@@ -226,7 +225,7 @@ def _build_network_task(
         target_file: Optional[Path],
         no_full: bool,
         log_path: Path,
-        force: bool  # <--- Added FORCE argument
+        force: bool  # <--- Recieves combined force decision
 ) -> None:
     prefix = f"{label}_"
     seidr = tools["seidr"]
@@ -235,16 +234,13 @@ def _build_network_task(
 
     def run_algo_task(algo: str, prerequisite_file: Optional[Path] = None) -> Optional[Path]:
         try:
-            # Unpack the 4-tuple from ALGO_MAP
             bin_name, m_flag, m_val, default_fmt = ALGO_MAP[algo]
-
-            # Determine format: 'el' if targeted, otherwise the algo specific format ('lm' or 'm')
             current_fmt = "el" if targeted else default_fmt
 
             out_tsv = outdir / f"{prefix}{algo.lower()}_scores.tsv"
             done_marker = outdir / f".{prefix}{algo.lower()}.done"
 
-            # Check FORCE here: If not force and markers exist, skip.
+            # THE LOGIC: If force is TRUE, we skip this check and fall through to execution.
             if not force and out_tsv.exists() and done_marker.exists():
                 msg = f"[Seidr] Found verified cache for {algo}. Skipping."
                 print(msg)
@@ -274,7 +270,6 @@ def _build_network_task(
                 if not prerequisite_file: raise ValueError(f"{algo} needs MI output")
                 cmd.extend(["-M", str(prerequisite_file)])
 
-            # Run with direct visibility and ENV overrides
             print(f"[Seidr] Running {algo}...")
             _run_direct_visible(cmd, cwd=outdir, log_path=log_path)
 
@@ -282,18 +277,14 @@ def _build_network_task(
                 raise FileNotFoundError(f"{algo} reported success but {out_tsv} is missing.")
 
             done_marker.touch()
-
-            # Import using the correct format logic
             return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, current_fmt, threads, log_path)
 
         except Exception as e:
             msg = f"[Error] {algo} failed: {e}"
             print(msg)
             log(msg, log_path)
-
             done_marker_path = outdir / f".{prefix}{algo.lower()}.done"
-            if done_marker_path.exists():
-                done_marker_path.unlink()
+            if done_marker_path.exists(): done_marker_path.unlink()
             return None
 
     # 1. Dependency: MI
@@ -302,7 +293,6 @@ def _build_network_task(
 
     if any(x in algorithms for x in ["MI", "CLR", "ARACNE"]):
         mi_sf_path = run_algo_task("MI")
-
         if "MI" in algorithms and mi_sf_path:
             sf_files.append(mi_sf_path)
 
@@ -318,20 +308,17 @@ def _build_network_task(
             future_map = {}
             for algo in parallel_algos:
                 prereq = mi_tsv_path if algo in ["CLR", "ARACNE"] else None
-
                 if prereq and not prereq.exists():
                     msg = f"[Error] Cannot run {algo}: MI output missing."
                     print(msg)
                     log(msg, log_path)
                     continue
-
                 future = executor.submit(run_algo_task, algo, prereq)
                 future_map[future] = algo
 
             for future in concurrent.futures.as_completed(future_map):
                 res = future.result()
-                if res:
-                    sf_files.append(res)
+                if res: sf_files.append(res)
 
     # 3. Aggregate
     if not sf_files:
@@ -352,7 +339,6 @@ def _build_network_task(
     agg_cmd = [seidr, "aggregate", "-o", str(net_sf), "-m", aggregate_mode] + [str(s) for s in sf_files]
 
     try:
-        # Use subprocess manually to ensure ENV is passed (run_cmd might not support it)
         cmd_str = " ".join(agg_cmd)
         log(f"[EXEC] {cmd_str}", log_path)
         subprocess.run(agg_cmd, cwd=str(outdir), check=True, env=ENV_OVERRIDES, stdout=subprocess.DEVNULL)
@@ -390,12 +376,18 @@ def _build_network_task(
 
 # --- MAIN RUNNER ---
 
-def run_seidr(cfg: Config, force: bool = False) -> None:  # <--- Added FORCE
+def run_seidr(cfg: Config, force: bool = False) -> None:
     log_path = Path(getattr(cfg, "log", "seidr.log"))
     opts = cfg.get_tool_opts("seidr")
 
     if not opts.get("enabled", False):
         return
+
+    # LOGIC:
+    # 1. 'force' arg passed from caller (e.g. hulk report --force)
+    # 2. 'opts["force"]' passed from persisted config (e.g. hulk seidr --force)
+    # If EITHER is true, we force execution.
+    active_force = force or opts.get("force", False)
 
     # 1. Locate inputs
     genes_file = Path(opts["genes_file"])
@@ -418,18 +410,16 @@ def run_seidr(cfg: Config, force: bool = False) -> None:  # <--- Added FORCE
         log(msg, log_path)
         return
 
-    # Manual print+log for header
     sep = "=" * 60
     print(sep)
     log(sep, log_path)
 
     header = "STARTING SEIDR NETWORK INFERENCE"
-    if force:
+    if active_force:
         header += " (FORCE MODE)"
     print(header)
     log(header, log_path)
 
-    # Task execution
     task_args = {
         "outdir": outdir,
         "genes_file": genes_file,
@@ -442,7 +432,7 @@ def run_seidr(cfg: Config, force: bool = False) -> None:  # <--- Added FORCE
         "tools": tools,
         "no_full": opts.get("no_full", False),
         "log_path": log_path,
-        "force": force  # <--- Passed down
+        "force": active_force  # <--- Pass combined force decision
     }
 
     if not targets or target_mode in ["both", "main_only"]:

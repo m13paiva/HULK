@@ -771,13 +771,14 @@ def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sam
 @click.option("--target-mode", type=click.Choice(["both", "main_only", "targeted_only"]),
               default=None, show_default="targeted_only",
               help="Execution scope for targeted analysis.")
+# NEW FLAG: Saves preference only.
+@click.option("-f", "--force/--no-force", "force_setting", default=None,
+              help="Persist a 'Force' preference. If True, Seidr always ignores cache.")
 @click.option("--reset-defaults", is_flag=True, help="Reset Seidr options to defaults.")
-@click.option("--run", is_flag=True, help="Run Seidr analysis immediately using saved settings.")
-@click.option("-f", "--force", is_flag=True, help="Force recalculation (ignore cache) if running.")
-def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, reset_defaults, run, force):
+def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, force_setting, reset_defaults):
     """
     Configure defaults for the Seidr inference step.
-    Use --run to execute the Seidr analysis immediately based on the saved configuration.
+    Use this to set up how networks are built when running 'hulk ...'.
     """
     if reset_defaults:
         p = _cfg_reset("seidr")
@@ -803,15 +804,20 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
     if workers is not None: seidr_cfg["workers"] = workers
     if target_mode: seidr_cfg["target_mode"] = target_mode
 
+    # Save the force preference
+    if force_setting is not None:
+        seidr_cfg["force"] = force_setting
+
     if targets:
         seidr_cfg["targets"] = [str(t.resolve()) for t in targets]
 
     p = _cfg_update("seidr", seidr_cfg)
     click.secho(f"Seidr settings saved to {p}", fg="green")
 
-    # Print summary
+    # Print summary for user verification
     click.echo("\nCurrent Seidr Configuration:")
     click.echo(f"  Enabled:     {seidr_cfg.get('enabled', True)}")
+    click.echo(f"  Force Mode:  {seidr_cfg.get('force', False)}")
     if "algorithms" in seidr_cfg:
         click.echo(f"  Algorithms:  {', '.join(seidr_cfg['algorithms'])}")
     else:
@@ -821,33 +827,6 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
     saved_targets = seidr_cfg.get("targets", [])
     if saved_targets:
         click.echo(f"  Default Targets: {len(saved_targets)} files")
-
-    # --- EXECUTION BLOCK ---
-    if run or force:
-        # Load necessary paths from 'general' section to build Config
-        general_cfg = current_cfg.get("general", {})
-        saved_outdir = general_cfg.get("outdir")
-        saved_tx2gene = general_cfg.get("tx2gene")
-
-        if not saved_outdir:
-            click.secho("\n[Error] Cannot run Seidr: 'outdir' not found in configuration. Run 'hulk report' first.",
-                        fg="red")
-            return
-
-        click.secho(f"\n[Seidr] Executing analysis... (Force={force})", fg="magenta", bold=True)
-
-        # Construct simplified Config
-        cfg = Config(
-            outdir=Path(saved_outdir),
-            tx2gene=Path(saved_tx2gene) if saved_tx2gene else None
-        )
-
-        try:
-            from .seidr import run_seidr
-            run_seidr(cfg, force=force)
-            click.secho("[Seidr] Done.", fg="green")
-        except Exception as e:
-            click.secho(f"[Error] Seidr execution failed: {e}", fg="red")
 
 @cli.command("report", cls=HulkCommand,
              help="Regenerate (or generate snapshots while hulk is running) plots and matrices using saved settings.")
