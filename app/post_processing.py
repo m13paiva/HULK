@@ -70,12 +70,10 @@ def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) ->
         args.append("--tximport-only")
 
     # --- DISPERSION PLOT ---
-    # Generated during Phase 1 (Compute) because it needs the DESeq2 object.
     if getattr(cfg, "plot_dispersion", False):
         args.append("--dispersion")
 
-    # Always force update in global mode (Phase 1)
-    # This ensures R recalculates and overwrites files.
+    # Always force update in global mode
     args.append("--force-txi")
 
     return args
@@ -129,7 +127,6 @@ def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[s
         args.append("--tximport-only")
         return args, True
 
-    # Re-add plot flags for BP
     if deseq2_enabled:
         if getattr(cfg, "plot_pca", False): args.append("--pca")
         if getattr(cfg, "plot_heatmap", False): args.append("--heatmap")
@@ -141,7 +138,7 @@ def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[s
 
 
 def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) -> None:
-    log_path = cfg.log  # Using cfg.log is safer if bp.log_path isn't guaranteed
+    log_path = cfg.log
     if hasattr(bp, 'log_path'):
         log_path = bp.log_path
 
@@ -170,7 +167,6 @@ def run_postprocessing(
     log_path = cfg.log
     error_warnings: List[str] = cfg.error_warnings
 
-    # Resolve flags (Argument overrides Config)
     do_global = not (skip_global if skip_global is not None else cfg.no_global_postprocessing)
     do_bp = not (skip_bp if skip_bp is not None else cfg.no_bp_postprocessing)
 
@@ -199,16 +195,12 @@ def run_postprocessing(
 
         base_args[1] = str(script_path)
 
-        # Determine Active Plots for Phase 2
         active_plots = []
         if getattr(cfg, "plot_pca", False): active_plots.append("--pca")
         if getattr(cfg, "plot_heatmap", False): active_plots.append("--heatmap")
         if getattr(cfg, "plot_var_heatmap", False): active_plots.append("--var-heatmap")
         if getattr(cfg, "plot_sample_cor", False): active_plots.append("--sample-cor")
 
-        # --- PHASE 1: COMPUTATION ---
-        # If plots_only_mode is False (default or --force), we RUN this.
-        # This phase generates the Seidr inputs and VST matrix.
         skip_compute = getattr(cfg, "plots_only_mode", False)
 
         if not skip_compute:
@@ -221,7 +213,6 @@ def run_postprocessing(
                 if res.returncode != 0:
                     log_err(error_warnings, log_path,
                             f"[post-processing] Global Compute failed (code {res.returncode})")
-                    # If compute fails, we probably shouldn't try plotting
                     active_plots = []
             except Exception as e:
                 log_err(error_warnings, log_path, f"[post-processing] Compute execution failed: {e}")
@@ -235,8 +226,6 @@ def run_postprocessing(
             log(f"[post-processing] Phase 2: Generating {len(active_plots)} plot types (Concurrency: {SAFE_PLOT_WORKERS})...",
                 log_path)
 
-            # We reuse base_args but remove computation-specific flags just to be safe/clean
-            # Phase 2 relies on reading the files generated in Phase 1.
             plot_base_args = [a for a in base_args if a not in ("--force-txi", "--dispersion")]
             plot_base_args.append("--plots-only")
 
@@ -284,15 +273,20 @@ def run_postprocessing(
 
     with ThreadPoolExecutor(max_workers=max_workers_bp) as executor:
         future_to_bp = {}
-        for bp_id in dataset.bioprojects:
+        for bp_item in dataset.bioprojects:
+            # <--- FIX HERE: Properly extract string ID from BioProject object or string
+            bp_id_str = str(bp_item)
+            if hasattr(bp_item, "id"):
+                bp_id_str = bp_item.id
+
             bp_obj = SimpleNamespace(
-                id=bp_id,
-                path=cfg.outdir / bp_id,
-                log_path=cfg.outdir / bp_id / "log.txt"
+                id=bp_id_str,
+                path=cfg.outdir / bp_id_str,  # Now safe because bp_id_str is a string
+                log_path=cfg.outdir / bp_id_str / "log.txt"
             )
             bp_obj.path.mkdir(parents=True, exist_ok=True)
             f = executor.submit(run_postprocessing_bp, bp_obj, cfg, r_script=script_path)
-            future_to_bp[f] = bp_id
+            future_to_bp[f] = bp_id_str
 
         for future in as_completed(future_to_bp):
             try:

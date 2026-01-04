@@ -17,16 +17,12 @@ from .utils import log
 
 # --- CONSTANTS ---
 
-# Force C locale to prevent std::stod errors in C++ binaries
-# due to comma/dot decimal separators in different languages.
 ENV_OVERRIDES = os.environ.copy()
 ENV_OVERRIDES["LC_ALL"] = "C"
 ENV_OVERRIDES["LC_NUMERIC"] = "C"
 ENV_OVERRIDES["LANG"] = "C"
 
 # ALGO_MAP Structure: (BinaryName, ModeFlag, ModeValue, ImportFormat)
-# ImportFormat 'lm' = Lower Triangular (Symmetric)
-# ImportFormat 'm'  = Dense Matrix (Asymmetric/Directed)
 ALGO_MAP = {
     "PEARSON": ("correlation", "-m", "pearson", "lm"),
     "SPEARMAN": ("correlation", "-m", "spearman", "lm"),
@@ -80,19 +76,13 @@ def _resolve_binaries(needed_algos: List[str], bin_dir: Optional[Path]) -> Dict[
 
 
 def _run_direct_visible(cmd: List[str], cwd: Path, log_path: Path):
-    """
-    Runs a subprocess letting stderr flow directly to the console.
-    CRITICAL: Uses modified ENV_OVERRIDES to ensure LC_ALL=C.
-    """
     cmd_str = " ".join(cmd)
     log(f"[EXEC] {cmd_str}", log_path)
-
     try:
-        # We pass env=ENV_OVERRIDES to fix the 'stod' locale crashes
         subprocess.run(
             cmd,
             cwd=str(cwd),
-            stderr=None,  # Inherit console stderr for progress bars
+            stderr=None,
             stdout=subprocess.DEVNULL,
             env=ENV_OVERRIDES,
             check=True
@@ -104,9 +94,6 @@ def _run_direct_visible(cmd: List[str], cwd: Path, log_path: Path):
 
 def _import_scores(seidr_bin: str, algo_name: str, outdir: Path, prefix: str,
                    tsv_in: Path, genes: Path, fmt: str, threads: int, log_path: Path) -> Path:
-    """
-    Imports the TSV scores into Seidr binary format (.sf).
-    """
     sf_path = outdir / f"{prefix}{algo_name.lower()}_scores.sf"
 
     if sf_path.exists() and sf_path.stat().st_size > 0:
@@ -115,7 +102,6 @@ def _import_scores(seidr_bin: str, algo_name: str, outdir: Path, prefix: str,
     cmd = [seidr_bin, "import", "-n", algo_name, "-o", str(sf_path),
            "-F", fmt, "-i", str(tsv_in), "-g", str(genes)]
 
-    # Standardize import flags
     if algo_name in ["PEARSON", "SPEARMAN", "PCOR"]:
         cmd.extend(["-A", "-r", "-u"])
     elif algo_name == "MI":
@@ -123,13 +109,11 @@ def _import_scores(seidr_bin: str, algo_name: str, outdir: Path, prefix: str,
     elif algo_name in ["CLR", "ARACNE"]:
         cmd.extend(["-r", "-u", "-z", "-O", str(threads)])
     else:
-        # Asymmetric methods
         cmd.extend(["-r", "-z", "-O", str(threads)])
 
     cmd_str = " ".join(cmd)
     log(f"[EXEC] {cmd_str}", log_path)
     try:
-        # CRITICAL: env=ENV_OVERRIDES prevents locale issues during import parsing
         subprocess.run(
             cmd,
             cwd=str(outdir),
@@ -149,12 +133,10 @@ def _import_scores(seidr_bin: str, algo_name: str, outdir: Path, prefix: str,
 
 
 def _safe_float(x: Any) -> float:
-    """Safely converts Seidr output strings to float, handling ';' rank info."""
     if isinstance(x, (float, int)):
         return float(x)
     if isinstance(x, str):
         try:
-            # Handle '0.123;1' format from Seidr
             val = x.split(";")[0]
             return float(val)
         except (ValueError, TypeError):
@@ -171,7 +153,6 @@ def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path
     cmd = [seidr, "view", "--column-headers", str(bb_sf)]
     log(f">> {' '.join(cmd)} (capturing output)", log_path)
 
-    # Use env overrides here too
     res = subprocess.run(cmd, capture_output=True, text=True, env=ENV_OVERRIDES)
 
     if not res.stdout.strip():
@@ -181,7 +162,6 @@ def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path
         return
 
     try:
-        # engine='python' is slower but more robust to bad lines than 'c'
         df = pd.read_csv(io.StringIO(res.stdout), sep="\t", engine="python")
     except Exception as e:
         msg = f"[Error] Failed to parse Seidr output: {e}"
@@ -189,7 +169,6 @@ def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path
         log(msg, log_path)
         return
 
-    # Clean numeric columns strictly
     numeric_cols = [c for c in df.columns if c not in ["Source", "Target"] and "interaction" not in c.lower()]
     for c in numeric_cols:
         df[c] = df[c].apply(_safe_float)
@@ -210,6 +189,7 @@ def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path
     if not no_full:
         df.to_csv(outdir / f"network_{label}_edges_full.tsv", sep="\t", index=False)
 
+
 def _build_network_task(
         outdir: Path,
         genes_file: Path,
@@ -225,7 +205,7 @@ def _build_network_task(
         target_file: Optional[Path],
         no_full: bool,
         log_path: Path,
-        force: bool  # <--- Recieves combined force decision
+        force: bool
 ) -> None:
     prefix = f"{label}_"
     seidr = tools["seidr"]
@@ -240,16 +220,21 @@ def _build_network_task(
             out_tsv = outdir / f"{prefix}{algo.lower()}_scores.tsv"
             done_marker = outdir / f".{prefix}{algo.lower()}.done"
 
-            # THE LOGIC: If force is TRUE, we skip this check and fall through to execution.
-            if not force and out_tsv.exists() and done_marker.exists():
+            # CRITICAL FIX: Identify the .sf file path that _import_scores will use
+            out_sf = outdir / f"{prefix}{algo.lower()}_scores.sf"
+
+            # 1. CHECK CACHE
+            # Only skip if NOT force AND tsv exists AND marker exists AND sf exists
+            if not force and out_tsv.exists() and done_marker.exists() and out_sf.exists():
                 msg = f"[Seidr] Found verified cache for {algo}. Skipping."
                 print(msg)
                 log(msg, log_path)
                 return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, current_fmt, threads, log_path)
 
-            # Cleanup before run (Force Mode or corrupt cache)
+            # 2. CLEANUP FOR RE-RUN
             if out_tsv.exists(): out_tsv.unlink()
             if done_marker.exists(): done_marker.unlink()
+            if out_sf.exists(): out_sf.unlink()  # <--- Force delete stale SF files
 
             cmd = [tools[bin_name]]
             cmd.extend(["-i", str(expression_file), "-g", str(genes_file), "-o", str(out_tsv)])
@@ -283,6 +268,7 @@ def _build_network_task(
             msg = f"[Error] {algo} failed: {e}"
             print(msg)
             log(msg, log_path)
+            # Clean up partials
             done_marker_path = outdir / f".{prefix}{algo.lower()}.done"
             if done_marker_path.exists(): done_marker_path.unlink()
             return None
@@ -328,8 +314,6 @@ def _build_network_task(
         return
 
     net_sf = outdir / f"network_{label}.sf"
-
-    # Always re-aggregate if force is on or file missing
     if force and net_sf.exists(): net_sf.unlink()
 
     msg = f"[Seidr] Aggregating {len(sf_files)} networks..."
@@ -341,9 +325,15 @@ def _build_network_task(
     try:
         cmd_str = " ".join(agg_cmd)
         log(f"[EXEC] {cmd_str}", log_path)
-        subprocess.run(agg_cmd, cwd=str(outdir), check=True, env=ENV_OVERRIDES, stdout=subprocess.DEVNULL)
+        # CHANGED: Capture output to debug aggregation failures
+        subprocess.run(agg_cmd, cwd=str(outdir), capture_output=True, text=True, check=True, env=ENV_OVERRIDES)
+    except subprocess.CalledProcessError as e:
+        msg = f"[Error] Aggregation failed: {e.stderr}"
+        print(msg)
+        log(msg, log_path)
+        return
     except Exception as e:
-        msg = f"[Error] Aggregation failed: {e}"
+        msg = f"[Error] Aggregation unexpected fail: {e}"
         print(msg)
         log(msg, log_path)
         return
@@ -383,10 +373,6 @@ def run_seidr(cfg: Config, force: bool = False) -> None:
     if not opts.get("enabled", False):
         return
 
-    # LOGIC:
-    # 1. 'force' arg passed from caller (e.g. hulk report --force)
-    # 2. 'opts["force"]' passed from persisted config (e.g. hulk seidr --force)
-    # If EITHER is true, we force execution.
     active_force = force or opts.get("force", False)
 
     # 1. Locate inputs
@@ -432,7 +418,7 @@ def run_seidr(cfg: Config, force: bool = False) -> None:
         "tools": tools,
         "no_full": opts.get("no_full", False),
         "log_path": log_path,
-        "force": active_force  # <--- Pass combined force decision
+        "force": active_force
     }
 
     if not targets or target_mode in ["both", "main_only"]:
@@ -442,6 +428,23 @@ def run_seidr(cfg: Config, force: bool = False) -> None:
         for t_file in targets:
             if t_file.exists():
                 _build_network_task(label=t_file.stem, targeted=True, target_file=t_file, **task_args)
+
+    # --- ADDED CLEANUP BLOCK ---
+    log("[Seidr] Cleaning up temporary working directories...", log_path)
+    # The junk folders are typically UUIDs: 8-4-4-4-12 hex digits.
+    # We use a glob that matches at least 3 hyphens to catch them.
+    junk_dirs = [p for p in outdir.glob("*-*-*-*") if p.is_dir()]
+
+    cleaned_count = 0
+    for d in junk_dirs:
+        try:
+            shutil.rmtree(d)
+            cleaned_count += 1
+        except Exception as e:
+            log(f"[Warn] Failed to delete temp dir {d.name}: {e}", log_path)
+
+    if cleaned_count > 0:
+        log(f"[Seidr] Removed {cleaned_count} temporary folders.", log_path)
 
     msg = "[Seidr] Analysis Finished."
     print(msg)

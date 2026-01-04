@@ -40,14 +40,13 @@ option_list <- list(
   make_option(c("--dispersion"), dest = "dispersion", action = "store_true", default = FALSE),
   make_option(c("--plots-only"), dest = "plots_only", action = "store_true", default = FALSE),
   make_option(c("--tximport-only"), dest = "tximport_only", action = "store_true", default = FALSE),
-  make_option(c("--target-genes"), dest = "target_genes", type = "character", default = NULL),
+  make_option(c("--target-genes"), dest = "target_genes", type = "character", action = "append", default = NULL),
   make_option(c("--mode"), dest = "mode", type = "character", default = "SRR")
 )
 
 opt <- parse_args(OptionParser(option_list = option_list))
 
 # --- CRITICAL LOCALE FIX ---
-# Force "C" locale for numbers to guarantee dot decimals regardless of system issues
 Sys.setlocale("LC_NUMERIC", "C")
 options(scipen = 999)
 options(OutDec = ".")
@@ -55,25 +54,15 @@ options(OutDec = ".")
 msg <- function(...) cat(sprintf(...), "\n", sep = "")
 
 # --- MANUAL WRITER FUNCTION ---
-# Explicitly forces format to avoid locale issues
 write_seidr_manual <- function(mat, outfile) {
   msg("[ManualWrite] Starting manual write to %s", outfile)
-
-  # 1. Replace NA with 0
   mat[is.na(mat)] <- 0
-
-  # 2. Open connection
   con <- file(outfile, "w")
   on.exit(close(con))
-
-  rows <- nrow(mat)
-  cols <- ncol(mat)
-
+  rows <- nrow(mat); cols <- ncol(mat)
   msg("[ManualWrite] Processing %d rows x %d cols...", rows, cols)
-
   for (i in seq_len(rows)) {
     vals <- mat[i, ]
-    # Force decimal mark to "." explicitly
     vals_fmt <- formatC(vals, format = "f", digits = 6, decimal.mark = ".")
     line_str <- paste(vals_fmt, collapse = "\t")
     cat(line_str, "\n", file = con, sep = "")
@@ -81,15 +70,9 @@ write_seidr_manual <- function(mat, outfile) {
   }
   cat("\n")
   msg("[ManualWrite] Finished writing.")
-
-  # --- DEBUG: READ BACK CHECK ---
-  # This prints the start of the file to the log so you can see if it's broken
-  msg("[DEBUG] Verifying first 100 characters of output file:")
-  raw_head <- readLines(outfile, n = 1, warn = FALSE)
-  msg("'%s'", substr(raw_head, 1, 100))
 }
 
-# ... [Rest of setup functions unchanged] ...
+# ... [Setup functions] ...
 find_files <- function(dir, excludes) {
   all_files <- list.files(dir, pattern="^abundance\\.tsv$", recursive=TRUE, full.names=TRUE)
   if (length(excludes) > 0) {
@@ -111,7 +94,7 @@ read_targets <- function(p) {
   unique(trimws(readLines(p, warn=FALSE)))
 }
 
-# Maps etc...
+# --- GLOBAL VARIABLES ---
 SEARCH_DIR    <- opt$search_dir
 EXCLUDE_DIRS  <- opt$exclude_dir
 TX2GENE_PATH  <- opt$tx2gene
@@ -129,6 +112,15 @@ PER_BP_MODE   <- !is.null(BIOPROJECT_ID)
 
 if (MODE == "FASTQ" && DO_VAR_HM) DO_VAR_HM <- FALSE
 
+# <--- BULLETPROOF VARIABLE FIX --->
+TARGET_GENES_LIST <- NULL
+if (!is.null(opt$target_genes)) {
+  TARGET_GENES_LIST <- unlist(strsplit(opt$target_genes, ","))
+  msg("[Setup] Target genes detected: %d files/lists provided.", length(TARGET_GENES_LIST))
+} else {
+  msg("[Setup] No target genes provided (Global mode only).")
+}
+
 # Paths
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 plots_dir  <- file.path(OUT_DIR, "plots")
@@ -141,6 +133,7 @@ txi_tsv  <- file.path(tximport_dir, "tximport_counts.tsv")
 dds_rds  <- file.path(deseq2_dir, "dds.rds")
 vst_tsv  <- file.path(deseq2_dir, "vst.tsv")
 sf_tsv   <- file.path(deseq2_dir, "size_factors.tsv")
+disp_pdf <- file.path(plots_dir, "deseq2_dispersion.pdf")
 
 seidr_genes <- file.path(deseq2_dir, "genes.txt")
 seidr_expr  <- file.path(deseq2_dir, "expression.tsv")
@@ -149,11 +142,10 @@ pca_pdf    <- file.path(plots_dir, "PCA.pdf")
 heatmap_pdf <- file.path(plots_dir, "expression_heatmap_global.pdf")
 var_hm_pdf <- file.path(plots_dir, "variance_heatmap.pdf")
 scor_pdf   <- file.path(plots_dir, "sample_correlation.pdf")
-disp_pdf   <- file.path(plots_dir, "deseq2_dispersion.pdf")
 
 
 # --- Plotting Function ---
-make_plots <- function(vst_mat, info) {
+make_plots <- function(vst_mat, info, targets = NULL) {
   if(!DO_PCA && !DO_HEATMAP && !DO_VAR_HM && !DO_SAMPLE_COR) return()
 
   vars <- apply(vst_mat, 1, var, na.rm=TRUE)
@@ -200,14 +192,16 @@ make_plots <- function(vst_mat, info) {
   if(DO_HEATMAP) draw_hm(vst_top, "Global Expression (Top N)", heatmap_pdf)
 
   # 3. TARGETED HEATMAPS
-  if(DO_HEATMAP && !is.null(TARGET_GENES_LIST)) {
-     targets_vec <- as.character(unlist(TARGET_GENES_LIST))
+  if(DO_HEATMAP && !is.null(targets)) {
+     targets_vec <- as.character(unlist(targets))
      bases <- make.unique(tools::file_path_sans_ext(basename(targets_vec)), sep="_")
      for(i in seq_along(targets_vec)) {
         g <- read_targets(targets_vec[i]); idx <- which(rownames(vst_mat) %in% g)
         if(length(idx) > 0) {
            f <- file.path(plots_dir, sprintf("expression_heatmap_%s.pdf", bases[i]))
            draw_hm(vst_mat[idx, , drop=FALSE], paste("Targeted:", bases[i]), f)
+        } else {
+           msg("[Heatmap] Warning: No matching genes found for target file %s", targets_vec[i])
         }
      }
   }
@@ -261,8 +255,24 @@ make_plots <- function(vst_mat, info) {
         readr::write_tsv(as.data.frame(var_mat) %>% tibble::rownames_to_column("gene_id"), sub("\\.pdf$", ".tsv", f))
         msg("[VarHeatmap] Saved %s", f)
       }
+
       msg("[VarHeatmap] Generating Global Variance Heatmap")
       draw_var_hm(rownames(vst_top), "Global Variance", var_hm_pdf)
+
+      # --- TARGETED VARIANCE HEATMAPS ---
+      if (!is.null(targets)) {
+         targets_vec <- as.character(unlist(targets))
+         bases <- make.unique(tools::file_path_sans_ext(basename(targets_vec)), sep="_")
+         for(i in seq_along(targets_vec)) {
+            g <- read_targets(targets_vec[i]); idx <- which(rownames(vst_mat) %in% g)
+            if(length(idx) > 0) {
+               f <- file.path(plots_dir, sprintf("variance_heatmap_%s.pdf", bases[i]))
+               draw_var_hm(rownames(vst_mat)[idx], paste("Targeted Variance:", bases[i]), f)
+            } else {
+               msg("[VarHeatmap] Warning: No matching genes found for target file %s", targets_vec[i])
+            }
+         }
+      }
   }
 }
 
@@ -289,7 +299,8 @@ if(PLOTS_ONLY) {
   } else {
       mat <- as.matrix(vst_df); rownames(mat) <- info$sample; vst_mat <- t(mat)
   }
-  make_plots(vst_mat, info)
+  # FIXED CALL: Passing TARGET_GENES_LIST explicitly
+  make_plots(vst_mat, info, TARGET_GENES_LIST)
   quit(status=0)
 }
 
@@ -348,16 +359,13 @@ readr::write_tsv(vst_out, vst_tsv)
 # ==============================================================================
 msg("[Seidr] Saving %d genes for Network Inference...", nrow(vst_mat))
 
-# 1. Gene List
 clean_genes <- gsub("\\s+", "_", rownames(vst_mat))
 writeLines(clean_genes, seidr_genes)
-
-# 2. Expression Matrix
 seidr_mat <- t(vst_mat)
 write_seidr_manual(seidr_mat, seidr_expr)
 
 # ==============================================================================
 # PLOTS
 # ==============================================================================
-make_plots(vst_mat, coldata)
+make_plots(vst_mat, coldata, TARGET_GENES_LIST)
 msg("Done.")
