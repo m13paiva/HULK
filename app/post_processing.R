@@ -11,6 +11,7 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(ComplexHeatmap)
   library(grid)
+  library(circlize)
 })
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
@@ -70,6 +71,10 @@ write_seidr_manual <- function(mat, outfile) {
   }
   cat("\n")
   msg("[ManualWrite] Finished writing.")
+
+  msg("[DEBUG] Verifying first 100 characters of output file:")
+  raw_head <- readLines(outfile, n = 1, warn = FALSE)
+  msg("'%s'", substr(raw_head, 1, 100))
 }
 
 # ... [Setup functions] ...
@@ -95,10 +100,15 @@ read_targets <- function(p) {
 }
 
 # --- GLOBAL VARIABLES ---
+# FIX: Handle double nested plots folder
+OUT_DIR <- opt$out_dir
+if (basename(OUT_DIR) == "plots") {
+  OUT_DIR <- dirname(OUT_DIR)
+}
+
 SEARCH_DIR    <- opt$search_dir
 EXCLUDE_DIRS  <- opt$exclude_dir
 TX2GENE_PATH  <- opt$tx2gene
-OUT_DIR       <- opt$out_dir
 BIOPROJECT_ID <- opt$bioproject
 TOP_N         <- opt$top_n
 DO_PCA        <- isTRUE(opt$pca)
@@ -112,7 +122,6 @@ PER_BP_MODE   <- !is.null(BIOPROJECT_ID)
 
 if (MODE == "FASTQ" && DO_VAR_HM) DO_VAR_HM <- FALSE
 
-# <--- BULLETPROOF VARIABLE FIX --->
 TARGET_GENES_LIST <- NULL
 if (!is.null(opt$target_genes)) {
   TARGET_GENES_LIST <- unlist(strsplit(opt$target_genes, ","))
@@ -132,6 +141,7 @@ txi_rds  <- file.path(tximport_dir, "txi.rds")
 txi_tsv  <- file.path(tximport_dir, "tximport_counts.tsv")
 dds_rds  <- file.path(deseq2_dir, "dds.rds")
 vst_tsv  <- file.path(deseq2_dir, "vst.tsv")
+vst_transposed_tsv <- file.path(deseq2_dir, "vst_transposed.tsv") # Save Path
 sf_tsv   <- file.path(deseq2_dir, "size_factors.tsv")
 disp_pdf <- file.path(plots_dir, "deseq2_dispersion.pdf")
 
@@ -158,10 +168,35 @@ make_plots <- function(vst_mat, info, targets = NULL) {
     pca <- prcomp(t(vst_top[apply(vst_top,1,var)>0,]), center=TRUE)
     df <- as.data.frame(pca$x[,1:2]) %>% tibble::rownames_to_column("sample") %>%
       left_join(info, by="sample")
-    col_by <- if(PER_BP_MODE || MODE=="FASTQ") "sample" else "bioproject"
-    p <- ggplot(df, aes(x=PC1, y=PC2, color=.data[[col_by]])) +
-         geom_point(size=2) + theme_bw() + labs(title=sprintf("PCA (Top %d Var Genes)", n_plot))
-    ggsave(pca_pdf, p, width=6, height=5)
+
+    # Create Numeric ID
+    df$numeric_id <- seq_len(nrow(df))
+
+    # Construct the legend label: "1: SampleName"
+    df$legend_label <- paste0(df$numeric_id, ": ", df$sample)
+
+    # Sort the factor so the legend appears in numeric order (1, 2, 3...)
+    df$legend_label <- factor(df$legend_label, levels = df$legend_label)
+
+    # Base aesthetics
+    p <- ggplot(df, aes(x=PC1, y=PC2)) +
+         geom_text(aes(label=numeric_id), hjust=-0.3, vjust=-0.3, size=3, show.legend=FALSE) +
+         theme_bw() +
+         labs(title=sprintf("PCA (Top %d Var Genes)", n_plot))
+
+    # Conditional Logic:
+    # If samples <= 60, show the specific "Number: Sample" legend requested.
+    # If samples > 60, grouping by Sample creates an unusable legend. Revert to BioProject/Group.
+    if(nrow(df) <= 60) {
+       p <- p + geom_point(aes(color=legend_label), size=2) +
+            guides(color = guide_legend(ncol = 2, title="Sample Index"))
+    } else {
+       col_by <- if(PER_BP_MODE || MODE=="FASTQ") "sample" else "bioproject"
+       p <- p + geom_point(aes(color=.data[[col_by]]), size=2) +
+            labs(subtitle="Legend shows groupings (too many samples for individual index list)")
+    }
+
+    ggsave(pca_pdf, p, width=10, height=7) # Slightly wider for legend
     readr::write_tsv(df, sub("\\.pdf$", ".tsv", pca_pdf))
     msg("[PCA] Saved %s", pca_pdf)
   }
@@ -171,8 +206,15 @@ make_plots <- function(vst_mat, info, targets = NULL) {
   title   <- if(PER_BP_MODE || MODE=="FASTQ") "Samples" else "BioProject"
 
   draw_hm <- function(m, t, f, raster=FALSE) {
+    # Custom Palette: Blue -> Yellow -> Red
+    q01 <- quantile(m, 0.01, na.rm = TRUE)
+    q50 <- quantile(m, 0.50, na.rm = TRUE)
+    q99 <- quantile(m, 0.99, na.rm = TRUE)
+    col_fun <- colorRamp2(c(q01, q50, q99), c("blue", "yellow", "red"))
+
     grDevices::pdf(f, width=12, height=8)
     ht <- ComplexHeatmap::Heatmap(m, name="vst",
+      col = col_fun,
       show_row_names=(nrow(m)<150),
       show_column_names=FALSE,
       column_split=grp_vec, column_title=t,
@@ -210,9 +252,14 @@ make_plots <- function(vst_mat, info, targets = NULL) {
   if(DO_SAMPLE_COR) {
       msg("[SampleCor] Computing Pearson correlation...")
       cor_mat <- cor(vst_mat)
+
+      # Consistent Palette
+      col_fun_cor <- colorRamp2(c(-1, 0, 1), c("blue", "yellow", "red"))
+
       grDevices::pdf(scor_pdf, width=10, height=8)
       ht <- ComplexHeatmap::Heatmap(cor_mat,
          name="Pearson",
+         col = col_fun_cor,
          show_row_names = (ncol(cor_mat) < 80),
          show_column_names = (ncol(cor_mat) < 80),
          column_title = "Sample-to-Sample Correlation",
@@ -242,8 +289,13 @@ make_plots <- function(vst_mat, info, targets = NULL) {
         if (any(na_cols)) var_mat <- var_mat[, !na_cols, drop=FALSE]
         if (ncol(var_mat) == 0) return()
 
+        # Variance Palette (0 to Max)
+        v_max <- quantile(var_mat, 0.99, na.rm=TRUE)
+        col_fun_var <- colorRamp2(c(0, v_max/2, v_max), c("blue", "yellow", "red"))
+
         grDevices::pdf(f, width = 10, height = 8)
         ht <- ComplexHeatmap::Heatmap(var_mat, name="var(VST)",
+            col = col_fun_var,
             show_row_names=(nrow(var_mat)<150),
             show_column_names=TRUE,
             row_names_gp = gpar(fontsize = 6),
@@ -299,6 +351,12 @@ if(PLOTS_ONLY) {
   } else {
       mat <- as.matrix(vst_df); rownames(mat) <- info$sample; vst_mat <- t(mat)
   }
+
+  # FIX: Generate transposed file in PLOTS_ONLY mode as well
+  vst_transposed_out <- tibble::rownames_to_column(as.data.frame(vst_mat), "gene_id")
+  readr::write_tsv(vst_transposed_out, vst_transposed_tsv)
+  msg("[Output] Saved transposed VST matrix to %s", vst_transposed_tsv)
+
   # FIXED CALL: Passing TARGET_GENES_LIST explicitly
   make_plots(vst_mat, info, TARGET_GENES_LIST)
   quit(status=0)
@@ -353,6 +411,11 @@ if (opt$drop_nonvarying) {
 # Save standard VST (Samples x Genes) for normal usage
 vst_out <- tibble::rownames_to_column(as.data.frame(t(vst_mat)), "sample")
 readr::write_tsv(vst_out, vst_tsv)
+
+# <--- FIX: Save TRANSPOSED VST (Genes x Samples) HERE --->
+vst_transposed_out <- tibble::rownames_to_column(as.data.frame(vst_mat), "gene_id")
+readr::write_tsv(vst_transposed_out, vst_transposed_tsv)
+msg("[Output] Saved transposed VST matrix to %s", vst_transposed_tsv)
 
 # ==============================================================================
 # SEIDR OUTPUT - MANUAL WRITE (Samples x Genes) with DEBUG
