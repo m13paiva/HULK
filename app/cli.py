@@ -828,6 +828,7 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
     if saved_targets:
         click.echo(f"  Default Targets: {len(saved_targets)} files")
 
+
 @cli.command("report", cls=HulkCommand,
              help="Regenerate (or generate snapshots while hulk is running) plots and matrices using saved settings.")
 @click.option("-o", "--output", "output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
@@ -840,7 +841,6 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
 @click.option("--no-global-postprocessing", is_flag=True, help="Skip Global analysis (only run BioProjects).")
 @click.option("--fast", is_flag=True, help="Skip DESeq2 recalculation (Fast Mode).")
 @click.option("-f", "--force", is_flag=True, help="Force full recalculation (overwrites existing matrices).")
-
 def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, no_global_postprocessing, fast, force):
     """
     Scans output directory and runs post-processing using settings defined in 'hulk plot'.
@@ -850,9 +850,11 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
     # 1. LOAD PERSISTED SETTINGS (The Source of Truth)
     persisted = _cfg_load()
     plot_cfg = persisted.get("plot", {})
+    deseq_cfg = persisted.get("deseq2", {})  # <--- ADDED
+    txi_cfg = persisted.get("tximport", {})  # <--- ADDED
+    expr_cfg = persisted.get("expression", {})  # <--- ADDED
 
     # Determine "Fast Mode" logic
-    # Force overrides Fast.
     if force:
         plots_only = False
     else:
@@ -863,19 +865,33 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
         outdir=output_dir,
         tx2gene=tx2gene_path,
         target_genes_files=list(target_genes_files) if target_genes_files else None,
-        plots_only_mode=plots_only,  # Controlled by Force/Fast flags
-
+        plots_only_mode=plots_only,
 
         no_bp_postprocessing=no_bp_postprocessing,
         no_global_postprocessing=no_global_postprocessing,
 
-        # Load plot settings directly from persistence
+        # Plot Settings
         plot_pca=plot_cfg.get("global_pca", True),
         plot_heatmap=plot_cfg.get("global_heatmap", True),
         plot_var_heatmap=plot_cfg.get("global_var_heatmap", True),
         plot_sample_cor=plot_cfg.get("sample_cor", True),
         plot_dispersion=plot_cfg.get("dispersion", True),
-        top_n_vars=plot_cfg.get("top_n", 500)
+        top_n_vars=plot_cfg.get("top_n", 500),
+
+        # --- MISSING PARAMS RESTORED BELOW ---
+
+        # DESeq2 Settings
+        deseq2_var_threshold=deseq_cfg.get("var_threshold", 0.05),
+        deseq2_vst_enabled=deseq_cfg.get("vst", True),
+
+        # Expression Matrix Settings
+        expr_use_matrix=expr_cfg.get("use_matrix", "vst"),
+        drop_nonvarying_genes=expr_cfg.get("drop_nonvarying", True),
+
+        # Tximport Settings
+        tximport_mode=txi_cfg.get("mode", "length_scaled_tpm"),
+        tximport_ignore_tx_version=txi_cfg.get("ignore_tx_version", False),
+        tximport_only_mode=txi_cfg.get("tximport_only", False)
     )
 
     # Fallback for tx2gene lookup if not provided in CLI
@@ -905,7 +921,8 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
             click.secho("[Report] Skipping Global analysis (--no-global-postprocessing).", fg="cyan")
 
         if force:
-            click.secho("[Report] FORCE ENABLED: Recalculating everything (overwriting old files)...", fg="magenta", bold=True)
+            click.secho("[Report] FORCE ENABLED: Recalculating everything (overwriting old files)...", fg="magenta",
+                        bold=True)
         elif plots_only:
             click.secho("[Report] Fast mode: Using existing VST matrix (plots only).", fg="yellow")
         else:

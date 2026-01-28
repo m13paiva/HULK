@@ -32,7 +32,7 @@ option_list <- list(
   make_option(c("--force-txi"), dest = "force_txi", action = "store_true", default = FALSE),
   make_option(c("--use-matrix"), dest = "use_matrix", type = "character", default = "vst"),
   make_option(c("--no-drop-nonvarying"), dest = "drop_nonvarying", action = "store_false", default = TRUE),
-  make_option(c("--var-threshold"), dest = "var_threshold", type = "numeric", default = 0.05),
+  make_option(c("--var-threshold"), dest = "var_threshold", type = "numeric", default = 0.1),
   make_option(c("--top-n"), dest = "top_n", type = "integer", default = 500),
   make_option(c("--pca"), dest = "pca", action = "store_true", default = FALSE),
   make_option(c("--heatmap"), dest = "heatmap", action = "store_true", default = FALSE),
@@ -141,7 +141,7 @@ txi_rds  <- file.path(tximport_dir, "txi.rds")
 txi_tsv  <- file.path(tximport_dir, "tximport_counts.tsv")
 dds_rds  <- file.path(deseq2_dir, "dds.rds")
 vst_tsv  <- file.path(deseq2_dir, "vst.tsv")
-vst_transposed_tsv <- file.path(deseq2_dir, "vst_transposed.tsv") # Save Path
+vst_transposed_tsv <- file.path(deseq2_dir, "vst_transposed.tsv")
 sf_tsv   <- file.path(deseq2_dir, "size_factors.tsv")
 disp_pdf <- file.path(plots_dir, "deseq2_dispersion.pdf")
 
@@ -155,38 +155,28 @@ scor_pdf   <- file.path(plots_dir, "sample_correlation.pdf")
 
 
 # --- Plotting Function ---
-make_plots <- function(vst_mat, info, targets = NULL) {
+# UPDATED: Now accepts `vst_top` directly to avoid re-calculation
+make_plots <- function(vst_mat, vst_top, info, targets = NULL) {
   if(!DO_PCA && !DO_HEATMAP && !DO_VAR_HM && !DO_SAMPLE_COR) return()
 
-  vars <- apply(vst_mat, 1, var, na.rm=TRUE)
-  n_plot <- min(TOP_N, nrow(vst_mat))
-  top <- order(vars, decreasing=TRUE)[seq_len(n_plot)]
-  vst_top <- vst_mat[top, , drop=FALSE]
+  n_plot <- nrow(vst_top)
 
   # 1. PCA
   if(DO_PCA && ncol(vst_top)>1) {
+    # Use vst_top directly
     pca <- prcomp(t(vst_top[apply(vst_top,1,var)>0,]), center=TRUE)
     df <- as.data.frame(pca$x[,1:2]) %>% tibble::rownames_to_column("sample") %>%
       left_join(info, by="sample")
 
-    # Create Numeric ID
     df$numeric_id <- seq_len(nrow(df))
-
-    # Construct the legend label: "1: SampleName"
     df$legend_label <- paste0(df$numeric_id, ": ", df$sample)
-
-    # Sort the factor so the legend appears in numeric order (1, 2, 3...)
     df$legend_label <- factor(df$legend_label, levels = df$legend_label)
 
-    # Base aesthetics
     p <- ggplot(df, aes(x=PC1, y=PC2)) +
          geom_text(aes(label=numeric_id), hjust=-0.3, vjust=-0.3, size=3, show.legend=FALSE) +
          theme_bw() +
          labs(title=sprintf("PCA (Top %d Var Genes)", n_plot))
 
-    # Conditional Logic:
-    # If samples <= 60, show the specific "Number: Sample" legend requested.
-    # If samples > 60, grouping by Sample creates an unusable legend. Revert to BioProject/Group.
     if(nrow(df) <= 60) {
        p <- p + geom_point(aes(color=legend_label), size=2) +
             guides(color = guide_legend(ncol = 2, title="Sample Index"))
@@ -196,7 +186,7 @@ make_plots <- function(vst_mat, info, targets = NULL) {
             labs(subtitle="Legend shows groupings (too many samples for individual index list)")
     }
 
-    ggsave(pca_pdf, p, width=10, height=7) # Slightly wider for legend
+    ggsave(pca_pdf, p, width=10, height=7)
     readr::write_tsv(df, sub("\\.pdf$", ".tsv", pca_pdf))
     msg("[PCA] Saved %s", pca_pdf)
   }
@@ -206,7 +196,6 @@ make_plots <- function(vst_mat, info, targets = NULL) {
   title   <- if(PER_BP_MODE || MODE=="FASTQ") "Samples" else "BioProject"
 
   draw_hm <- function(m, t, f, raster=FALSE) {
-    # Custom Palette: Blue -> Yellow -> Red
     q01 <- quantile(m, 0.01, na.rm = TRUE)
     q50 <- quantile(m, 0.50, na.rm = TRUE)
     q99 <- quantile(m, 0.99, na.rm = TRUE)
@@ -230,10 +219,10 @@ make_plots <- function(vst_mat, info, targets = NULL) {
     msg("[Heatmap] Saved %s", f)
   }
 
-  # 2. GLOBAL HEATMAP
+  # 2. GLOBAL HEATMAP (Uses vst_top)
   if(DO_HEATMAP) draw_hm(vst_top, "Global Expression (Top N)", heatmap_pdf)
 
-  # 3. TARGETED HEATMAPS
+  # 3. TARGETED HEATMAPS (Still searches full vst_mat)
   if(DO_HEATMAP && !is.null(targets)) {
      targets_vec <- as.character(unlist(targets))
      bases <- make.unique(tools::file_path_sans_ext(basename(targets_vec)), sep="_")
@@ -248,12 +237,11 @@ make_plots <- function(vst_mat, info, targets = NULL) {
      }
   }
 
-  # 4. SAMPLE CORRELATION
+  # 4. SAMPLE CORRELATION (Still uses full vst_mat for robustness)
   if(DO_SAMPLE_COR) {
       msg("[SampleCor] Computing Pearson correlation...")
       cor_mat <- cor(vst_mat)
 
-      # Consistent Palette
       col_fun_cor <- colorRamp2(c(-1, 0, 1), c("blue", "yellow", "red"))
 
       grDevices::pdf(scor_pdf, width=10, height=8)
@@ -273,9 +261,10 @@ make_plots <- function(vst_mat, info, targets = NULL) {
       msg("[SampleCor] Saved %s", scor_pdf)
   }
 
-  # 5. VARIANCE HEATMAP
+  # 5. VARIANCE HEATMAP (Global uses vst_top)
   if(DO_VAR_HM) {
       draw_var_hm <- function(genes, t, f) {
+        # Note: We still access the full matrix for plotting, but `genes` limits it
         df <- t(vst_mat[genes, , drop=FALSE]) %>% as.data.frame() %>%
           tibble::rownames_to_column("sample") %>% left_join(info, by="sample") %>%
           tidyr::pivot_longer(cols = all_of(genes), names_to="gene", values_to="vst")
@@ -289,7 +278,6 @@ make_plots <- function(vst_mat, info, targets = NULL) {
         if (any(na_cols)) var_mat <- var_mat[, !na_cols, drop=FALSE]
         if (ncol(var_mat) == 0) return()
 
-        # Variance Palette (0 to Max)
         v_max <- quantile(var_mat, 0.99, na.rm=TRUE)
         col_fun_var <- colorRamp2(c(0, v_max/2, v_max), c("blue", "yellow", "red"))
 
@@ -343,6 +331,19 @@ if(PER_BP_MODE) {
 
 # --- LOAD / CALCULATE ---
 
+# Shared logic for selecting Top N genes
+select_top_genes <- function(mat, n_genes) {
+    all_vars <- apply(mat, 1, var, na.rm=TRUE)
+    n_select <- min(n_genes, length(all_vars))
+    top_idx <- order(all_vars, decreasing=TRUE)[seq_len(n_select)]
+    
+    # Return list with both the sub-matrix and the variance dataframe for saving
+    list(
+        mat = mat[top_idx, , drop=FALSE],
+        df  = tibble(gene_id = rownames(mat)[top_idx], variance = all_vars[top_idx])
+    )
+}
+
 if(PLOTS_ONLY) {
   if (!file.exists(vst_tsv)) stop("VST file missing for fast mode.")
   vst_df <- readr::read_tsv(vst_tsv, col_types=cols())
@@ -352,13 +353,20 @@ if(PLOTS_ONLY) {
       mat <- as.matrix(vst_df); rownames(mat) <- info$sample; vst_mat <- t(mat)
   }
 
-  # FIX: Generate transposed file in PLOTS_ONLY mode as well
   vst_transposed_out <- tibble::rownames_to_column(as.data.frame(vst_mat), "gene_id")
   readr::write_tsv(vst_transposed_out, vst_transposed_tsv)
   msg("[Output] Saved transposed VST matrix to %s", vst_transposed_tsv)
 
-  # FIXED CALL: Passing TARGET_GENES_LIST explicitly
-  make_plots(vst_mat, info, TARGET_GENES_LIST)
+  # --- CALCULATE TOP N ONCE ---
+  res <- select_top_genes(vst_mat, TOP_N)
+  vst_top <- res$mat
+  
+  # Save the Top N file (even in plots-only mode)
+  top_var_outfile <- file.path(deseq2_dir, sprintf("top_%d_variable_genes.tsv", TOP_N))
+  readr::write_tsv(res$df, top_var_outfile)
+  msg("[Analysis] Saved Top %d Variable Genes to %s", nrow(res$df), top_var_outfile)
+
+  make_plots(vst_mat, vst_top, info, TARGET_GENES_LIST)
   quit(status=0)
 }
 
@@ -380,7 +388,10 @@ if(opt$tximport_only) quit(status=0)
 coldata <- info[match(colnames(txi$counts), info$sample),]
 dds <- DESeqDataSetFromTximport(txi, colData=coldata, design=~1)
 
-dds <- dds[rowSums(counts(dds))>0,]
+# --- FILTERING --- 
+# Calculate 10% of sample size
+min_samples <- round(ncol(dds) * 0.1)
+dds <- dds[rowSums(counts(dds) >= 10) >= min_samples, ]
 msg("[DESeq2] Estimating size factors (poscounts)...")
 dds <- estimateSizeFactors(dds, type="poscounts")
 
@@ -408,27 +419,36 @@ if (opt$drop_nonvarying) {
     }
 }
 
-# Save standard VST (Samples x Genes) for normal usage
 vst_out <- tibble::rownames_to_column(as.data.frame(t(vst_mat)), "sample")
 readr::write_tsv(vst_out, vst_tsv)
 
-# <--- FIX: Save TRANSPOSED VST (Genes x Samples) HERE --->
 vst_transposed_out <- tibble::rownames_to_column(as.data.frame(vst_mat), "gene_id")
 readr::write_tsv(vst_transposed_out, vst_transposed_tsv)
 msg("[Output] Saved transposed VST matrix to %s", vst_transposed_tsv)
 
 # ==============================================================================
-# SEIDR OUTPUT - MANUAL WRITE (Samples x Genes) with DEBUG
+# CALCULATE TOP N (MAIN MODE)
+# ==============================================================================
+msg("[Analysis] Calculating Top %d Most Variable Genes...", TOP_N)
+res <- select_top_genes(vst_mat, TOP_N)
+vst_top <- res$mat
+
+top_var_outfile <- file.path(deseq2_dir, sprintf("top_%d_variable_genes.tsv", TOP_N))
+readr::write_tsv(res$df, top_var_outfile)
+msg("[Analysis] Saved Top %d Variable Genes to %s", nrow(res$df), top_var_outfile)
+
+
+# ==============================================================================
+# SEIDR OUTPUT
 # ==============================================================================
 msg("[Seidr] Saving %d genes for Network Inference...", nrow(vst_mat))
-
 clean_genes <- gsub("\\s+", "_", rownames(vst_mat))
 writeLines(clean_genes, seidr_genes)
 seidr_mat <- t(vst_mat)
 write_seidr_manual(seidr_mat, seidr_expr)
 
 # ==============================================================================
-# PLOTS
+# PLOTS (Passing pre-calculated vst_top)
 # ==============================================================================
-make_plots(vst_mat, coldata, TARGET_GENES_LIST)
+make_plots(vst_mat, vst_top, coldata, TARGET_GENES_LIST)
 msg("Done.")
