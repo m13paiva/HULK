@@ -847,12 +847,12 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
     """
     click.secho("\n[Report] Scanning output directory...", fg="yellow")
 
-    # 1. LOAD PERSISTED SETTINGS (The Source of Truth)
+    # 1. LOAD PERSISTED SETTINGS
     persisted = _cfg_load()
     plot_cfg = persisted.get("plot", {})
-    deseq_cfg = persisted.get("deseq2", {})  # <--- ADDED
-    txi_cfg = persisted.get("tximport", {})  # <--- ADDED
-    expr_cfg = persisted.get("expression", {})  # <--- ADDED
+    deseq_cfg = persisted.get("deseq2", {})
+    txi_cfg = persisted.get("tximport", {})
+    expr_cfg = persisted.get("expression", {})
 
     # Determine "Fast Mode" logic
     if force:
@@ -861,6 +861,7 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
         plots_only = fast
 
     # 2. Build Configuration
+    # We only pass arguments that Config.__init__ actually accepts.
     cfg = Config(
         outdir=output_dir,
         tx2gene=tx2gene_path,
@@ -870,7 +871,7 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
         no_bp_postprocessing=no_bp_postprocessing,
         no_global_postprocessing=no_global_postprocessing,
 
-        # Plot Settings
+        # Plot Settings (Accepted by __init__)
         plot_pca=plot_cfg.get("global_pca", True),
         plot_heatmap=plot_cfg.get("global_heatmap", True),
         plot_var_heatmap=plot_cfg.get("global_var_heatmap", True),
@@ -878,21 +879,23 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
         plot_dispersion=plot_cfg.get("dispersion", True),
         top_n_vars=plot_cfg.get("top_n", 500),
 
-        # --- MISSING PARAMS RESTORED BELOW ---
-
-        # DESeq2 Settings
-        deseq2_var_threshold=deseq_cfg.get("var_threshold", 0.05),
-        deseq2_vst_enabled=deseq_cfg.get("vst", True),
-
-        # Expression Matrix Settings
-        expr_use_matrix=expr_cfg.get("use_matrix", "vst"),
-        drop_nonvarying_genes=expr_cfg.get("drop_nonvarying", True),
-
-        # Tximport Settings
+        # Tximport Settings (Accepted by __init__)
         tximport_mode=txi_cfg.get("mode", "length_scaled_tpm"),
         tximport_ignore_tx_version=txi_cfg.get("ignore_tx_version", False),
         tximport_only_mode=txi_cfg.get("tximport_only", False)
     )
+
+    # 3. MANUAL OVERRIDES
+    # Since Config.__init__ doesn't accept these, we inject them directly
+    # to ensure the report uses the saved JSON values, not class defaults.
+
+    # DESeq2
+    cfg.deseq2_var_threshold = float(deseq_cfg.get("var_threshold", 0.1))
+    cfg.deseq2_vst_enabled = bool(deseq_cfg.get("vst", True))
+
+    # Expression Matrix
+    cfg.expr_use_matrix = expr_cfg.get("use_matrix", "vst")
+    cfg.drop_nonvarying_genes = bool(expr_cfg.get("drop_nonvarying", True))
 
     # Fallback for tx2gene lookup if not provided in CLI
     if not cfg.tx2gene:
@@ -905,7 +908,7 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
         return
 
     try:
-        # 3. Reconstruct Dataset from disk
+        # 4. Reconstruct Dataset
         dataset = Dataset.reconstruct_from_output(cfg)
 
         click.secho(f"[Report] Found {len(dataset)} samples across {len(dataset.bioprojects)} BioProjects.", fg="green")
@@ -928,7 +931,7 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
         else:
             click.secho("[Report] Recalculating expression matrices (this may take a moment)...", fg="magenta")
 
-        # 4. Run Post-Processing
+        # 5. Run Post-Processing
         run_postprocessing(
             dataset,
             cfg,
@@ -942,7 +945,6 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
         click.secho(f"[Error] {e}", fg="red")
     except Exception as e:
         click.secho(f"[Error] Unexpected failure: {e}", fg="red")
-
 def main():
     os.environ.setdefault("COLUMNS", str(WIDE_HELP))
     cli(standalone_mode=True)
