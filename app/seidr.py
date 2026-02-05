@@ -449,3 +449,60 @@ def run_seidr(cfg: Config, force: bool = False) -> None:
     msg = "[Seidr] Analysis Finished."
     print(msg)
     log(msg, log_path)
+
+def run_seidr_batch(cfg: Config,
+                    genes_file: Path,
+                    expression_file: Path,
+                    outdir: Path,
+                    preset: str = "FAST",
+                    threads: Optional[int] = None) -> None:  # <--- ARGUMENT ADDED HERE
+    """
+    Runs Seidr on a specific saturation batch iteration.
+    Allows overriding thread count for safe parallel execution.
+    """
+    log_path = cfg.log
+
+    # Force enable if calling this function explicitly
+    algos = PRESETS.get(preset.upper(), PRESETS["FAST"])
+
+    # Resolve Tools
+    try:
+        tools = _resolve_binaries(algos, None)
+    except RuntimeError as e:
+        print(f"[Error] {e}")
+        return
+
+    # Dynamic Threading: Use override if provided, else Config default
+    effective_threads = threads if threads is not None else cfg.max_threads
+
+    # Force internal workers to 1 because we are parallelizing the batches themselves.
+    workers = 1
+    backbone = 1.28
+    agg_mode = "irp"
+
+    # Run Task
+    _build_network_task(
+        outdir=outdir,
+        genes_file=genes_file,
+        expression_file=expression_file,
+        threads=effective_threads,  # <--- USE EFFECTIVE THREADS
+        max_workers=workers,  # <--- FORCE 1
+        backbone=backbone,
+        aggregate_mode=agg_mode,
+        algorithms=algos,
+        tools=tools,
+        label="saturation",
+        targeted=False,
+        target_file=None,
+        no_full=True,
+        log_path=log_path,
+        force=True
+    )
+
+    # Cleanup temp folders inside this iteration dir
+    junk_dirs = [p for p in outdir.glob("*-*-*-*") if p.is_dir()]
+    for d in junk_dirs:
+        try:
+            shutil.rmtree(d)
+        except:
+            pass
