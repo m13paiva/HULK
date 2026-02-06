@@ -102,32 +102,66 @@ def aggregate_and_plot_egad(results: List[dict], out_dir: Path):
         print("[EGAD] No valid results to plot.")
         return
 
-    # Save raw table
     raw_path = out_dir / "saturation_auroc_raw.tsv"
     df.to_csv(raw_path, sep="\t", index=False)
 
-    # Aggregate stats
+    # Aggregate
     agg = df.groupby("pct")["auc"].agg(["mean", "std", "count"]).reset_index()
+    agg["std"] = agg["std"].fillna(0)  # For 100% point
     agg["se"] = agg["std"] / np.sqrt(agg["count"])
 
     agg_path = out_dir / "saturation_auroc_summary.tsv"
     agg.to_csv(agg_path, sep="\t", index=False)
 
-    # Plotting
     try:
         plt.figure(figsize=(8, 6))
-        plt.errorbar(
-            agg["pct"], agg["mean"], yerr=agg["std"],
-            fmt='-o', capsize=5, color='#2c3e50', ecolor='#e74c3c',
-            linewidth=2, markersize=8, label="Mean AUROC ± Std Dev"
-        )
+
+        # 1. Main Line
+        plt.plot(agg["pct"], agg["mean"], color='#2c3e50', linewidth=2, zorder=1)
+
+        # 2. Points with Variance
+        mask_var = agg["std"] > 0
+        if mask_var.any():
+            plt.errorbar(
+                agg.loc[mask_var, "pct"], agg.loc[mask_var, "mean"],
+                yerr=agg.loc[mask_var, "std"],
+                fmt='o', capsize=5, color='#2c3e50', ecolor='#e74c3c',
+                linewidth=0,
+                markersize=8, zorder=2, label="Subsampled Batches"
+            )
+
+        # 3. 100% Point
+        mask_ref = agg["std"] == 0
+        if mask_ref.any():
+            plt.scatter(
+                agg.loc[mask_ref, "pct"], agg.loc[mask_ref, "mean"],
+                color='#e74c3c', s=64, zorder=3, label="Full Dataset (100%)"
+            )
 
         plt.title("Network Reconstruction Performance vs Dataset Size", fontsize=14)
         plt.xlabel("Dataset Size (% of Total Samples)", fontsize=12)
         plt.ylabel("Mean AUROC (EGAD)", fontsize=12)
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.legend()
-        plt.ylim(0.4, 1.0)
+
+        # --- NARROWER AXIS SCALING ---
+        y_vals = agg["mean"]
+        y_errs = agg["std"]
+
+        # Calculate strict min/max including error bars
+        y_min_data = (y_vals - y_errs).min()
+        y_max_data = (y_vals + y_errs).max()
+
+        if pd.notna(y_min_data) and pd.notna(y_max_data):
+            range_span = y_max_data - y_min_data
+            if range_span == 0: range_span = 0.01
+
+            # Use 5% padding for tighter fit
+            padding = range_span * 0.05
+
+            plt.ylim(y_min_data - padding, y_max_data + padding)
+        else:
+            plt.ylim(0.4, 1.0)
 
         plot_path = out_dir / "saturation_plot.pdf"
         plt.savefig(plot_path)
