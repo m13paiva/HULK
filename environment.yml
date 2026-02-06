@@ -16,18 +16,22 @@ dependencies:
   - fastp
   - multiqc
   - click
+  - matplotlib
+  - pyarrow          
 
   # --- R / Bioconductor stack ---
-  - r-base>=4.3,<4.4          
+  - r-base>=4.3,<4.4
   - r-optparse
   - r-readr
   - r-dplyr
   - r-tibble
   - r-tidyr
   - r-ggplot2
+  - r-data.table     
+  - r-circlize
 
   # Bioconductor packages
-  - bioconductor-deseq2       # DESeq2
-  - bioconductor-tximport     # tximport (R)
+  - bioconductor-deseq2
+  - bioconductor-tximport
   - bioconductor-complexheatmap
-  - r-circlize                # dependency of ComplexHeatmap
+  - bioconductor-egad 

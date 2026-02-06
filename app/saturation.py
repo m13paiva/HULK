@@ -5,6 +5,7 @@ from typing import Optional, List, Tuple, TYPE_CHECKING
 import concurrent.futures
 
 from .seidr import run_seidr_batch
+from .egad import run_egad_task, aggregate_and_plot_egad, get_egad_script_path
 
 if TYPE_CHECKING:
     from .entities import Dataset, Config
@@ -14,15 +15,15 @@ class BatchOrchestrator:
     def __init__(self, dataset: "Dataset", config: "Config",
                  seed: Optional[int] = None,
                  workers: int = 4,
-                 max_threads: Optional[int] = None):
-        """
-        Orchestrator: 'Knapsack' Mode + Parallel Execution.
-        OPTIMIZED: Pre-transposes VST matrix to eliminate redundant Ops.
-        """
+                 max_threads: Optional[int] = None,
+                 mapman_file: Optional[Path] = None,
+                 force: bool = False):
         self.dataset = dataset
         self.config = config
         self.seed = seed
         self.workers = workers
+        self.mapman_file = mapman_file
+        self.force = force
 
         if max_threads is not None:
             self.total_thread_budget = max_threads
@@ -39,86 +40,81 @@ class BatchOrchestrator:
         self.iterations = 10
         self.vst_path = self.config.shared / "deseq2" / "vst.tsv"
 
-        # LOAD AND TRANSPOSE IMMEDIATELY
-        self.master_df = self._load_and_transpose_vst()
+        # LAZY LOAD STATE
+        self.master_df = None
 
-    def _load_and_transpose_vst(self) -> pd.DataFrame:
+    def _get_master_df(self) -> pd.DataFrame:
+        """
+        Lazy loader: Only reads VST if we actually need to GENERATE a file.
+        """
+        if self.master_df is not None:
+            return self.master_df
+
         if not self.vst_path.exists():
             print(f"[Error] VST matrix missing: {self.vst_path}")
             return pd.DataFrame()
+
         try:
             print(f">> Loading Master VST Matrix from {self.vst_path}...", flush=True)
             try:
-                # Optimized read if pyarrow installed
                 df = pd.read_csv(self.vst_path, sep="\t", index_col=0, engine="pyarrow")
             except:
                 df = pd.read_csv(self.vst_path, sep="\t", index_col=0)
 
-            # Transpose ONCE -> (Gene x Sample)
-            # This allows fast column slicing in the loop
-            df = df.T
-
-            print(f"   [Info] Matrix ready. Shape: {df.shape[0]} genes x {df.shape[1]} samples.")
-            return df
+            # Transpose to (Gene x Sample) for fast column slicing
+            self.master_df = df.T
+            print(
+                f"   [Info] Matrix ready. Shape: {self.master_df.shape[0]} genes x {self.master_df.shape[1]} samples.")
+            return self.master_df
         except Exception as e:
             print(f"[Error] Failed to read VST: {e}")
             return pd.DataFrame()
 
     def _write_seidr_files(self, df: pd.DataFrame, out_dir: Path):
-        # Input 'df' is (Gene x Sample), already clean and filtered.
-
+        df = df.fillna(0)
         g_file = out_dir / "genes.txt"
         e_file = out_dir / "expression.tsv"
-
-        # 1. Write Genes (Index of df)
         with open(g_file, "w") as f:
             f.write("\n".join(df.index.astype(str)))
-
-        # 2. Transpose to (Sample x Gene) for Seidr tools
-        #    Seidr expects samples as rows and genes as columns for correlation
-        df_out = df.T
-
-        # 3. Write Matrix (Values only, no headers/index)
-        df_out.to_csv(e_file, sep="\t", header=False, index=False, float_format='%.6f')
-
+        df.to_csv(e_file, sep="\t", header=False, index=False, float_format='%.6f')
         return g_file, e_file
 
     def run(self):
-        if self.master_df.empty: return
-
         total_samples = len(self.dataset)
         steps_pct = [10, 20, 30, 40, 50, 60, 70, 80, 90]
 
-        # Build Metadata
-        # Master Matrix is (Gene x Sample), so we check columns for sample IDs
-        valid_samples_in_matrix = set(self.master_df.columns)
-
+        # We assume all samples in dataset are valid candidates.
+        # We DO NOT check against VST index here to avoid I/O.
+        # If a sample is missing from VST, it will fail only during the WRITE step (if reached).
         all_projects_meta = []
         for bp in self.dataset.bioprojects:
             s_ids = [s.id for s in bp.samples]
-            valid_s_ids = [sid for sid in s_ids if sid in valid_samples_in_matrix]
-            if valid_s_ids:
-                all_projects_meta.append((bp, len(valid_s_ids), valid_s_ids))
+            if s_ids:
+                all_projects_meta.append((bp, len(s_ids), s_ids))
 
         if not all_projects_meta:
-            print("[Error] No valid BioProjects found.")
+            print("[Error] No BioProjects found in dataset.")
             return
 
         preset = getattr(self.config, "seidr_preset", "FAST")
 
-        # --- PHASE 1: GENERATE FILES & QUEUE TASKS ---
-        execution_queue = []
-        print(f"\n[Phase 1] Generating inputs for {len(steps_pct)} batch steps x {self.iterations} iterations...",
-              flush=True)
+        # --- PHASE 1: GENERATE FILES & QUEUE ---
+        seidr_queue = []
+        egad_queue = []
+
+        print(f"\n[Phase 1] Scanning {len(steps_pct)} batch steps x {self.iterations} iterations...", flush=True)
 
         for pct in steps_pct:
             n_target = int(total_samples * (pct / 100.0))
             if n_target == 0: continue
 
             dir_name = f"{pct}%_batch"
+            # We must maintain the pool logic even if files exist,
+            # so the random seed sequence remains deterministic across runs.
             available_pool = list(all_projects_meta)
 
             for i in range(1, self.iterations + 1):
+                # --- START KNAPSACK LOGIC (CPU ONLY - FAST) ---
                 selected_samples = []
                 current_n = 0
                 used_in_this_run = set()
@@ -155,68 +151,144 @@ class BatchOrchestrator:
                         used_in_this_run.add(chosen_bp)
                         item_to_remove = (chosen_bp, chosen_size, chosen_ids)
                         if item_to_remove in available_pool: available_pool.remove(item_to_remove)
+                # --- END KNAPSACK LOGIC ---
 
-                # --- FAST SLICING & FILTERING ---
-                final_samples = [s for s in selected_samples if s in valid_samples_in_matrix]
+                # --- CHECK FILES ---
+                iter_dir = self.base_outdir / dir_name / f"iter{i}"
+                iter_dir.mkdir(parents=True, exist_ok=True)
 
-                if final_samples:
-                    iter_dir = self.base_outdir / dir_name / f"iter{i}"
-                    iter_dir.mkdir(parents=True, exist_ok=True)
+                # Check directly for the final network.
+                # If it exists, we don't care about VST or genes.txt or expression.tsv
+                network_file = iter_dir / "network_saturation_edges.tsv"
 
-                    # 1. COLUMN SLICE (Subset Samples)
-                    # Create explicit copy to handle NAs safely
-                    subset_df = self.master_df[final_samples].copy()
+                if not self.force and network_file.exists():
+                    # FAST PATH: Network exists. Queue directly for EGAD.
+                    egad_queue.append({
+                        "net": network_file,
+                        "out": iter_dir / "egad_auroc.tsv",
+                        "dir": iter_dir,
+                        "pct": pct,
+                        "iter": i
+                    })
+                    # Skip Seidr queue. Skip VST load.
+                    continue
 
-                    # 2. FILL NA
+                # --- MISSING FILES PATH ---
+                # Network missing. Must queue Seidr.
+                # Do we have input files?
+                g_path = iter_dir / "genes.txt"
+                e_path = iter_dir / "expression.tsv"
+
+                if not (g_path.exists() and e_path.exists()):
+                    # Inputs missing. NOW we must load VST.
+                    matrix = self._get_master_df()
+                    if matrix.empty: continue
+
+                    # Filter samples that actually exist in the matrix
+                    final_samples = [s for s in selected_samples if s in matrix.columns]
+
+                    if not final_samples:
+                        print(f"   [Warning] Empty batch at {dir_name}/iter{i}")
+                        continue
+
+                    subset_df = matrix[final_samples].copy()
                     subset_df.fillna(0, inplace=True)
-
-                    # 3. VARIANCE FILTER
-                    # Calculate variance across samples (axis=1 because subset_df is Gene x Sample)
                     variances = subset_df.var(axis=1)
-
-                    # Drop genes with variance <= 0.1
                     subset_df = subset_df[variances > 0.1]
 
                     if subset_df.empty:
-                        print(f"   [Warning] Batch {dir_name}/iter{i} dropped all genes due to low variance.")
+                        print(f"   [Warning] Batch {dir_name}/iter{i} dropped all genes.")
                         continue
 
-                    # 3. Write
-                    g_path, e_path = self._write_seidr_files(subset_df, iter_dir)
-                    execution_queue.append((g_path, e_path, iter_dir, dir_name, i))
-                else:
-                    print(f"   [Warning] Empty batch at {dir_name}/iter{i}")
+                    self._write_seidr_files(subset_df, iter_dir)
 
-        # --- PHASE 2: PARALLEL EXECUTION ---
-        total_tasks = len(execution_queue)
-        if total_tasks == 0:
-            print("[Info] No tasks generated.")
-            return
+                # Queue for Seidr
+                seidr_queue.append((g_path, e_path, iter_dir, dir_name, i))
 
-        threads_per_job = max(1, self.total_thread_budget // self.workers)
+                # Queue for EGAD (will run after Seidr)
+                egad_queue.append({
+                    "net": network_file,
+                    "out": iter_dir / "egad_auroc.tsv",
+                    "dir": iter_dir,
+                    "pct": pct,
+                    "iter": i
+                })
 
-        print(f"\n[Phase 2] Executing {total_tasks} Seidr runs in parallel.")
-        print(f"          Total Budget: {self.total_thread_budget} threads")
-        print(f"          Workers: {self.workers} | Threads per Job: {threads_per_job}")
-        print(f"          Preset: {preset}", flush=True)
+        # --- PHASE 2: SEIDR ---
+        if seidr_queue:
+            threads_per_job = max(1, self.total_thread_budget // self.workers)
+            print(f"\n[Phase 2] Executing {len(seidr_queue)} Seidr runs in parallel.")
+            print(f"          Total Budget: {self.total_thread_budget} threads")
+            print(f"          Workers: {self.workers} | Threads per Job: {threads_per_job}")
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
-            future_to_task = {}
-            for (g, e, d, bname, iter_n) in execution_queue:
-                fut = executor.submit(
-                    run_seidr_batch,
-                    cfg=self.config,
-                    genes_file=g,
-                    expression_file=e,
-                    outdir=d,
-                    preset=preset,
-                    threads=threads_per_job
-                )
-                future_to_task[fut] = f"{bname}/iter{iter_n}"
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                future_to_task = {}
+                for (g, e, d, bname, iter_n) in seidr_queue:
+                    fut = executor.submit(
+                        run_seidr_batch,
+                        cfg=self.config,
+                        genes_file=g,
+                        expression_file=e,
+                        outdir=d,
+                        preset=preset,
+                        threads=threads_per_job
+                    )
+                    future_to_task[fut] = f"{bname}/iter{iter_n}"
 
-            for future in concurrent.futures.as_completed(future_to_task):
-                task_name = future_to_task[future]
-                try:
-                    future.result()
-                except Exception as exc:
-                    print(f"   [Error] {task_name} generated an exception: {exc}")
+                for future in concurrent.futures.as_completed(future_to_task):
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        print(f"   [Error] Seidr {future_to_task[future]}: {exc}")
+        else:
+            print("\n[Phase 2] All networks found. Skipping Seidr inference.")
+
+        # --- PHASE 3: EGAD ---
+        if self.mapman_file:
+            print(f"\n[Phase 3] Running EGAD Analysis (Workers: {self.workers})...", flush=True)
+
+            try:
+                r_script = get_egad_script_path()
+            except Exception as e:
+                print(f"[Error] Failed to locate EGAD script: {e}")
+                return
+
+            egad_results = []
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                futures = {}
+                for item in egad_queue:
+                    # Double check network exists (if it failed in Phase 2)
+                    if not item["net"].exists():
+                        print(f"   [Skip] Network missing for {item['pct']}% iter {item['iter']}")
+                        continue
+
+                    if not self.force and item["out"].exists():
+                        try:
+                            val = pd.read_csv(item["out"], sep="\t")["AUC"].mean()
+                            egad_results.append({'pct': item['pct'], 'iter': item['iter'], 'auc': val})
+                        except:
+                            pass
+                        continue
+
+                    f = executor.submit(
+                        run_egad_task,
+                        network_file=item["net"],
+                        mapman_file=self.mapman_file,
+                        out_file=item["out"],
+                        script_path=r_script,
+                        log_path=item["dir"] / "egad.log"
+                    )
+                    futures[f] = item
+
+                for future in concurrent.futures.as_completed(futures):
+                    item = futures[future]
+                    res_auc = future.result()
+                    if res_auc is not None:
+                        egad_results.append({'pct': item['pct'], 'iter': item['iter'], 'auc': res_auc})
+                    else:
+                        print(f"   [Error] EGAD failed for {item['pct']}% iter {item['iter']}")
+
+            aggregate_and_plot_egad(egad_results, self.base_outdir)
+        else:
+            print("\n[Phase 3] Skipped (No MapMan file provided).")

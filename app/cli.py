@@ -958,26 +958,25 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
               help="Seidr consensus algorithm preset.")
 @click.option("--seed", type=int, default=None, help="Random seed for reproducibility.")
 @click.option("-w", "--workers", type=int, default=4, show_default=True,
-              help="Number of concurrent Seidr jobs.")
+              help="Number of concurrent jobs.")
 @click.option("-t", "--threads", type=int, default=None,
-              help="Total max threads allowed across all workers (overrides config).")
-def saturation(output_dir, iterations, seidr_preset, seed, workers, threads):
+              help="Total max threads allowed (overrides config).")
+@click.option("-f", "--force", is_flag=True, help="Force re-calculation of batches/networks.")
+@click.option("-m", "--mapman", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="MapMan annotation file for EGAD.")
+def saturation(output_dir, iterations, seidr_preset, seed, workers, threads, force, mapman):
     """
-    Performs a data saturation analysis to assess network reconstruction quality
-    as a function of dataset size and diversity.
+    Performs a data saturation analysis to assess network reconstruction quality.
 
     \b
-    1. Generates subsampled batches (10% to 90% of total data).
-    2. Enforces maximum BioProject diversity (Knapsack algorithm).
-    3. Generates Seidr inputs (expression.tsv/genes.txt).
-    4. (Optional) Runs Seidr network inference.
-    5. Calculates AUROC using the R package EGAD.
+    1. Generates subsampled batches (10% to 90%).
+    2. Runs Seidr network inference.
+    3. (If --mapman provided) Runs EGAD to calculate AUROC.
     """
     click.secho("\n[Saturation] Initializing Data Saturation Analysis...", fg="cyan", bold=True)
-    click.secho(f"[Saturation] Seidr Mode: {seidr_preset} | Iterations: {iterations}", fg="cyan")
+    click.secho(f"[Saturation] Seidr: {seidr_preset} | Iters: {iterations} | Force: {force}", fg="cyan")
 
-    if seed is not None:
-        click.secho(f"[Saturation] Reproducibility Seed: {seed}", fg="magenta")
+    if seed: click.secho(f"[Saturation] Seed: {seed}", fg="magenta")
 
     try:
         cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=False)
@@ -991,19 +990,23 @@ def saturation(output_dir, iterations, seidr_preset, seed, workers, threads):
         return
 
     try:
-        # Pass the explicit threads argument to the orchestrator
-        orch = BatchOrchestrator(dataset, cfg, seed=seed, workers=workers, max_threads=threads)
+        orch = BatchOrchestrator(
+            dataset, cfg,
+            seed=seed,
+            workers=workers,
+            max_threads=threads,
+            mapman_file=mapman,
+            force=force
+        )
         orch.iterations = iterations
         orch.run()
 
         click.secho("\n[Saturation] Analysis complete.", fg="green")
-        click.secho(f"[Saturation] Finalize with EGAD in: {cfg.shared}/egad/data_size_analysis", fg="blue")
 
     except KeyboardInterrupt:
         click.secho("\n[Saturation] Interrupted by user.", fg="yellow")
     except Exception as e:
         click.secho(f"\n[Error] Saturation analysis failed: {e}", fg="red")
-
 def main():
     os.environ.setdefault("COLUMNS", str(WIDE_HELP))
     cli(standalone_mode=True)
