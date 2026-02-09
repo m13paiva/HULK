@@ -1,10 +1,10 @@
+# core.py
 from __future__ import annotations
-
 
 import shutil
 from pathlib import Path
 from datetime import datetime
-from .utils import log, log_err
+from .utils import log, log_err, generate_read_metrics_plot
 from .align import build_transcriptome_index
 from .qc import run_multiqc_global
 from .entities import Config, Dataset
@@ -140,6 +140,7 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
             log("Generating Global MultiQC report...", log_path)
             # Pass 'dataset' to trigger global aggregation mode
             run_multiqc_global(outdir, shared, "multiqc_shared", log_path, modules=("kallisto", "fastp"))
+            generate_read_metrics_plot(data,cfg.shared / "plots", cfg.log)
         except Exception as e:
             log_err(cfg.error_warnings, log_path, f"Global MultiQC failed: {e}")
     else:

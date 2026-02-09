@@ -6,7 +6,8 @@ import subprocess
 from pathlib import Path
 from typing import List, Union, Iterable
 import pandas as pd
-
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -223,4 +224,97 @@ def pad_desc(name: str, width: int = 14) -> str:
     return name.ljust(width)
 
 
+def generate_read_metrics_plot(dataset, out_dir: Path, log_path: Path) -> None:
+    """
+    Generates a bar plot of mean percentages for High Quality and Pseudoaligned reads
+    per BioProject, aggregating the individual read metrics files.
+    """
+    log("Generating BioProject read metrics summary plot...", log_path)
+
+    data_list = []
+
+    # Iterate through the BioProjects in the Dataset
+    for bp in dataset.bioprojects:
+        # Construct path: BP_FOLDER / BP_ID_read_metrics.tsv
+        # We assume the file naming convention matches the BP ID
+        metric_file = bp.path / f"{bp.id}_read_metrics.tsv"
+
+        if not metric_file.exists():
+            # Try generic name if specific one fails
+            metric_file = bp.path / "read_metrics.tsv"
+
+        if not metric_file.exists():
+            log(f"[Warn] Metrics file not found for {bp.id}, skipping.", log_path)
+            continue
+
+        try:
+            df = pd.read_csv(metric_file, sep='\t')
+        except Exception as e:
+            log(f"[Error] Failed to read {metric_file}: {e}", log_path)
+            continue
+
+        # Validation
+        required = {'total_reads', 'high_quality_reads', 'pseudoaligned_reads'}
+        if not required.issubset(df.columns):
+            log(f"[Warn] File {metric_file} missing required columns {required - set(df.columns)}", log_path)
+            continue
+
+        # Calculate Percentages
+        # Avoid division by zero
+        df = df[df['total_reads'] > 0].copy()
+        df['High Quality'] = (df['high_quality_reads'] / df['total_reads']) * 100
+        df['Pseudoaligned'] = (df['pseudoaligned_reads'] / df['total_reads']) * 100
+
+        # Melt for Seaborn
+        df_melted = df.melt(
+            id_vars=['Sample'],
+            value_vars=['High Quality', 'Pseudoaligned'],
+            var_name='Metric',
+            value_name='Percentage'
+        )
+
+        df_melted['Bioproject'] = bp.id
+        data_list.append(df_melted)
+
+    if not data_list:
+        log("[Warn] No valid metrics data found to plot.", log_path)
+        return
+
+    final_df = pd.concat(data_list, ignore_index=True)
+
+    # Save the source data for the plot
+    plot_data_file = out_dir / "bioproject_mean_percentages.tsv"
+    final_df.to_csv(plot_data_file, sep="\t", index=False)
+
+    # Plotting
+    try:
+        plt.figure(figsize=(12, 8))  # Increased size slightly for readability
+
+        sns.barplot(
+            data=final_df,
+            x='Bioproject',
+            y='Percentage',
+            hue='Metric',
+            errorbar='sd',
+            palette="viridis"  # Viridis is easier on the eyes than default
+        )
+
+        plt.title('Mean Percentage of High Quality and Pseudoaligned Reads per BioProject')
+        plt.ylabel('Mean Percentage of Total Reads (%)')
+        plt.xlabel('BioProject')
+
+        # Rotation
+        plt.xticks(rotation=90)
+        plt.ylim(0, 105)
+        plt.legend(title='Metric', loc='upper right')
+        plt.tight_layout()
+
+        output_file = out_dir / 'bioproject_mean_percentages.pdf'
+        plt.savefig(output_file, format='pdf')
+        plt.close()
+
+        log(f"Saved metrics plot to {output_file}", log_path)
+
+    except Exception as e:
+        log(f"[Error] Failed during plotting: {e}", log_path)
 

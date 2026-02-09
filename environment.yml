@@ -17,6 +17,7 @@ dependencies:
   - multiqc
   - click
   - matplotlib
+  - seaborn
   - pyarrow          
 
   # --- R / Bioconductor stack ---

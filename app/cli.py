@@ -17,7 +17,7 @@ from .seidr import PRESETS, ALGO_MAP
 from .core import pipeline
 from .entities import Config, Dataset
 from .post_processing import run_postprocessing
-from .utils import transcriptome_suffixes, smash, scan_fastqs
+from .utils import transcriptome_suffixes, smash, generate_read_metrics_plot
 from .logo import LOGO
 from . import __version__
 
@@ -932,6 +932,7 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
             click.secho("[Report] Recalculating expression matrices (this may take a moment)...", fg="magenta")
 
         # 5. Run Post-Processing
+        generate_read_metrics_plot(dataset, cfg.shared / "plots",cfg.log)
         run_postprocessing(
             dataset,
             cfg,
