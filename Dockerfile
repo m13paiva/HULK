@@ -12,7 +12,7 @@ RUN apt-get update && \
 RUN locale-gen en_US.UTF-8 || true
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
-
+ENV MPLCONFIGDIR=/tmp
 # --- Conda env ---
 # build args for flexibility
 ARG ENV_FILE=environment.yml

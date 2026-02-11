@@ -954,6 +954,8 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
               default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
 @click.option("-i", "--iterations", type=int, default=10, show_default=True,
               help="Number of random subsampling iterations per step.")
+@click.option("-s", "--steps", type=int, default=10, show_default=True,
+              help="Number of BioProject steps in the saturation curve.")
 @click.option("--seidr-preset", type=click.Choice(list(PRESETS.keys()), case_sensitive=False),
               default="FAST", show_default=True,
               help="Seidr consensus algorithm preset.")
@@ -965,17 +967,17 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
 @click.option("-f", "--force", is_flag=True, help="Force re-calculation of batches/networks.")
 @click.option("-m", "--mapman", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="MapMan annotation file for EGAD.")
-def saturation(output_dir, iterations, seidr_preset, seed, workers, threads, force, mapman):
+def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threads, force, mapman):
     """
     Performs a data saturation analysis to assess network reconstruction quality.
 
     \b
-    1. Generates subsampled batches (10% to 90%).
+    1. Generates balanced BioProject batches (defined by --steps).
     2. Runs Seidr network inference.
     3. (If --mapman provided) Runs EGAD to calculate AUROC.
     """
     click.secho("\n[Saturation] Initializing Data Saturation Analysis...", fg="cyan", bold=True)
-    click.secho(f"[Saturation] Seidr: {seidr_preset} | Iters: {iterations} | Force: {force}", fg="cyan")
+    click.secho(f"[Saturation] Seidr: {seidr_preset} | Steps: {steps} | Iters: {iterations} | Force: {force}", fg="cyan")
 
     if seed: click.secho(f"[Saturation] Seed: {seed}", fg="magenta")
 
@@ -997,7 +999,8 @@ def saturation(output_dir, iterations, seidr_preset, seed, workers, threads, for
             workers=workers,
             max_threads=threads,
             mapman_file=mapman,
-            force=force
+            force=force,
+            num_steps=steps
         )
         orch.iterations = iterations
         orch.run()
