@@ -120,6 +120,8 @@ class Config:
             "ignore_tx_version": self.tximport_ignore_tx_version,
         }
 
+
+
         # --------------------------- DESeq2 / Expression ---------------------
         deseq2_cfg = self.persisted_cfg.get("deseq2", {})
         self.deseq2_vst_enabled: bool = bool(deseq2_cfg.get("enabled", True))
@@ -168,6 +170,20 @@ class Config:
 
         # Effective Seidr Targets: CLI targets take precedence if present
         self.seidr_targets = self.target_genes_files if self.target_genes_files else self.seidr_persisted_targets
+
+        # --------------------------- EGAD / Evaluation ---------------------------
+        egad_cfg = self.persisted_cfg.get("egad", {})
+
+        # Paths and defaults
+        self.egad_network_name = egad_cfg.get("network_name", "network_main_edges.tsv")
+        self.egad_output_name = egad_cfg.get("output_name", "egad_auroc.tsv")
+        self.egad_log_name = egad_cfg.get("log_name", "egad.log")
+
+        self.egad_opts: Dict[str, Any] = {
+            "network_file": self.shared / "seidr" / self.egad_network_name,
+            "out_file": self.shared / "seidr" / self.egad_output_name,
+            "log_path": self.shared / "seidr" / self.egad_log_name,
+        }
 
         # Cache
         self.cache_gb: Optional[int] = cache_gb
