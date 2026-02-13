@@ -1011,6 +1011,33 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
         click.secho("\n[Saturation] Interrupted by user.", fg="yellow")
     except Exception as e:
         click.secho(f"\n[Error] Saturation analysis failed: {e}", fg="red")
+
+
+@cli.command("evaluate", cls=HulkCommand,
+             help="Run EGAD evaluation on the main consensus network.")
+@click.option("-o", "--output", "output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
+              default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
+@click.option("-m", "--mapman", "mapman_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              required=True, help="MapMan annotation file for EGAD.")
+def evaluate(output_dir, mapman_path):
+    """
+    Evaluates the primary consensus network using MapMan functional annotations.
+    Delegates execution and output to the EGAD vocal wrapper.
+    """
+    from .egad import run_vocal_evaluation
+
+    click.secho("\n[Hulk] Network Evaluation", fg="magenta", bold=True)
+
+    try:
+        # Standard config loading
+        cfg = Config(outdir=output_dir, plots_only_mode=True)
+
+        # Execute using the vocal wrapper (no 'force' passed here as requested)
+        run_vocal_evaluation(cfg, mapman_path)
+
+    except Exception as e:
+        click.secho(f"[Error] Evaluation failed: {e}", fg="red")
+
 def main():
     os.environ.setdefault("COLUMNS", str(WIDE_HELP))
     cli(standalone_mode=True)

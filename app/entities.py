@@ -95,6 +95,11 @@ class Config:
         self.rem_missing_bps = rem_missing_bps
         self.seq_tech: Optional[str] = seq_tech
 
+        # --------------------------- Directory setup ---------------------------
+        self.shared = (self.outdir / "shared").resolve()
+        self.cache = (self.shared / "cache").resolve()
+        self.log = (self.shared / "log.txt").resolve()
+
         # --------------------------- Persistent JSON ---------------------------
         self.cfg_path = self._resolve_cfg_path()
         self.persisted_cfg = self._load_json_cfg(self.cfg_path)
@@ -171,10 +176,13 @@ class Config:
         # Effective Seidr Targets: CLI targets take precedence if present
         self.seidr_targets = self.target_genes_files if self.target_genes_files else self.seidr_persisted_targets
 
-        # --------------------------- EGAD / Evaluation ---------------------------
-        egad_cfg = self.persisted_cfg.get("egad", {})
+        # Cache
+        self.cache_gb: Optional[int] = cache_gb
+        self.no_cache: bool = bool(no_cache)
 
-        # Paths and defaults
+        # --------------------------- EGAD / Evaluation ---------------------------
+
+        egad_cfg = self.persisted_cfg.get("egad", {})
         self.egad_network_name = egad_cfg.get("network_name", "network_main_edges.tsv")
         self.egad_output_name = egad_cfg.get("output_name", "egad_auroc.tsv")
         self.egad_log_name = egad_cfg.get("log_name", "egad.log")
@@ -184,15 +192,6 @@ class Config:
             "out_file": self.shared / "seidr" / self.egad_output_name,
             "log_path": self.shared / "seidr" / self.egad_log_name,
         }
-
-        # Cache
-        self.cache_gb: Optional[int] = cache_gb
-        self.no_cache: bool = bool(no_cache)
-
-        # --------------------------- Directory setup ---------------------------
-        self.shared = (self.outdir / "shared").resolve()
-        self.cache = (self.shared / "cache").resolve()
-        self.log = (self.shared / "log.txt").resolve()
 
     # ======================================================================
     # Internal helpers
@@ -256,6 +255,9 @@ class Config:
                 "aggregate": "irp",
                 "no_full": False
             }
+
+        if tool == "egad":
+            return dict(self.egad_opts)
         return self.persisted_cfg.get(tool, {})
 
     @property

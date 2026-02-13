@@ -18,7 +18,7 @@ option_list <- list(
   make_option(c("-m", "--mapman"), type="character", default=NULL, help="MapMan file"),
   # HULK passes a specific FILE path for output, not a directory
   make_option(c("-o", "--output"), type="character", default="egad_results.tsv", help="Output TSV file"),
-  make_option(c("-c", "--min_genes"), type="integer", default=5, help="Min genes per term")
+  make_option(c("-c", "--min_genes"), type="integer", default=10, help="Min genes per term")
 )
 opt <- parse_args(OptionParser(option_list=option_list))
 
