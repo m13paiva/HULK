@@ -2,20 +2,64 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 from threading import Thread
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any, Tuple
 
 from tqdm.auto import tqdm
 
-from .utils import log, log_err, pad_desc
+from .utils import log, log_err, pad_desc, bp_seidr_batches
 from .prefetcher import prefetch
 from .processor import process
 from .cache_manager import CacheGate
 from .qc import run_multiqc, build_bp_metrics
-from .post_processing import run_postprocessing_bp
+from .post_processing import run_postprocessing_bp, run_postprocessing_batch
+from .seidr import run_seidr_aggregation
+
+
+def force_test_seidr_aggregation(cfg: "Config") -> None:
+    """
+    A sledgehammer to bypass the orchestrator and test both R aggregation and Seidr
+    on a specific multi-BP batch.
+    """
+    import sys
+    from pathlib import Path
+    from types import SimpleNamespace
+    from .seidr import run_seidr_aggregation
+    from .post_processing import run_postprocessing_batch
+
+    print(f"\n{'=' * 50}", flush=True)
+    print(f"[TEST MODE] Forcing Post-processing & Seidr on [PRJNA1174730, PRJNA1198503]", flush=True)
+    print(f"{'=' * 50}\n", flush=True)
+
+    # 1. Mock the BioProject objects because the function expects objects, not strings
+    bp1 = SimpleNamespace(id="PRJNA1174730", path=cfg.outdir / "PRJNA1174730")
+    bp2 = SimpleNamespace(id="PRJNA1198503", path=cfg.outdir / "PRJNA1198503")
+    fake_batch = [bp1, bp2]
+
+    # 2. Run the post-processing step
+    print("\n[TEST MODE] Step 1: Running run_postprocessing_batch...", flush=True)
+    batch_dir = run_postprocessing_batch(fake_batch, cfg)
+
+    if not batch_dir or not batch_dir.exists():
+        print("\n[TEST MODE ERROR] Post-processing failed or returned nothing. Look at the R output above.", flush=True)
+        sys.exit(1)
+
+    print(f"\n[TEST MODE] Post-processing succeeded. Batch dir: {batch_dir}", flush=True)
+
+    # 3. Run Seidr
+    print("\n[TEST MODE] Step 2: Running run_seidr_aggregation...", flush=True)
+    try:
+        run_seidr_aggregation(batch_dir, cfg)
+        print("\n[TEST MODE] Seidr finished successfully.", flush=True)
+    except Exception as e:
+        print(f"\n[TEST MODE] Seidr crashed: {e}", flush=True)
+    finally:
+        print("[TEST MODE] Exiting pipeline so the real orchestrator doesn't run.", flush=True)
+        sys.exit(0)
 
 
 def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
@@ -59,10 +103,22 @@ def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
     except Exception as e:
         log_err(errors, log_path, f"[{bp.id}] Failed to build read metrics: {e}")
 
+    # --- MARKER CREATION ---
+    try:
+        marker = bp.path / ".postprocessing_done"
+        marker.touch()
+    except Exception as e:
+        log_err(errors, log_path, f"[{bp.id}] Failed to create completion marker: {e}")
+
     log(f"[{bp.id}] === BioProject post-processing complete ===", log_path)
 
-def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: float = 0.5):
-    """Create one tqdm bar per BioProject and return a monitor thread."""
+
+def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: float = 0.5):
+    """
+    Create one tqdm bar per BioProject and return a monitor thread.
+    Takes the full dataset object to allow batch organization utilities to inspect dataset attributes.
+    """
+    bioprojects = dataset.bioprojects
     bp_bars = {}
     last_done = {}
     pos = start_position
@@ -71,6 +127,19 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
 
     # Track which bars are finished and closed to stop updating them
     closed_bars = set()
+
+    # --- BATCH LOGIC INITIALIZATION ---
+    # Only organize batches if we are in 'aggregated' or 'both' mode.
+    # Defaults to 'single' if missing.
+    seidr_mode = getattr(cfg, "seidr_construction_mode", "single")
+
+    batches = []
+    if seidr_mode in ("aggregated", "both"):
+        batches = bp_seidr_batches(dataset, min_samples=50)
+        if batches:
+            log(f"[monitor] Organized {len(batches)} batches for aggregated Seidr inference.", cfg.log)
+
+    processed_batches = set()
 
     # -------------------------------
     # Create bars with initial offset
@@ -111,10 +180,11 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
     def _monitor():
         # Track which BPs have already had postprocessing run in THIS pipeline run
         already_postprocessed = set()
+        force_run = getattr(cfg, "force", False)
 
         while True:
-            # If all bars are closed, we are done
-            if len(closed_bars) == len(bp_bars):
+            # If all bars are closed AND (if batching is active) all batches are done
+            if len(closed_bars) == len(bp_bars) and len(processed_batches) == len(batches):
                 break
 
             for bp in bioprojects:
@@ -141,19 +211,57 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
                 if done_now >= len(bp.samples):
                     # 1. Run Post-processing (if not already done)
                     if bp.id not in already_postprocessed:
-                        bp.status = "done"
-                        try:
-                            _finalize_bioproject(bp, cfg)
-                        except Exception as e:
-                            # Log error but don't crash the monitor thread
-                            if hasattr(bp, 'log_path'):
-                                log(f"[{bp.id}] Postprocessing failed: {e}", bp.log_path)
-                        finally:
-                            already_postprocessed.add(bp.id)
+                        marker = bp.path / ".postprocessing_done"
 
-                    # 2. Close the bar (NEW LOGIC)
+                        # CHECK MARKER
+                        if marker.exists() and not force_run:
+                            # Skip execution, but mark as done so batch logic sees it
+                            log(f"[{bp.id}] Found .postprocessing_done marker. Skipping BP post-processing.", cfg.log)
+                            bp.status = "done"
+                            already_postprocessed.add(bp.id)
+                        else:
+                            # Execute actual processing
+                            bp.status = "done"
+                            try:
+                                _finalize_bioproject(bp, cfg)
+                            except Exception as e:
+                                # Log error but don't crash the monitor thread
+                                if hasattr(bp, 'log_path'):
+                                    log(f"[{bp.id}] Postprocessing failed: {e}", bp.log_path)
+                            finally:
+                                already_postprocessed.add(bp.id)
+
+                    # 2. Close the bar
                     bp_bars[bp.id].close()
                     closed_bars.add(bp.id)
+
+            # -------------------------------
+            # Batch Completion Check
+            # -------------------------------
+            for idx, batch in enumerate(batches):
+                if idx in processed_batches:
+                    continue
+
+                # Check if all BioProjects in this specific batch are 'done'
+                if all(getattr(bp, "status", None) == "done" for bp in batch):
+                    log(f"[batch-monitor] Batch {idx} ready. Aggregating expression data...", cfg.log)
+
+                    # Call the batch post-processing function (R aggregation)
+                    batch_dir = run_postprocessing_batch(batch, cfg)
+
+                    if batch_dir:
+                        log(f"[batch-monitor] Batch {idx} data prepared at {batch_dir}", cfg.log)
+
+                        # --- TRIGGER SEIDR INFERENCE ---
+                        try:
+                            run_seidr_aggregation(batch_dir, cfg)
+                        except Exception as e:
+                            log_err(cfg.error_warnings, cfg.log, f"[batch-monitor] Seidr failed for batch {idx}: {e}")
+
+                    else:
+                        log(f"[batch-monitor] Batch {idx} failed data aggregation.", cfg.log)
+
+                    processed_batches.add(idx)
 
             time.sleep(poll_secs)
 
@@ -166,7 +274,6 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
     t.start()
 
     return bp_bars, t
-
 
 
 def _cfg(cfg, name, default=None):
@@ -208,8 +315,8 @@ def _plan_threads(cfg) -> ThreadPlan:
     forced_bt = _cfg(cfg, "bundle_threads", None)
     bt = max(1, int(forced_bt)) if forced_bt is not None else max(1, usable // bundles)
 
-    dump_cap     = _cfg(cfg, "dump_cap", 1)
-    fastp_cap    = _cfg(cfg, "fastp_cap", 8)
+    dump_cap = _cfg(cfg, "dump_cap", 1)
+    fastp_cap = _cfg(cfg, "fastp_cap", 8)
     kallisto_cap = _cfg(cfg, "kallisto_cap", 32)
 
     default_pf = _clamp(max(4, logical // 8), 2, 24)
@@ -227,6 +334,7 @@ def _plan_threads(cfg) -> ThreadPlan:
         reserved_for_os=reserve_default,
         usable_threads=usable,
     )
+
 
 def run_download_and_process(
         dataset: "Dataset",
@@ -249,10 +357,11 @@ def run_download_and_process(
         • Processing daemon calls prefetch_one() internally per-SRR
         • Still parallel across bundles
     """
+    # ----------------------------------------
+    # HIJACK PIPELINE FOR TESTING
+    # ----------------------------------------
+    #force_test_seidr_aggregation(cfg)
 
-    # ----------------------------------------
-    # Decide cache mode using CacheGate
-    # ----------------------------------------
     gate = CacheGate(
         cache_dir,
         cfg.cache_high_gb * (1024 ** 3),
@@ -269,9 +378,6 @@ def run_download_and_process(
         log_path,
     )
 
-    # ----------------------------------------
-    # Thread planning
-    # ----------------------------------------
     plan = _plan_threads(cfg)
     msg_user = "auto" if plan.user_max_threads is None else f"{plan.user_max_threads} (user)"
 
@@ -291,14 +397,13 @@ def run_download_and_process(
     # BioProject progress bars
     # ----------------------------------------
     if getattr(dataset, "bioprojects", None):
-        _bp_bars, t_bpmon = _start_bp_progress(dataset.bioprojects,cfg, start_position=2, poll_secs=0.5)
+        _bp_bars, t_bpmon = _start_bp_progress(dataset, cfg, start_position=2, poll_secs=0.5)
     else:
         _bp_bars, t_bpmon = {}, None
 
     # ----------------------------------------
     # Start PROCESSING daemon
     # ----------------------------------------
-    # NOTE: processing daemon must receive cache mode
     t_proc = Thread(
         target=process,
         kwargs=dict(
@@ -330,7 +435,7 @@ def run_download_and_process(
                 max_workers=plan.prefetch_workers,
                 cache_high_gb=cfg.cache_high_gb,
                 cache_low_gb=cfg.cache_low_gb,
-                mode="cache",          # <<< NEW
+                mode="cache",
             ),
             daemon=True,
         )
@@ -350,4 +455,3 @@ def run_download_and_process(
         t_bpmon.join()
 
     log("[orchestrator] all done", log_path)
-

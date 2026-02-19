@@ -318,3 +318,52 @@ def generate_read_metrics_plot(dataset, out_dir: Path, log_path: Path) -> None:
     except Exception as e:
         log(f"[Error] Failed during plotting: {e}", log_path)
 
+def bp_seidr_batches(dataset: "Dataset", min_samples: int = 50) -> List[List["BioProject"]]:
+    """
+    Groups BioProjects into batches where each batch has at least min_samples.
+    Maximizes the number of batches by greedy small-to-large pairing.
+    """
+    if dataset.mode != "SRR":
+        # I'm assuming you aren't doing this for FASTQ mode since BioProjects don't exist there.
+        # But knowing you, you might try.
+        return []
+
+    # 1. Separate the "big fish" from the "fry"
+    big_bps = [bp for bp in dataset.bioprojects if bp.total() >= min_samples]
+    small_bps = sorted(
+        [bp for bp in dataset.bioprojects if bp.total() < min_samples],
+        key=lambda x: x.total()
+    )
+
+    batches = []
+
+    # 2. Every big BioProject gets its own batch. Easy.
+    for bp in big_bps:
+        batches.append([bp])
+
+    # 3. Greedily pack the small ones to reach the threshold
+    current_batch = []
+    current_count = 0
+
+    for bp in small_bps:
+        current_batch.append(bp)
+        current_count += bp.total()
+
+        if current_count >= min_samples:
+            batches.append(current_batch)
+            current_batch = []
+            current_count = 0
+
+    # 4. Handle the leftovers.
+    # If we have a final batch that didn't reach 50, we have to shove it
+    # into the last successful batch to keep things valid.
+    if current_batch:
+        if batches:
+            batches[-1].extend(current_batch)
+        else:
+            # If the entire dataset doesn't have 50 samples,
+            # you get one sad, undersized batch.
+            batches.append(current_batch)
+
+    return batches
+

@@ -26,7 +26,7 @@ option_list <- list(
   make_option(c("-t", "--tx2gene"), dest = "tx2gene", type = "character", default = "tx2gene.clean.tsv"),
   make_option(c("-o", "--out-dir"), dest = "out_dir", type = "character", default = "."),
   make_option(c("-p", "--prefix"), dest = "prefix", type = "character", default = ""),
-  make_option(c("--bioproject"), dest = "bioproject", type = "character", default = NULL),
+  make_option(c("--bioproject"), dest = "bioproject", type = "character", default = NULL, help="Single ID or comma-separated list"),
   make_option(c("--ignore-tx-version"), dest = "ignore_tx_version", action = "store_true", default = FALSE),
   make_option(c("--counts-from-abundance"), dest = "counts_from_abundance", type = "character", default = "no"),
   make_option(c("--force-txi"), dest = "force_txi", action = "store_true", default = FALSE),
@@ -109,7 +109,11 @@ if (basename(OUT_DIR) == "plots") {
 SEARCH_DIR    <- opt$search_dir
 EXCLUDE_DIRS  <- opt$exclude_dir
 TX2GENE_PATH  <- opt$tx2gene
-BIOPROJECT_ID <- opt$bioproject
+
+# <--- UPDATED: Handle comma-separated list of BioProjects
+BIOPROJECT_IDS <- if(!is.null(opt$bioproject)) unlist(strsplit(opt$bioproject, ",")) else NULL
+PER_BP_MODE   <- !is.null(BIOPROJECT_IDS)
+
 TOP_N         <- opt$top_n
 DO_PCA        <- isTRUE(opt$pca)
 DO_HEATMAP    <- isTRUE(opt$heatmap)
@@ -118,7 +122,6 @@ DO_SAMPLE_COR <- isTRUE(opt$sample_cor)
 DO_DISP       <- isTRUE(opt$dispersion)
 PLOTS_ONLY    <- isTRUE(opt$plots_only)
 MODE          <- toupper(opt$mode %||% "SRR")
-PER_BP_MODE   <- !is.null(BIOPROJECT_ID)
 
 if (MODE == "FASTQ" && DO_VAR_HM) DO_VAR_HM <- FALSE
 
@@ -324,8 +327,9 @@ files <- find_files(SEARCH_DIR, EXCLUDE_DIRS)
 info <- tibble(sample=basename(dirname(files)), bioproject=basename(dirname(dirname(files))))
 names(files) <- info$sample
 
+# <--- UPDATED: Check for membership in the provided LIST of IDs, not just equality to a single string
 if(PER_BP_MODE) {
-  info <- info[info$bioproject == BIOPROJECT_ID,]
+  info <- info[info$bioproject %in% BIOPROJECT_IDS,]
   files <- files[info$sample]
 }
 
@@ -336,7 +340,7 @@ select_top_genes <- function(mat, n_genes) {
     all_vars <- apply(mat, 1, var, na.rm=TRUE)
     n_select <- min(n_genes, length(all_vars))
     top_idx <- order(all_vars, decreasing=TRUE)[seq_len(n_select)]
-    
+
     # Return list with both the sub-matrix and the variance dataframe for saving
     list(
         mat = mat[top_idx, , drop=FALSE],
@@ -360,7 +364,7 @@ if(PLOTS_ONLY) {
   # --- CALCULATE TOP N ONCE ---
   res <- select_top_genes(vst_mat, TOP_N)
   vst_top <- res$mat
-  
+
   # Save the Top N file (even in plots-only mode)
   top_var_outfile <- file.path(deseq2_dir, sprintf("top_%d_variable_genes.tsv", TOP_N))
   readr::write_tsv(res$df, top_var_outfile)
@@ -388,7 +392,7 @@ if(opt$tximport_only) quit(status=0)
 coldata <- info[match(colnames(txi$counts), info$sample),]
 dds <- DESeqDataSetFromTximport(txi, colData=coldata, design=~1)
 
-# --- FILTERING --- 
+# --- FILTERING ---
 # Calculate 10% of sample size
 min_samples <- round(ncol(dds) * 0.1)
 dds <- dds[rowSums(counts(dds) >= 10) >= min_samples, ]

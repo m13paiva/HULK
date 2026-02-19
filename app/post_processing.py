@@ -1,5 +1,6 @@
 from __future__ import annotations
 import subprocess
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Any, Optional, Set
@@ -137,7 +138,11 @@ def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[s
     return args, False
 
 
-def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) -> None:
+def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) -> Path | None:
+    """
+    Run post-processing for a SINGLE BioProject.
+    Returns path to gene counts if successful.
+    """
     log_path = cfg.log
     if hasattr(bp, 'log_path'):
         log_path = bp.log_path
@@ -152,8 +157,97 @@ def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) ->
             fh.write(f"\n[post-processing] {bp.id} command:\n  {' '.join(args)}\n\n")
             fh.flush()
             subprocess.run(args, stdout=fh, stderr=fh, text=True, check=False)
+        return out_dir
     except Exception:
-        pass
+        return None
+
+
+def run_postprocessing_batch(
+        batch: List[Any],
+        cfg: Config,
+        r_script: Path | None = None
+) -> Optional[Path]:
+    """
+    Run post-processing for a BATCH of BioProjects (Aggregated Mode).
+    Creates folder shared/seidr/aggregated/BP1_BP2_...
+    Generates genes.txt and expression.tsv there.
+    """
+    if not batch:
+        return None
+
+    # 1. Create Aggregated Folder Name
+    bp_ids = sorted([b.id for b in batch])
+    batch_name = "_".join(bp_ids)
+
+    # Output: shared/seidr/aggregated/<batch_name>
+    out_dir = cfg.shared / "seidr" / "aggregated" / batch_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = out_dir / "batch.log"
+
+    # --- OPTIMIZATION: Single BP Shortcut ---
+    if len(batch) == 1:
+        bp = batch[0]
+        src_genes = bp.path / "plots" / "deseq2" / "genes.txt"
+        src_expr = bp.path / "plots" / "deseq2" / "expression.tsv"
+
+        if src_genes.exists() and src_expr.exists():
+            log(f"[Batch] Single-BP batch ({bp.id}) detected with existing data. Copying...", cfg.log)
+            try:
+                shutil.copy2(src_genes, out_dir / "genes.txt")
+                shutil.copy2(src_expr, out_dir / "expression.tsv")
+                return out_dir
+            except Exception as e:
+                log_err(cfg.error_warnings, cfg.log, f"[Batch] Failed to copy existing files for {bp.id}: {e}")
+        else:
+            log(f"[Batch] Single-BP batch ({bp.id}) detected, but source files missing. Re-running...", cfg.log)
+
+    # 2. Build Arguments
+    try:
+        args = _build_r_args_global(cfg, out_dir, mode="SRR")
+    except Exception as e:
+        log_err(cfg.error_warnings, cfg.log, f"[Batch] Failed to build args: {e}")
+        return None
+
+    # Set prefix to batch name
+    if "--prefix" in args:
+        idx = args.index("--prefix")
+        args[idx + 1] = "batch"
+
+    bp_arg_str = ",".join(bp_ids)
+    args.extend(["--bioproject", bp_arg_str])
+
+    # 3. Execution
+    script_path = r_script if r_script else R_SCRIPT_PATH
+    args[1] = str(script_path)
+
+    log(f"[Batch] Starting aggregated post-processing for {len(batch)} BPs in {out_dir.name}", cfg.log)
+
+    try:
+        with open(log_path, "w", encoding="utf-8") as fh:
+            fh.write(f"# Batch Aggregation Log\n# Batch: {batch_name}\n")
+            fh.write(f"# Command:\n{' '.join(args)}\n\n")
+            fh.flush()
+            subprocess.run(args, stdout=fh, stderr=fh, text=True, check=False)
+
+        # 4. Move output files to the root of the batch folder
+        src_genes = out_dir / "deseq2" / "genes.txt"
+        src_expr = out_dir / "deseq2" / "expression.tsv"
+
+        dst_genes = out_dir / "genes.txt"
+        dst_expr = out_dir / "expression.tsv"
+
+        if src_genes.exists() and src_expr.exists():
+            shutil.move(str(src_genes), str(dst_genes))
+            shutil.move(str(src_expr), str(dst_expr))
+            log(f"[Batch] Aggregation complete. Files ready in {out_dir}", cfg.log)
+            return out_dir
+        else:
+            log_err(cfg.error_warnings, cfg.log, f"[Batch] R script did not generate expected files in {out_dir}/deseq2")
+            return None
+
+    except Exception as e:
+        log_err(cfg.error_warnings, cfg.log, f"[Batch] Execution failed: {e}")
+        return None
 
 
 def run_postprocessing(
@@ -274,14 +368,13 @@ def run_postprocessing(
     with ThreadPoolExecutor(max_workers=max_workers_bp) as executor:
         future_to_bp = {}
         for bp_item in dataset.bioprojects:
-            # <--- FIX HERE: Properly extract string ID from BioProject object or string
             bp_id_str = str(bp_item)
             if hasattr(bp_item, "id"):
                 bp_id_str = bp_item.id
 
             bp_obj = SimpleNamespace(
                 id=bp_id_str,
-                path=cfg.outdir / bp_id_str,  # Now safe because bp_id_str is a string
+                path=cfg.outdir / bp_id_str,
                 log_path=cfg.outdir / bp_id_str / "log.txt"
             )
             bp_obj.path.mkdir(parents=True, exist_ok=True)

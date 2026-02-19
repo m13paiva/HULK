@@ -10,7 +10,7 @@ from .qc import run_multiqc_global
 from .entities import Config, Dataset
 from .orchestrator import run_download_and_process
 from .post_processing import run_postprocessing as run__postprocessing
-from .seidr import run_seidr
+from .seidr import run_seidr_single
 
 def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
     """
@@ -153,11 +153,17 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         # If DESeq2 is disabled, it will automatically fall back to tximport-only.
         run__postprocessing(data, cfg, skip_bp=True)
 
-    try:
-        run_seidr(cfg)
-    except Exception as e:
-        log_err(cfg.error_warnings, log_path, f"[Seidr] Pipeline step failed: {e}")
+    seidr_mode = getattr(cfg, "seidr_construction_mode", "single")
 
+    if seidr_mode in ("single", "both"):
+        try:
+            run_seidr_single(cfg)
+        except Exception as e:
+            log_err(cfg.error_warnings, log_path, f"[Seidr] Single Network pipeline failed: {e}")
+
+    if seidr_mode in ("aggregated", "both"):
+        log("[Seidr] Aggregated mode enabled; monitor thread will trigger batch inference.", log_path)
+        
         # End of pipeline
     log("Pipeline finished.", log_path)
 

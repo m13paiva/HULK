@@ -1,6 +1,3 @@
-"""
-Seidr Pipeline Integration for HULK.
-"""
 from __future__ import annotations
 import os
 import shutil
@@ -100,6 +97,10 @@ def _import_scores(seidr_bin: str, algo_name: str, outdir: Path, prefix: str,
                    tsv_in: Path, genes: Path, fmt: str, threads: int, log_path: Path) -> Path:
     sf_path = outdir / f"{prefix}{algo_name.lower()}_scores.sf"
 
+    # If the .sf file already exists and we aren't forcing, technically we could skip this too,
+    # but import is so fast it's usually safer to just overwrite it. Seidr's 'import'
+    # command usually accepts overwriting, unlike the main binaries.
+
     cmd = [seidr_bin, "import", "-n", algo_name, "-o", str(sf_path),
            "-F", fmt, "-i", str(tsv_in), "-g", str(genes)]
 
@@ -185,6 +186,10 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
         print(f"[Seidr ERROR] Input files missing.", file=sys.stderr)
         return
 
+    # Ensure log file exists before we try to append to it
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.touch(exist_ok=True)
+
     prefix = f"{label}_"
     seidr = tools["seidr"]
     sf_files = []
@@ -197,30 +202,39 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
 
             out_tsv = outdir / f"{prefix}{algo.lower()}_scores.tsv"
 
-            cmd = [tools[bin_name], "-i", str(expression_file), "-g", str(genes_file), "-o", str(out_tsv)]
-            if m_flag: cmd.extend([m_flag, m_val])
-
-            if bin_name not in ["correlation", "pcor"]:
-                cmd.extend(["-O", str(threads)])
+            # <--- THE FIX: Skip running the binary if the output already exists and we aren't forcing
+            if out_tsv.exists() and not force:
+                print(f"[Seidr] {algo} TSV already exists. Skipping calculation.", flush=True)
             else:
-                cmd.append("--no-scale")
+                # If we are forcing, we must delete the old file, or Seidr will crash
+                if force and out_tsv.exists():
+                    out_tsv.unlink()
 
-            if targeted:
-                cmd.insert(1, "-t");
-                cmd.insert(2, str(target_file))
+                cmd = [tools[bin_name], "-i", str(expression_file), "-g", str(genes_file), "-o", str(out_tsv)]
+                if m_flag: cmd.extend([m_flag, m_val])
 
-            if algo in ["CLR", "ARACNE"]:
-                if not prerequisite_file or not prerequisite_file.exists():
-                    print(f"[Seidr ERROR] {algo} missing prerequisite.", file=sys.stderr)
-                    return None
-                cmd.extend(["-M", str(prerequisite_file.resolve())])
+                if bin_name not in ["correlation", "pcor"]:
+                    cmd.extend(["-O", str(threads)])
+                else:
+                    cmd.append("--no-scale")
 
-            # Minimal console output
-            print(f"[Seidr] Running {algo}...")
+                if targeted:
+                    cmd.insert(1, "-t");
+                    cmd.insert(2, str(target_file))
 
-            # Heavy output goes to log file
-            _run_direct_quiet(cmd, cwd=outdir, log_path=log_path)
+                if algo in ["CLR", "ARACNE"]:
+                    if not prerequisite_file or not prerequisite_file.exists():
+                        print(f"[Seidr ERROR] {algo} missing prerequisite.", file=sys.stderr)
+                        return None
+                    cmd.extend(["-M", str(prerequisite_file.resolve())])
 
+                # Minimal console output
+                print(f"[Seidr] Running {algo}...")
+
+                # Heavy output goes to log file
+                _run_direct_quiet(cmd, cwd=outdir, log_path=log_path)
+
+            # Always run import to ensure we have the .sf file.
             return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, current_fmt, threads, log_path)
 
         except Exception as e:
@@ -262,6 +276,10 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
     net_sf = outdir / f"network_{label}.sf"
     print(f"[Seidr] Aggregating {len(sf_files)} networks...")
 
+    # If forcing, delete old aggregate network to prevent appending/crashing issues
+    if force and net_sf.exists():
+        net_sf.unlink()
+
     try:
         # Aggregate is fast, but let's log it too
         _run_direct_quiet([seidr, "aggregate", "-o", str(net_sf), "-m", aggregate_mode] + [str(s) for s in sf_files],
@@ -272,6 +290,10 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
     # 4. Backbone
     print(f"[Seidr] Backbone pruning ({backbone})...")
     bb_sf = outdir / f"network_{label}.bb.sf"
+
+    if force and bb_sf.exists():
+        bb_sf.unlink()
+
     try:
         _run_direct_quiet([seidr, "backbone", "-F", str(backbone), str(net_sf)], cwd=outdir, log_path=log_path)
         if bb_sf.exists():
@@ -280,7 +302,7 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
         pass
 
 
-def run_seidr(cfg: Config, force: bool = False) -> None:
+def run_seidr_single(cfg: Config, force: bool = False) -> None:
     opts = cfg.get_tool_opts("seidr")
     if not str(opts.get("enabled", False)).lower() == "true": return
 
@@ -344,3 +366,86 @@ def run_seidr_batch(cfg: Config, genes_file: Path, expression_file: Path, outdir
 
     for d in [p for p in outdir.glob("*-*-*-*") if p.is_dir()]:
         shutil.rmtree(d, ignore_errors=True)
+
+
+def run_seidr_aggregation(batch_dir: Path, cfg: Config) -> None:
+    """
+    Runs Seidr inference on a specific aggregation batch directory.
+    Uses a .seidr_done marker to skip execution if already completed.
+    """
+    # 1. Check if enabled
+    opts = cfg.get_tool_opts("seidr")
+    if not str(opts.get("enabled", False)).lower() == "true":
+        return
+
+    # 2. Resolve paths
+    batch_dir = batch_dir.resolve()
+    genes_file = batch_dir / "genes.txt"
+    expression_file = batch_dir / "expression.tsv"
+
+    # Restore actual logging path
+    log_path = batch_dir / "seidr.log"
+
+    marker = batch_dir / ".seidr_done"  # <--- MARKER FILE
+
+    if not genes_file.exists() or not expression_file.exists():
+        log(f"[Seidr] Skipping aggregation batch {batch_dir.name}: missing input files.", cfg.log)
+        return
+
+    # 3. Check for completion marker
+    force_run = bool(opts.get("force", False)) or cfg.force
+    if marker.exists() and not force_run:
+        log(f"[Seidr] Skipping batch {batch_dir.name} (found .seidr_done marker).", cfg.log)
+        return
+
+    # 4. Determine Algorithms / Preset
+    preset_name = opts.get("preset", "BALANCED").upper()
+    raw_algos = opts.get("algorithms")
+
+    if not raw_algos:
+        raw_algos = PRESETS.get(preset_name, PRESETS["BALANCED"])
+
+    if isinstance(raw_algos, str):
+        raw_algos = [x.strip() for x in raw_algos.split(",")]
+
+    algos = [str(a).upper() for a in raw_algos if str(a).strip()]
+
+    # 5. Resolve Binaries
+    try:
+        tools = _resolve_binaries(algos)
+    except RuntimeError as e:
+        log(f"[Seidr FATAL] {e}", cfg.log)
+        return
+
+    # 6. Config Parameters
+    workers = int(opts.get("workers", 4))
+    backbone_val = float(opts.get("backbone", 1.28))
+    agg_mode = opts.get("aggregate", "irp")
+
+    # 7. Run Task
+    log(f"[Seidr] Starting inference for aggregation batch: {batch_dir.name} (Preset: {preset_name})", cfg.log)
+
+    _build_network_task(
+        outdir=batch_dir,
+        genes_file=genes_file,
+        expression_file=expression_file,
+        threads=cfg.max_threads,
+        max_workers=workers,
+        backbone=backbone_val,
+        aggregate_mode=agg_mode,
+        algorithms=algos,
+        tools=tools,
+        label=batch_dir.name,
+        targeted=False,
+        target_file=None,
+        no_full=opts.get("no_full", False),
+        log_path=log_path,
+        force=force_run
+    )
+
+    # 8. Create Marker
+    try:
+        marker.touch()
+        log(f"[Seidr] Finished aggregation batch: {batch_dir.name}", cfg.log)
+    except Exception as e:
+        log(f"[Seidr] Warning: Could not create marker file for {batch_dir.name}: {e}", cfg.log)

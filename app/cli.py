@@ -761,6 +761,9 @@ def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sam
               help="Algorithm preset configuration.")
 @click.option("--algo", "algorithms", type=click.Choice(list(ALGO_MAP.keys()), case_sensitive=False),
               multiple=True, help="Manually select specific algorithms (overrides preset).")
+@click.option("--mode", type=click.Choice(["single", "aggregated", "both"], case_sensitive=False),
+              default=None, show_default="single",
+              help="Network construction mode: individual algorithms, aggregated consensus, or both.")
 @click.option("-b", "--backbone", type=float, default=None, show_default="1.28",
               help="Backbone significance threshold (Fdr).")
 @click.option("-w", "--workers", type=int, default=None, show_default="2",
@@ -771,11 +774,10 @@ def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sam
 @click.option("--target-mode", type=click.Choice(["both", "main_only", "targeted_only"]),
               default=None, show_default="targeted_only",
               help="Execution scope for targeted analysis.")
-# NEW FLAG: Saves preference only.
 @click.option("-f", "--force/--no-force", "force_setting", default=None,
               help="Persist a 'Force' preference. If True, Seidr always ignores cache.")
 @click.option("--reset-defaults", is_flag=True, help="Reset Seidr options to defaults.")
-def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, force_setting, reset_defaults):
+def seidr(enabled, preset, algorithms, mode, backbone, workers, targets, target_mode, force_setting, reset_defaults):
     """
     Configure defaults for the Seidr inference step.
     Use this to set up how networks are built when running 'hulk ...'.
@@ -800,11 +802,15 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
         seidr_cfg["algorithms"] = [a.upper() for a in algorithms]
         if "preset" in seidr_cfg: del seidr_cfg["preset"]
 
+    # Stored as a lowercase string: "single", "aggregated", or "both"
+    if mode:
+        seidr_cfg["mode"] = mode.lower()
+
     if backbone is not None: seidr_cfg["backbone"] = backbone
     if workers is not None: seidr_cfg["workers"] = workers
     if target_mode: seidr_cfg["target_mode"] = target_mode
 
-    # Save the force preference
+    # Save the force preference (Stored as a boolean)
     if force_setting is not None:
         seidr_cfg["force"] = force_setting
 
@@ -818,6 +824,7 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
     click.echo("\nCurrent Seidr Configuration:")
     click.echo(f"  Enabled:     {seidr_cfg.get('enabled', True)}")
     click.echo(f"  Force Mode:  {seidr_cfg.get('force', False)}")
+    click.echo(f"  Build Mode:  {seidr_cfg.get('mode', 'single')}")
     if "algorithms" in seidr_cfg:
         click.echo(f"  Algorithms:  {', '.join(seidr_cfg['algorithms'])}")
     else:
@@ -827,7 +834,6 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
     saved_targets = seidr_cfg.get("targets", [])
     if saved_targets:
         click.echo(f"  Default Targets: {len(saved_targets)} files")
-
 
 @cli.command("report", cls=HulkCommand,
              help="Regenerate (or generate snapshots while hulk is running) plots and matrices using saved settings.")
