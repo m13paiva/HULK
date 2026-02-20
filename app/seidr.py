@@ -63,7 +63,6 @@ def _resolve_binaries(needed_algos: List[str]) -> Dict[str, str]:
         raise RuntimeError(f"Missing Seidr binaries: {', '.join(missing)}")
     return resolved
 
-
 def _run_direct_quiet(cmd: List[str], cwd: Path, log_path: Path):
     """
     Runs a command, redirecting all stdout/stderr to the log file.
@@ -157,9 +156,18 @@ def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path
     numeric_cols = [c for c in df.columns if c not in ["Source", "Target"] and "interaction" not in c.lower()]
     for c in numeric_cols: df[c] = df[c].apply(_safe_float)
 
+    # The last column in a Seidr view is always the aggregated ensemble weight
     agg_col = df.columns[-1]
-    simple = df[["Source", "Target", agg_col]].copy().rename(columns={agg_col: "weight"})
-    simple["direction"] = df["Interaction"] if "Interaction" in df.columns else "Undirected"
+
+    # Strip the garbage and map strictly to the columns the JS expects
+    simple = df[["Source", "Target", agg_col]].copy().rename(columns={agg_col: "Weight"})
+
+    # Dynamically find the IRP score column, regardless of its suffix
+    irp_col = next((c for c in df.columns if "IRP" in c.upper()), None)
+    if irp_col:
+        simple["IRP_score"] = df[irp_col]
+
+    # Save the sanitized format for the frontend
     simple.to_csv(outdir / f"network_{label}_edges.tsv", sep="\t", index=False)
 
     keepers = ["Source", "Target"]
@@ -201,40 +209,45 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
             current_fmt = "el" if targeted else default_fmt
 
             out_tsv = outdir / f"{prefix}{algo.lower()}_scores.tsv"
+            out_sf = outdir / f"{prefix}{algo.lower()}_scores.sf"
 
-            # <--- THE FIX: Skip running the binary if the output already exists and we aren't forcing
-            if out_tsv.exists() and not force:
-                print(f"[Seidr] {algo} TSV already exists. Skipping calculation.", flush=True)
+            # <--- THE REAL FIX: Check for the completed .sf file, not the intermediate .tsv
+            if out_sf.exists() and not force:
+                print(f"[Seidr] {algo} network already exists (.sf found). Skipping calculation.", flush=True)
+                return out_sf
+
+            # If we are here, we need to compute.
+            # We MUST nuke any half-written trash from previous OOM crashes or Seidr will panic.
+            if out_tsv.exists():
+                out_tsv.unlink()
+            if out_sf.exists():
+                out_sf.unlink()
+
+            cmd = [tools[bin_name], "-i", str(expression_file), "-g", str(genes_file), "-o", str(out_tsv)]
+            if m_flag: cmd.extend([m_flag, m_val])
+
+            if bin_name not in ["correlation", "pcor"]:
+                cmd.extend(["-O", str(threads)])
             else:
-                # If we are forcing, we must delete the old file, or Seidr will crash
-                if force and out_tsv.exists():
-                    out_tsv.unlink()
+                cmd.append("--no-scale")
 
-                cmd = [tools[bin_name], "-i", str(expression_file), "-g", str(genes_file), "-o", str(out_tsv)]
-                if m_flag: cmd.extend([m_flag, m_val])
+            if targeted:
+                cmd.insert(1, "-t")
+                cmd.insert(2, str(target_file))
 
-                if bin_name not in ["correlation", "pcor"]:
-                    cmd.extend(["-O", str(threads)])
-                else:
-                    cmd.append("--no-scale")
+            if algo in ["CLR", "ARACNE"]:
+                if not prerequisite_file or not prerequisite_file.exists():
+                    print(f"[Seidr ERROR] {algo} missing prerequisite.", file=sys.stderr)
+                    return None
+                cmd.extend(["-M", str(prerequisite_file.resolve())])
 
-                if targeted:
-                    cmd.insert(1, "-t");
-                    cmd.insert(2, str(target_file))
+            # Minimal console output
+            print(f"[Seidr] Running {algo}...")
 
-                if algo in ["CLR", "ARACNE"]:
-                    if not prerequisite_file or not prerequisite_file.exists():
-                        print(f"[Seidr ERROR] {algo} missing prerequisite.", file=sys.stderr)
-                        return None
-                    cmd.extend(["-M", str(prerequisite_file.resolve())])
+            # Heavy output goes to log file
+            _run_direct_quiet(cmd, cwd=outdir, log_path=log_path)
 
-                # Minimal console output
-                print(f"[Seidr] Running {algo}...")
-
-                # Heavy output goes to log file
-                _run_direct_quiet(cmd, cwd=outdir, log_path=log_path)
-
-            # Always run import to ensure we have the .sf file.
+            # Import the freshly calculated TSV into SF
             return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, current_fmt, threads, log_path)
 
         except Exception as e:

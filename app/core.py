@@ -163,7 +163,7 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
 
     if seidr_mode in ("aggregated", "both"):
         log("[Seidr] Aggregated mode enabled; monitor thread will trigger batch inference.", log_path)
-        
+
         # End of pipeline
     log("Pipeline finished.", log_path)
 

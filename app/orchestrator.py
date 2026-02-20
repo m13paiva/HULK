@@ -1,3 +1,5 @@
+# orchestrator.py
+
 from __future__ import annotations
 
 import math
@@ -127,18 +129,44 @@ def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: floa
 
     # Track which bars are finished and closed to stop updating them
     closed_bars = set()
-
     # --- BATCH LOGIC INITIALIZATION ---
-    # Only organize batches if we are in 'aggregated' or 'both' mode.
-    # Defaults to 'single' if missing.
-    seidr_mode = getattr(cfg, "seidr_construction_mode", "single")
+    opts = cfg.get_tool_opts("seidr") if hasattr(cfg, "get_tool_opts") else {}
+
+    # ---------------------------------------------------------
+    # DEBUG: FORCE THE PIPELINE TO CONFESS ITS SECRETS
+    # ---------------------------------------------------------
+    print(f"\n{'!' * 50}", flush=True)
+    print(f"[DEBUG] Seidr opts dictionary loaded: {opts}", flush=True)
+    print(f"[DEBUG] cfg.seidr_construction_mode: {getattr(cfg, 'seidr_construction_mode', 'MISSING')}", flush=True)
+    print(f"[DEBUG] cfg.seidr_constrution_mode (typo): {getattr(cfg, 'seidr_constrution_mode', 'MISSING')}", flush=True)
+    print(f"{'!' * 50}\n", flush=True)
+    # ---------------------------------------------------------
+
+    # Brute-force search for the mode. We will check the dictionary first, then the global config.
+    search_locations = [
+        opts.get("mode"),
+        opts.get("build_mode"),
+        opts.get("construction_mode"),
+        getattr(cfg, "seidr_construction_mode", None),
+        getattr(cfg, "seidr_constrution_mode", None)
+    ]
+
+    seidr_mode = "single"  # Default fallback
+    for val in search_locations:
+        if val and str(val).lower().strip() in ["aggregated", "both", "single"]:
+            seidr_mode = str(val).lower().strip()
+            break  # Stop at the first valid setting we find
 
     batches = []
     if seidr_mode in ("aggregated", "both"):
         batches = bp_seidr_batches(dataset, min_samples=50)
         if batches:
             log(f"[monitor] Organized {len(batches)} batches for aggregated Seidr inference.", cfg.log)
-
+        else:
+            log(f"[monitor] WARNING: Mode is '{seidr_mode}', but bp_seidr_batches returned 0 batches. Check your min_samples limit.",
+                cfg.log)
+    else:
+        log(f"[monitor] Skipping batch logic entirely. Mode is set to: '{seidr_mode}'", cfg.log)
     processed_batches = set()
 
     # -------------------------------
