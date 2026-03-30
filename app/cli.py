@@ -955,7 +955,7 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
 
 
 @cli.command("saturation", cls=HulkCommand,
-             help="Run data saturation analysis: Subsampling -> Seidr -> EGAD (AUROC).")
+             help="Run data saturation analysis: Subsampling -> Seidr -> EGAD (AUROC/AUPR).")
 @click.option("-o", "--output", "output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
               default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
 @click.option("-i", "--iterations", type=int, default=10, show_default=True,
@@ -973,22 +973,27 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
 @click.option("-f", "--force", is_flag=True, help="Force re-calculation of batches/networks.")
 @click.option("-m", "--mapman", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="MapMan annotation file for EGAD.")
-def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threads, force, mapman):
+@click.option("--metrics", type=click.Choice(['auroc', 'aupr', 'both'], case_sensitive=False),
+              default='both', show_default=True, help="Which EGAD metrics to calculate.")
+@click.option("--plot-only", is_flag=True, help="Skip processing and only regenerate plots from existing raw results.")
+def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threads, force, mapman, metrics, plot_only):
     """
     Performs a data saturation analysis to assess network reconstruction quality.
 
     \b
     1. Generates balanced BioProject batches (defined by --steps).
     2. Runs Seidr network inference.
-    3. (If --mapman provided) Runs EGAD to calculate AUROC.
+    3. (If --mapman provided) Runs EGAD to calculate the requested metrics.
     """
     click.secho("\n[Saturation] Initializing Data Saturation Analysis...", fg="cyan", bold=True)
-    click.secho(f"[Saturation] Seidr: {seidr_preset} | Steps: {steps} | Iters: {iterations} | Force: {force}", fg="cyan")
+    click.secho(
+        f"[Saturation] Seidr: {seidr_preset} | Steps: {steps} | Iters: {iterations} | Force: {force} | Plot Only: {plot_only} | Metrics: {metrics.upper()}",
+        fg="cyan")
 
     if seed: click.secho(f"[Saturation] Seed: {seed}", fg="magenta")
 
     try:
-        cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=False)
+        cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only)
         cfg.seidr_preset = seidr_preset.upper()
 
         dataset = Dataset.reconstruct_from_output(cfg)
@@ -999,6 +1004,7 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
         return
 
     try:
+        # Note: This will instantly crash until you let me fix BatchOrchestrator
         orch = BatchOrchestrator(
             dataset, cfg,
             seed=seed,
@@ -1006,9 +1012,25 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
             max_threads=threads,
             mapman_file=mapman,
             force=force,
-            num_steps=steps
+            num_steps=steps,
+            metrics=metrics.lower()
         )
         orch.iterations = iterations
+
+        if plot_only:
+            import pandas as pd
+            raw_file = orch.base_outdir / "saturation_results_raw.tsv"
+
+            if not raw_file.exists():
+                click.secho(f"[Error] Cannot plot. Missing {raw_file}. Did you even run it completely once?", fg="red")
+                return
+
+            click.secho(f"[Saturation] Plot-only mode active. Reading {raw_file}...", fg="yellow")
+            results_dicts = pd.read_csv(raw_file, sep="\t").to_dict('records')
+            orch._generate_plots(results_dicts)
+            click.secho("\n[Saturation] Plotting complete.", fg="green")
+            return
+
         orch.run()
 
         click.secho("\n[Saturation] Analysis complete.", fg="green")
@@ -1025,7 +1047,11 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
               default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
 @click.option("-m", "--mapman", "mapman_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               required=True, help="MapMan annotation file for EGAD.")
-def evaluate(output_dir, mapman_path):
+@click.option("--metrics", type=click.Choice(['auroc', 'aupr', 'both'], case_sensitive=False),
+              default='both', show_default=True, help="Which EGAD metrics to calculate.")
+@click.option("-n", "--network", "custom_network", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="Optional custom edges .tsv table (Source, Target, weight).")
+def evaluate(output_dir, mapman_path, metrics, custom_network):
     """
     Evaluates the primary consensus network using MapMan functional annotations.
     Delegates execution and output to the EGAD vocal wrapper.
@@ -1038,8 +1064,13 @@ def evaluate(output_dir, mapman_path):
         # Standard config loading
         cfg = Config(outdir=output_dir, plots_only_mode=True)
 
-        # Execute using the vocal wrapper (no 'force' passed here as requested)
-        run_vocal_evaluation(cfg, mapman_path)
+        # Execute using the vocal wrapper
+        run_vocal_evaluation(
+            cfg,
+            mapman_path,
+            metrics=metrics.lower(),
+            custom_network=custom_network
+        )
 
     except Exception as e:
         click.secho(f"[Error] Evaluation failed: {e}", fg="red")

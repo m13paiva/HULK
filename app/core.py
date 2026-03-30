@@ -10,7 +10,7 @@ from .qc import run_multiqc_global
 from .entities import Config, Dataset
 from .orchestrator import run_download_and_process
 from .post_processing import run_postprocessing as run__postprocessing
-from .seidr import run_seidr_single
+from .seidr import run_seidr_single, run_seidr_aggregation
 
 def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
     """
@@ -124,6 +124,12 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         for s in getattr(data, "samples", []):
             log(f"[PLAN] FASTQ sample {s.id} -> {s.outdir}", log_path)
 
+    opts = cfg.get_tool_opts("seidr") if hasattr(cfg, "get_tool_opts") else {}
+    seidr_mode = opts.get("mode", opts.get("construction_mode", getattr(cfg, "seidr_construction_mode", "both")))
+    seidr_mode = str(seidr_mode).lower().strip()
+
+
+
     # Run orchestrator (prefetch + processing) — uses cfg internally (incl. bootstraps)
     run_download_and_process(
         dataset=data,
@@ -162,7 +168,8 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
             log_err(cfg.error_warnings, log_path, f"[Seidr] Single Network pipeline failed: {e}")
 
     if seidr_mode in ("aggregated", "both"):
-        log("[Seidr] Aggregated mode enabled; monitor thread will trigger batch inference.", log_path)
+        log("[Seidr] Initiating final aggregation of batch networks...", log_path)
+        run_seidr_aggregation(cfg)
 
         # End of pipeline
     log("Pipeline finished.", log_path)

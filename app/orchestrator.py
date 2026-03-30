@@ -19,7 +19,7 @@ from .processor import process
 from .cache_manager import CacheGate
 from .qc import run_multiqc, build_bp_metrics
 from .post_processing import run_postprocessing_bp, run_postprocessing_batch
-from .seidr import run_seidr_aggregation
+from .seidr import run_seidr_agg_batch
 
 
 def force_test_seidr_aggregation(cfg: "Config") -> None:
@@ -282,7 +282,7 @@ def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: floa
 
                         # --- TRIGGER SEIDR INFERENCE ---
                         try:
-                            run_seidr_aggregation(batch_dir, cfg)
+                            run_seidr_agg_batch(batch_dir, cfg)
                         except Exception as e:
                             log_err(cfg.error_warnings, cfg.log, f"[batch-monitor] Seidr failed for batch {idx}: {e}")
 

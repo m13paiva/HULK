@@ -8,7 +8,7 @@ import concurrent.futures
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import pandas as pd
-
+import numpy as np
 from .entities import Config
 from .utils import log
 
@@ -381,7 +381,7 @@ def run_seidr_batch(cfg: Config, genes_file: Path, expression_file: Path, outdir
         shutil.rmtree(d, ignore_errors=True)
 
 
-def run_seidr_aggregation(batch_dir: Path, cfg: Config) -> None:
+def run_seidr_agg_batch(batch_dir: Path, cfg: Config) -> None:
     """
     Runs Seidr inference on a specific aggregation batch directory.
     Uses a .seidr_done marker to skip execution if already completed.
@@ -462,3 +462,169 @@ def run_seidr_aggregation(batch_dir: Path, cfg: Config) -> None:
         log(f"[Seidr] Finished aggregation batch: {batch_dir.name}", cfg.log)
     except Exception as e:
         log(f"[Seidr] Warning: Could not create marker file for {batch_dir.name}: {e}", cfg.log)
+
+
+def run_seidr_aggregation(cfg: Config) -> None:
+    """
+    Bypasses the Seidr C++ aggregator.
+    Implements Sample-Size Weighted Mean with Fractional Node (25%)
+    and Edge (10%) Thresholding.
+    """
+    import numpy as np
+    import pandas as pd
+
+    opts = cfg.get_tool_opts("seidr")
+    if not str(opts.get("enabled", False)).lower() == "true":
+        return
+
+    aggregated_dir = cfg.shared / "seidr" / "aggregated"
+    if not aggregated_dir.exists():
+        print("[Seidr Meta] No aggregated batch directory found. Skipping meta-aggregation.")
+        return
+
+    # Find all batch directories that actually have an exported TSV
+    batch_tsvs = list(aggregated_dir.rglob("network_*_edges.tsv"))
+    batch_tsvs = [f for f in batch_tsvs if "meta" not in f.name]
+
+    if not batch_tsvs:
+        print("[Seidr Meta] No batch TSV networks found.")
+        return
+
+    num_batches = len(batch_tsvs)
+    if num_batches == 1:
+        print("[Seidr Meta] Only 1 batch network found. Skipping.")
+        return
+
+    meta_outdir = cfg.shared / "seidr" / "meta_aggregated"
+    meta_outdir.mkdir(parents=True, exist_ok=True)
+    meta_edges_out = meta_outdir / "network_meta_edges.tsv"
+
+    force_run = bool(opts.get("force", False)) or getattr(cfg, "force", False)
+
+    if meta_edges_out.exists() and not force_run:
+        print("[Seidr Meta] Meta-network TSV already exists. Skipping calculation.")
+        return
+
+    print(f"[Seidr Meta] Executing Sample-Weighted Meta-Aggregation across {num_batches} batches...")
+
+    # --- STEP 1 & 2: Sample Census and Core Node Election (25% Threshold) ---
+    node_threshold = max(1, int(num_batches * 0.50))
+    edge_threshold = max(1, int(num_batches * 0.25))
+
+    print(
+        f"[Seidr Meta] Thresholds - Nodes: >= {node_threshold} batches (25%). Edges: >= {edge_threshold} batches (10%).")
+
+    gene_counts = {}
+    batch_weights = {}
+
+    for tsv in batch_tsvs:
+        batch_dir = tsv.parent
+
+        # 1. Sample Census
+        expr_file = batch_dir / "expression.tsv"
+        samples = 1  # Default to 1 if we can't find it to prevent division by zero
+        if expr_file.exists():
+            try:
+                with open(expr_file, 'r') as f:
+                    header = f.readline()
+                    # Counting columns minus the gene ID column
+                    samples = max(1, len(header.split('\t')) - 1)
+            except Exception as e:
+                print(f"[Seidr Meta Warning] Could not read samples from {expr_file.name}: {e}")
+        batch_weights[tsv] = samples
+
+        # 2. Node Election
+        genes_file = batch_dir / "genes.txt"
+        if genes_file.exists():
+            try:
+                with open(genes_file, 'r') as f:
+                    for line in f:
+                        g = line.strip()
+                        if g:
+                            gene_counts[g] = gene_counts.get(g, 0) + 1
+            except Exception as e:
+                print(f"[Seidr Meta Warning] Could not read {genes_file.name}: {e}")
+
+    core_nodes = {g for g, count in gene_counts.items() if count >= node_threshold}
+    print(f"[Seidr Meta] Elected {len(core_nodes)} Core Nodes out of {len(gene_counts)} total unique genes.")
+
+    if len(core_nodes) < 2:
+        print("[Seidr Meta ERROR] Not enough core nodes survived the 25% threshold. Aborting.")
+        return
+
+    # Write core nodes to file
+    with open(meta_outdir / "meta_genes.txt", "w") as f:
+        for g in sorted(core_nodes):
+            f.write(f"{g}\n")
+
+    # --- STEP 3 & 4: Edge Purge and Sample-Weighted Math ---
+    df_list = []
+    for tsv in batch_tsvs:
+        try:
+            df = pd.read_csv(tsv, sep="\t")
+            col_map = {c.lower(): c for c in df.columns}
+
+            if "weight" not in col_map:
+                print(f"[Seidr Meta Warning] Skipping {tsv.name}: Missing 'weight' column.")
+                continue
+
+            w_col = col_map["weight"]
+            df = df[["Source", "Target", w_col]].copy()
+            df.rename(columns={w_col: "weight"}, inplace=True)
+
+            # Purge non-core nodes
+            df = df[df["Source"].isin(core_nodes) & df["Target"].isin(core_nodes)].copy()
+
+            if df.empty:
+                continue
+
+            # Alphabetical sort
+            nodes = np.sort(df[["Source", "Target"]].values, axis=1)
+            df["Source"] = nodes[:, 0]
+            df["Target"] = nodes[:, 1]
+
+            # Apply sample weight
+            samples = batch_weights[tsv]
+            df["weight_x_samples"] = df["weight"] * samples
+            df["sample_count"] = samples
+
+            df_list.append(df)
+        except Exception as e:
+            print(f"[Seidr Meta ERROR] Failed to process {tsv.name}: {e}")
+
+    if not df_list:
+        print("[Seidr Meta ERROR] No edges survived the core node purge. Aborting.")
+        return
+
+    print("[Seidr Meta] Concatenating and applying 10% Edge Purge...")
+    try:
+        mega_df = pd.concat(df_list, ignore_index=True)
+
+        meta_df = mega_df.groupby(["Source", "Target"]).agg(
+            Sum_WxS=("weight_x_samples", "sum"),
+            Sum_Samples=("sample_count", "sum"),
+            Batch_Count=("weight", "count")
+        ).reset_index()
+
+        # Edge Purge (10%)
+        initial_edges = len(meta_df)
+        meta_df = meta_df[meta_df["Batch_Count"] >= edge_threshold].copy()
+        print(
+            f"[Seidr Meta] Purged {initial_edges - len(meta_df)} edges failing the 10% threshold (>= {edge_threshold} batches).")
+
+        if meta_df.empty:
+            print("[Seidr Meta ERROR] No edges survived the frequency threshold. Aborting.")
+            return
+
+        # Final Math: Sample-Weighted Mean
+        meta_df["Weighted_Mean"] = (meta_df["Sum_WxS"] / meta_df["Sum_Samples"]).round(5)
+
+        meta_df = meta_df[["Source", "Target", "Weighted_Mean", "Batch_Count"]]
+
+        print(f"[Seidr Meta] Writing {len(meta_df)} final edges to {meta_edges_out.name}...")
+        meta_df.to_csv(meta_edges_out, sep="\t", index=False)
+
+        print("[Seidr Meta] Success. The biologically questionable meta-network is complete.")
+
+    except Exception as e:
+        print(f"[Seidr Meta ERROR] Pandas math failed: {e}")

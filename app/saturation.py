@@ -26,7 +26,8 @@ class BatchOrchestrator:
                  max_threads: Optional[int] = None,
                  mapman_file: Optional[Path] = None,
                  force: bool = False,
-                 num_steps: int = 10):
+                 num_steps: int = 10,
+                 metrics: str = "both"):
         self.dataset = dataset
         self.config = config
         self.seed = seed
@@ -34,6 +35,9 @@ class BatchOrchestrator:
         self.mapman_file = mapman_file
         self.force = force
         self.num_steps = num_steps
+
+        self.do_auroc = metrics.lower() in ["both", "auroc"]
+        self.do_aupr = metrics.lower() in ["both", "aupr"]
 
         if max_threads is not None:
             self.total_thread_budget = max_threads
@@ -103,35 +107,26 @@ class BatchOrchestrator:
         df = pd.DataFrame(results)
         df.to_csv(self.base_outdir / "saturation_results_raw.tsv", sep="\t", index=False)
 
-        agg = df.groupby("n_bps").agg(
-            auc_mean=("auc", "mean"),
-            auc_std=("auc", "std"),
-            samples_mean=("n_samples", "mean"),
-            samples_std=("n_samples", "std")
-        ).reset_index().fillna(0)
+        # Dynamic aggregation based on metrics available
+        agg_dict = {"n_samples": ["mean", "std"]}
+        if self.do_auroc and "auc" in df.columns:
+            agg_dict["auc"] = ["mean", "std"]
+        if self.do_aupr and "aupr" in df.columns:
+            agg_dict["aupr"] = ["mean", "std"]
 
+        agg = df.groupby("n_bps").agg(agg_dict).reset_index().fillna(0)
+
+        # Flatten multi-level columns properly for dynamic generation
+        agg.columns = ['_'.join(col).strip('_') for col in agg.columns.values]
         agg.to_csv(self.base_outdir / "saturation_results_summary.tsv", sep="\t", index=False)
 
-        color_auc, color_err, color_samp = '#2c3e50', '#e74c3c', '#27ae60'
+        color_auc, color_aupr, color_err, color_samp = '#2c3e50', '#8e44ad', '#e74c3c', '#d35400'
 
+        # 1. Single Sample Accumulation Plot
         try:
             plt.figure(figsize=(8, 6))
-            plt.plot(agg["n_bps"], agg["auc_mean"], color=color_auc, linewidth=2, marker='o')
-            plt.errorbar(agg["n_bps"], agg["auc_mean"], yerr=agg["auc_std"], fmt='none', ecolor=color_err, capsize=3)
-            plt.title("Performance vs BioProject Count")
-            plt.xlabel("Number of BioProjects")
-            plt.ylabel("Mean AUROC")
-            plt.grid(True, linestyle='--', alpha=0.6)
-            plt.tight_layout()
-            plt.savefig(self.base_outdir / "saturation_auroc.pdf")
-            plt.close()
-        except Exception as e:
-            print(f"[Plot Error 1] {e}")
-
-        try:
-            plt.figure(figsize=(8, 6))
-            plt.plot(agg["n_bps"], agg["samples_mean"], color=color_samp, linewidth=2, marker='s')
-            plt.errorbar(agg["n_bps"], agg["samples_mean"], yerr=agg["samples_std"], fmt='none', ecolor='black',
+            plt.plot(agg["n_bps"], agg["n_samples_mean"], color=color_samp, linewidth=2, marker='s')
+            plt.errorbar(agg["n_bps"], agg["n_samples_mean"], yerr=agg["n_samples_std"], fmt='none', ecolor='black',
                          capsize=3)
             plt.title("Sample Accumulation vs BioProject Count")
             plt.xlabel("Number of BioProjects")
@@ -141,26 +136,115 @@ class BatchOrchestrator:
             plt.savefig(self.base_outdir / "saturation_samples.pdf")
             plt.close()
         except Exception as e:
-            print(f"[Plot Error 2] {e}")
+            print(f"[Plot Error - Samples] {e}")
 
-        try:
-            fig, ax1 = plt.subplots(figsize=(10, 6))
-            ax1.set_xlabel('Number of BioProjects')
-            ax1.set_ylabel('Mean AUROC', color=color_auc)
-            ax1.plot(agg["n_bps"], agg["auc_mean"], color=color_auc, linewidth=2, marker='o', label="AUROC")
-            ax1.tick_params(axis='y', labelcolor=color_auc)
-            ax2 = ax1.twinx()
-            ax2.set_ylabel('Mean Samples', color=color_samp)
-            ax2.plot(agg["n_bps"], agg["samples_mean"], color=color_samp, linewidth=2, linestyle='--', marker='s',
-                     label="Samples")
-            ax2.tick_params(axis='y', labelcolor=color_samp)
-            plt.title("Saturation Analysis Summary")
-            fig.tight_layout()
-            plt.savefig(self.base_outdir / "saturation_combined.pdf")
-            plt.close()
-        except Exception as e:
-            print(f"[Plot Error 3] {e}")
+        # 2. AUROC Plots
+        if self.do_auroc and "auc_mean" in agg.columns:
+            try:
+                plt.figure(figsize=(8, 6))
+                plt.plot(agg["n_bps"], agg["auc_mean"], color=color_auc, linewidth=2, marker='o')
+                plt.errorbar(agg["n_bps"], agg["auc_mean"], yerr=agg["auc_std"], fmt='none', ecolor=color_err,
+                             capsize=3)
+                plt.title("Performance vs BioProject Count (AUROC)")
+                plt.xlabel("Number of BioProjects")
+                plt.ylabel("Mean AUROC")
+                plt.grid(True, linestyle='--', alpha=0.6)
+                plt.tight_layout()
+                plt.savefig(self.base_outdir / "saturation_auroc.pdf")
+                plt.close()
+
+                fig, ax1 = plt.subplots(figsize=(10, 6))
+                ax1.set_xlabel('Number of BioProjects')
+                ax1.set_ylabel('Mean AUROC', color=color_auc)
+                line1 = ax1.plot(agg["n_bps"], agg["auc_mean"], color=color_auc, linewidth=2, marker='o', label="AUROC")
+                ax1.errorbar(agg["n_bps"], agg["auc_mean"], yerr=agg["auc_std"], fmt='none', ecolor=color_err,
+                             capsize=3)
+                ax1.tick_params(axis='y', labelcolor=color_auc)
+
+                ax2 = ax1.twinx()
+                ax2.set_ylabel('Mean Samples', color=color_samp)
+                line2 = ax2.plot(agg["n_bps"], agg["n_samples_mean"], color=color_samp, linewidth=2, linestyle='--',
+                                 marker='s', label="Samples")
+                ax2.errorbar(agg["n_bps"], agg["n_samples_mean"], yerr=agg["n_samples_std"], fmt='none', ecolor='black',
+                             capsize=3)
+                ax2.tick_params(axis='y', labelcolor=color_samp)
+
+                plt.title("Saturation Analysis Summary (AUROC)")
+                lines = line1 + line2
+                labels = [l.get_label() for l in lines]
+                ax1.legend(lines, labels, loc='best')
+
+                fig.tight_layout()
+                plt.savefig(self.base_outdir / "saturation_combined_auroc.pdf")
+                plt.close()
+            except Exception as e:
+                print(f"[Plot Error - AUROC] {e}")
+
+        # 3. AUPR Plots
+        if self.do_aupr and "aupr_mean" in agg.columns:
+            try:
+                plt.figure(figsize=(8, 6))
+                plt.plot(agg["n_bps"], agg["aupr_mean"], color=color_aupr, linewidth=2, marker='^')
+                plt.errorbar(agg["n_bps"], agg["aupr_mean"], yerr=agg["aupr_std"], fmt='none', ecolor=color_err,
+                             capsize=3)
+                plt.title("Performance vs BioProject Count (AUPR)")
+                plt.xlabel("Number of BioProjects")
+                plt.ylabel("Mean AUPR")
+                plt.grid(True, linestyle='--', alpha=0.6)
+                plt.tight_layout()
+                plt.savefig(self.base_outdir / "saturation_aupr.pdf")
+                plt.close()
+
+                fig, ax1 = plt.subplots(figsize=(10, 6))
+                ax1.set_xlabel('Number of BioProjects')
+                ax1.set_ylabel('Mean AUPR', color=color_aupr)
+                line1 = ax1.plot(agg["n_bps"], agg["aupr_mean"], color=color_aupr, linewidth=2, marker='^',
+                                 label="AUPR")
+                ax1.errorbar(agg["n_bps"], agg["aupr_mean"], yerr=agg["aupr_std"], fmt='none', ecolor=color_err,
+                             capsize=3)
+                ax1.tick_params(axis='y', labelcolor=color_aupr)
+
+                ax2 = ax1.twinx()
+                ax2.set_ylabel('Mean Samples', color=color_samp)
+                line2 = ax2.plot(agg["n_bps"], agg["n_samples_mean"], color=color_samp, linewidth=2, linestyle='--',
+                                 marker='s', label="Samples")
+                ax2.errorbar(agg["n_bps"], agg["n_samples_mean"], yerr=agg["n_samples_std"], fmt='none', ecolor='black',
+                             capsize=3)
+                ax2.tick_params(axis='y', labelcolor=color_samp)
+
+                plt.title("Saturation Analysis Summary (AUPR)")
+                lines = line1 + line2
+                labels = [l.get_label() for l in lines]
+                ax1.legend(lines, labels, loc='best')
+
+                fig.tight_layout()
+                plt.savefig(self.base_outdir / "saturation_combined_aupr.pdf")
+                plt.close()
+            except Exception as e:
+                print(f"[Plot Error - AUPR] {e}")
+
         print(f"\n[Saturation] Plots updated in {self.base_outdir}")
+
+    def regenerate_plots_from_raw(self):
+        raw_file = self.base_outdir / "saturation_results_raw.tsv"
+        if not raw_file.exists():
+            print(f"[Error] Cannot plot. Missing {raw_file}. Did you even run it completely once?")
+            return
+        try:
+            print(f"[Saturation] Plot-only mode active. Reading {raw_file}...")
+            df = pd.read_csv(raw_file, sep="\t")
+
+            required_cols = ["n_bps", "n_samples"]
+            if self.do_auroc: required_cols.append("auc")
+            if self.do_aupr: required_cols.append("aupr")
+
+            if not all(col in df.columns for col in required_cols):
+                print(
+                    f"[Error] The file {raw_file} is malformed. Missing required columns based on your metrics request.")
+                return
+            self._generate_plots(df.to_dict('records'))
+        except Exception as e:
+            print(f"[Error] Failed to read {raw_file}: {e}")
 
     def run(self):
         if self.force and self.base_outdir.exists():
@@ -210,10 +294,11 @@ class BatchOrchestrator:
                 e_path = global_expr if n_bps == total_bps else iter_dir / "expression.tsv"
 
                 seidr_queue.append((g_path, e_path, iter_dir, s_name, iter_num))
+
                 egad_queue.append({
                     "n_bps": n_bps, "iter": iter_num, "dir": iter_dir,
                     "net": iter_dir / "network_saturation_edges.tsv",
-                    "out": iter_dir / "egad_auroc.tsv", "expr": e_path
+                    "out": iter_dir / "egad_results.tsv", "expr": e_path
                 })
 
                 if n_bps < total_bps:
@@ -264,25 +349,81 @@ class BatchOrchestrator:
         if self.mapman_file:
             print(f"\n[Phase 3] EGAD Analysis...")
             r_script = get_egad_script_path()
-            egad_tasks = [item for item in egad_queue if
-                          item["net"].exists() and (self.force or not item["out"].exists())]
+
+            egad_tasks = []
             for item in egad_queue:
+                # 1. FIRST, check if we already have the valid output
                 if not self.force and item["out"].exists():
                     try:
-                        auc = pd.read_csv(item["out"], sep="\t")["AUC"].mean()
-                        final_results.append({'n_bps': item['n_bps'], 'iter': item['iter'], 'auc': auc,
-                                              'n_samples': self._count_samples_from_file(item["expr"])})
-                    except:
-                        pass
+                        df_check = pd.read_csv(item["out"], sep="\t")
+                        valid = True
+                        auc_val, aupr_val = None, None
+
+                        if self.do_auroc:
+                            if "AUC" not in df_check.columns or df_check.empty:
+                                valid = False
+                            else:
+                                auc_val = df_check["AUC"].mean()
+
+                        if self.do_aupr:
+                            if "AUPR" not in df_check.columns or df_check.empty:
+                                valid = False
+                            else:
+                                aupr_val = df_check["AUPR"].mean()
+
+                        if valid:
+                            res_dict = {
+                                'n_bps': item['n_bps'],
+                                'iter': item['iter'],
+                                'n_samples': self._count_samples_from_file(item["expr"])
+                            }
+                            if self.do_auroc: res_dict['auc'] = auc_val
+                            if self.do_aupr: res_dict['aupr'] = aupr_val
+                            final_results.append(res_dict)
+                            continue  # Safely move to the next item, we don't need the network!
+                        else:
+                            print(f"[Warn] Output {item['out']} is missing requested metrics. Re-queueing.")
+                    except Exception as e:
+                        print(f"[Warn] Corrupted EGAD output at {item['out']} ({e}). Re-queueing.")
+
+                # 2. THEN, if we actually need to calculate it, check if the network exists
+                if not item["net"].exists():
+                    continue  # Can't evaluate a network that failed to generate
+
+                # 3. If we made it here, the output is missing/bad AND the network exists. Queue it.
+                egad_tasks.append(item)
+
             if egad_tasks:
                 with tqdm(total=len(egad_queue), initial=len(egad_queue) - len(egad_tasks), desc="EGAD Eval") as p_egad:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
-                        f_map = {executor.submit(run_egad_task, i["net"], self.mapman_file, i["out"], r_script,
-                                                 i["dir"] / "egad.log"): i for i in egad_tasks}
+
+                        f_map = {
+                            executor.submit(
+                                run_egad_task,
+                                network_file=i["net"],
+                                mapman_file=self.mapman_file,
+                                out_file=i["out"],
+                                script_path=r_script,
+                                log_path=i["dir"] / "egad.log",
+                                curves_prefix=None,  # Explicitly no curves requested for saturation
+                                do_auroc=self.do_auroc,
+                                do_aupr=self.do_aupr
+                            ): i for i in egad_tasks
+                        }
+
                         for f in concurrent.futures.as_completed(f_map):
-                            it, res = f_map[f], f.result()
-                            if res is not None:
-                                final_results.append({'n_bps': it['n_bps'], 'iter': it['iter'], 'auc': res,
-                                                      'n_samples': self._count_samples_from_file(it["expr"])})
+                            it = f_map[f]
+                            res_auc, res_aupr = f.result()
+
+                            if res_auc is not None or res_aupr is not None:
+                                res_dict = {
+                                    'n_bps': it['n_bps'],
+                                    'iter': it['iter'],
+                                    'n_samples': self._count_samples_from_file(it["expr"])
+                                }
+                                if self.do_auroc and res_auc is not None: res_dict['auc'] = res_auc
+                                if self.do_aupr and res_aupr is not None: res_dict['aupr'] = res_aupr
+                                final_results.append(res_dict)
                             p_egad.update(1)
+
             self._generate_plots(final_results)
