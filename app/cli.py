@@ -973,17 +973,19 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
 @click.option("-f", "--force", is_flag=True, help="Force re-calculation of batches/networks.")
 @click.option("-m", "--mapman", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="MapMan annotation file for EGAD.")
+@click.option("-g", "--go-file", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="BioMart GO export file (TSV) for EGAD.")
 @click.option("--metrics", type=click.Choice(['auroc', 'aupr', 'both'], case_sensitive=False),
               default='both', show_default=True, help="Which EGAD metrics to calculate.")
 @click.option("--plot-only", is_flag=True, help="Skip processing and only regenerate plots from existing raw results.")
-def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threads, force, mapman, metrics, plot_only):
+def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threads, force, mapman, go_file, metrics, plot_only):
     """
     Performs a data saturation analysis to assess network reconstruction quality.
 
     \b
     1. Generates balanced BioProject batches (defined by --steps).
     2. Runs Seidr network inference.
-    3. (If --mapman provided) Runs EGAD to calculate the requested metrics.
+    3. (If mapman or go-file provided) Runs EGAD to calculate the requested metrics.
     """
     click.secho("\n[Saturation] Initializing Data Saturation Analysis...", fg="cyan", bold=True)
     click.secho(
@@ -993,7 +995,8 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
     if seed: click.secho(f"[Saturation] Seed: {seed}", fg="magenta")
 
     try:
-        cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only)
+        # Pass the annotation files to Config so they are centrally stored
+        cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only, mapman_file=mapman, go_file=go_file)
         cfg.seidr_preset = seidr_preset.upper()
 
         dataset = Dataset.reconstruct_from_output(cfg)
@@ -1011,6 +1014,7 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
             workers=workers,
             max_threads=threads,
             mapman_file=mapman,
+            go_file=go_file,
             force=force,
             num_steps=steps,
             metrics=metrics.lower()
@@ -1046,28 +1050,38 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
 @click.option("-o", "--output", "output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
               default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
 @click.option("-m", "--mapman", "mapman_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
-              required=True, help="MapMan annotation file for EGAD.")
+              default=None, help="MapMan annotation file for EGAD.")
+@click.option("-g", "--go-file", "go_file_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="BioMart GO export file (TSV) for EGAD.")
 @click.option("--metrics", type=click.Choice(['auroc', 'aupr', 'both'], case_sensitive=False),
               default='both', show_default=True, help="Which EGAD metrics to calculate.")
 @click.option("-n", "--network", "custom_network", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="Optional custom edges .tsv table (Source, Target, weight).")
-def evaluate(output_dir, mapman_path, metrics, custom_network):
+def evaluate(output_dir, mapman_path, go_file_path, metrics, custom_network):
     """
-    Evaluates the primary consensus network using MapMan functional annotations.
+    Evaluates the primary consensus network using MapMan or GO functional annotations.
     Delegates execution and output to the EGAD vocal wrapper.
     """
     from .egad import run_vocal_evaluation
 
     click.secho("\n[Hulk] Network Evaluation", fg="magenta", bold=True)
 
+    if not mapman_path and not go_file_path:
+        click.secho("[Error] Indecision is fatal. You must provide either --mapman or --go-file.", fg="red")
+        return
+
+    if mapman_path and go_file_path:
+        click.secho("[Warning] Both MapMan and GO provided. The underlying R script will halt until dual-run logic is finalized.", fg="yellow")
+
     try:
         # Standard config loading
-        cfg = Config(outdir=output_dir, plots_only_mode=True)
+        cfg = Config(outdir=output_dir, plots_only_mode=True, mapman_file=mapman_path, go_file=go_file_path)
 
         # Execute using the vocal wrapper
         run_vocal_evaluation(
             cfg,
-            mapman_path,
+            mapman_path=mapman_path,
+            go_file_path=go_file_path,
             metrics=metrics.lower(),
             custom_network=custom_network
         )

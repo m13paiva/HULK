@@ -13,6 +13,7 @@ RUN locale-gen en_US.UTF-8 || true
 ENV LANG=en_US.UTF-8
 ENV LC_ALL=en_US.UTF-8
 ENV MPLCONFIGDIR=/tmp
+
 # --- Conda env ---
 # build args for flexibility
 ARG ENV_FILE=environment.yml
@@ -22,6 +23,9 @@ ARG ENV_NAME=bulk_rna_seq
 #    Make sure 'seidr' is REMOVED from environment.yml before building!
 COPY ${ENV_FILE} /tmp/environment.yml
 RUN conda env create -f /tmp/environment.yml && conda clean -a
+
+# -> NEW: Inject GO.db into the main environment
+RUN conda install -n ${ENV_NAME} -c bioconda -y bioconductor-go.db && conda clean -a
 
 # 2. Install Seidr in an Isolated Environment
 #    CHANGE: Use 'libgfortran=3' (no -ng) to get the legacy .so.3 library

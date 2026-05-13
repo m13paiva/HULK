@@ -46,6 +46,10 @@ class Config:
             keep_fastq: bool = False,
             seq_tech: Optional[str] = None,
 
+            # --- New Annotation Options ---
+            mapman_file: Optional[Path] = None,
+            go_file: Optional[Path] = None,
+
             # Tool config
             trim_window_size: int = 4,
             trim_mean_quality: int = 20,
@@ -90,6 +94,9 @@ class Config:
         self.error_warnings: List[str] = []
         self.rem_missing_bps = rem_missing_bps
         self.seq_tech: Optional[str] = seq_tech
+
+        self.mapman_file = Path(mapman_file).expanduser().resolve() if mapman_file else None
+        self.go_file = Path(go_file).expanduser().resolve() if go_file else None
 
         # --------------------------- Directory setup ---------------------------
         self.shared = (self.outdir / "shared").resolve()
@@ -187,6 +194,8 @@ class Config:
             "network_file": self.shared / "seidr" / self.egad_network_name,
             "out_file": self.shared / "seidr" / self.egad_output_name,
             "log_path": self.shared / "seidr" / self.egad_log_name,
+            "mapman_file": self.mapman_file,
+            "go_file": self.go_file,
         }
 
     # ======================================================================
@@ -270,8 +279,6 @@ class Config:
 
     def __repr__(self) -> str:
         return f"<Config output={self.outdir} threads={self.max_threads}>"
-
-
 # ------------------------------- Sample -------------------------------
 
 class Sample:

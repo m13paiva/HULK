@@ -9,12 +9,13 @@ suppressPackageStartupMessages({
 
 # --- DEBUG LOGGER ---
 log_msg <- function(...) {
-  message(sprintf(...))
+  print(sprintf(...))
 }
 
 option_list <- list(
   make_option(c("-n", "--network"), type="character", default=NULL, help="Network file"),
   make_option(c("-m", "--mapman"), type="character", default=NULL, help="MapMan file"),
+  make_option(c("-g", "--go_file"), type="character", default=NULL, help="BioMart GO export file (TSV)"),
   make_option(c("-o", "--output"), type="character", default="egad_results.tsv", help="Output TSV file"),
   make_option(c("-c", "--min_genes"), type="integer", default=10, help="Min genes per term"),
   make_option(c("--curves"), type="character", default=NULL, help="Prefix path to save curve data"),
@@ -23,65 +24,27 @@ option_list <- list(
 )
 opt <- parse_args(OptionParser(option_list=option_list))
 
-if (is.null(opt$network) || is.null(opt$mapman)) stop("Files required.")
+# Basic Validation
+if (is.null(opt$network)) stop("Network file (-n) is required.")
+
+use_mapman <- !is.null(opt$mapman)
+use_go <- !is.null(opt$go_file)
+
+if (!use_mapman && !use_go) stop("You must provide either a MapMan file (-m) or a GO BioMart file (-g).")
 
 log_msg("---------------------------------------------------")
-log_msg("Starting EGAD Analysis")
-log_msg("AUROC requested: %s", opt$auroc)
-log_msg("AUPR requested: %s", opt$aupr)
+log_msg("Starting EGAD Analysis (Multi-Annotation Mode)")
 
 # ------------------------------------------------------------------------------
-# 1. MapMan
-# ------------------------------------------------------------------------------
-log_msg(">> Parsing MapMan file...")
-mm <- fread(opt$mapman, header = TRUE, quote = "", fill = TRUE, sep = "\t")
-colnames(mm) <- gsub("'", "", colnames(mm))
-
-if (!"IDENTIFIER" %in% colnames(mm)) {
-    if(ncol(mm) >= 3) {
-        mm <- mm[, 1:3]
-        colnames(mm) <- c("BINCODE", "NAME", "IDENTIFIER")
-    }
-}
-
-mm_clean <- mm[IDENTIFIER != "" & IDENTIFIER != "''"]
-mm_clean[, IDENTIFIER := toupper(gsub("'", "", IDENTIFIER))]
-mm_clean[, BINCODE := gsub("'", "", BINCODE)]
-mm_clean[, NAME := gsub("'", "", NAME)]
-
-unique_pairs <- unique(mm_clean[, .(IDENTIFIER, BINCODE)])
-get_parents <- function(bincode) {
-  parts <- unlist(strsplit(bincode, "\\."))
-  sapply(1:length(parts), function(i) paste(parts[1:i], collapse = "."))
-}
-
-expanded_dt <- unique_pairs[, .(expanded_bins = unlist(lapply(BINCODE, get_parents))), by = IDENTIFIER]
-bin_names <- unique(mm[, .(BINCODE = gsub("'", "", BINCODE), NAME = gsub("'", "", NAME))])
-
-final_annot <- merge(expanded_dt, bin_names, by.x = "expanded_bins", by.y = "BINCODE", all.x = TRUE)
-final_annot[is.na(NAME), NAME := expanded_bins]
-
-annot_matrix_long <- final_annot[, .(IDENTIFIER, NAME)]
-annot_matrix_long[, val := 1]
-
-annot_sparse <- Matrix::sparseMatrix(
-  i = as.numeric(as.factor(annot_matrix_long$IDENTIFIER)),
-  j = as.numeric(as.factor(annot_matrix_long$NAME)),
-  x = annot_matrix_long$val,
-  dimnames = list(levels(as.factor(annot_matrix_long$IDENTIFIER)),
-                  levels(as.factor(annot_matrix_long$NAME)))
-)
-
-# ------------------------------------------------------------------------------
-# 2. Network
+# 1. Loading Network (Done exactly once)
 # ------------------------------------------------------------------------------
 log_msg(">> Loading Network...")
 edges <- fread(opt$network)
 
 if (ncol(edges) >= 3) {
-    colnames(edges)[1:3] <- c("source", "target", "weight")
+  colnames(edges)[1:3] <- c("source", "target", "weight")
 } else {
-    stop("Network file must have at least 3 columns.")
+  stop("Network file must have at least 3 columns.")
 }
 
 edges[, source := toupper(source)]
@@ -102,117 +65,232 @@ edges_unique <- unique(edges, by = c("i", "j"))
 rm(edges)
 gc()
 
-net_mat_general <- Matrix::sparseMatrix(
+net_sparse_init <- Matrix::sparseMatrix(
   i = edges_unique$i,
   j = edges_unique$j,
   x = edges_unique$weight,
   dims = c(n_genes, n_genes),
   dimnames = list(all_genes, all_genes),
-  symmetric = FALSE
+  symmetric = TRUE
 )
-net_mat_sparse <- Matrix::forceSymmetric(net_mat_general, uplo = "U")
 
-rm(edges_unique, net_mat_general)
+rm(edges_unique)
 gc()
 
 # ------------------------------------------------------------------------------
-# 3. Intersect & Prep
+# 2. Annotation Parsing Phase
 # ------------------------------------------------------------------------------
-log_msg(">> Intersecting Genes...")
-common_genes <- intersect(rownames(net_mat_sparse), rownames(annot_sparse))
+annotations_list <- list()
 
-if (length(common_genes) < 10) {
-    log_msg("!!! CRITICAL: Overlap too small (<10). Returning empty result.")
-    fwrite(data.table(Term="None", AUC=NA, AUPR=NA, NodeDegreeAUC=NA), opt$output, sep="\t")
-    quit(save="no", status=0)
+if (use_mapman) {
+  log_msg(">> Parsing MapMan file...")
+  mm <- fread(opt$mapman, header = TRUE, quote = "", fill = TRUE, sep = "\t")
+  colnames(mm) <- gsub("'", "", colnames(mm))
+
+  if (!"IDENTIFIER" %in% colnames(mm)) {
+    if(ncol(mm) >= 3) {
+      mm <- mm[, 1:3]
+      colnames(mm) <- c("BINCODE", "NAME", "IDENTIFIER")
+    }
+  }
+
+  mm_clean <- mm[IDENTIFIER != "" & IDENTIFIER != "''"]
+  mm_clean[, IDENTIFIER := toupper(gsub("'", "", IDENTIFIER))]
+  mm_clean[, BINCODE := gsub("'", "", BINCODE)]
+  mm_clean[, NAME := gsub("'", "", NAME)]
+
+  unique_pairs <- unique(mm_clean[, .(IDENTIFIER, BINCODE)])
+  get_parents <- function(bincode) {
+    parts <- unlist(strsplit(bincode, "\\."))
+    sapply(1:length(parts), function(i) paste(parts[1:i], collapse = "."))
+  }
+
+  expanded_dt <- unique_pairs[, .(expanded_bins = unlist(lapply(BINCODE, get_parents))), by = IDENTIFIER]
+  bin_names <- unique(mm[, .(BINCODE = gsub("'", "", BINCODE), NAME = gsub("'", "", NAME))])
+
+  final_annot_dt <- merge(expanded_dt, bin_names, by.x = "expanded_bins", by.y = "BINCODE", all.x = TRUE)
+  final_annot_dt[is.na(NAME), NAME := expanded_bins]
+
+  annot_matrix_long <- final_annot_dt[, .(IDENTIFIER, NAME)]
+  setnames(annot_matrix_long, c("IDENTIFIER", "TERM"))
+
+  annot_matrix_long[, val := 1]
+  annotations_list[["MapMan"]] <- Matrix::sparseMatrix(
+    i = as.numeric(as.factor(annot_matrix_long$IDENTIFIER)),
+    j = as.numeric(as.factor(annot_matrix_long$TERM)),
+    x = annot_matrix_long$val,
+    dimnames = list(levels(as.factor(annot_matrix_long$IDENTIFIER)),
+                    levels(as.factor(annot_matrix_long$TERM)))
+  )
+  rm(mm, mm_clean, expanded_dt, bin_names, final_annot_dt, annot_matrix_long)
+  gc()
 }
 
-net_final_sparse <- net_mat_sparse[common_genes, common_genes]
-annot_final_sparse <- annot_sparse[common_genes, ]
+if (use_go) {
+  log_msg(">> Parsing BioMart GO file...")
+  if (!requireNamespace("GO.db", quietly = TRUE)) stop("Missing required Bioconductor package: GO.db")
+  suppressPackageStartupMessages(library(GO.db))
 
-term_sizes <- colSums(annot_final_sparse)
-valid_terms <- term_sizes >= opt$min_genes
+  go_dt <- fread(opt$go_file, header=TRUE, sep="\t", quote="", fill=TRUE)
+  if (ncol(go_dt) < 2) stop("BioMart file must have at least 2 columns.")
 
-if (sum(valid_terms) < 2) {
-    log_msg("!!! CRITICAL: No valid terms remaining.")
-    fwrite(data.table(Term="None", AUC=NA, AUPR=NA, NodeDegreeAUC=NA), opt$output, sep="\t")
-    quit(save="no", status=0)
+  setnames(go_dt, 1:2, c("IDENTIFIER", "GO_ID"))
+  go_dt <- go_dt[GO_ID != "" & !is.na(GO_ID)]
+  go_dt[, IDENTIFIER := toupper(IDENTIFIER)]
+
+  if (nrow(go_dt) == 0) stop("No valid GO terms found after removing empty rows.")
+
+  log_msg(">> Propagating GO DAG using GO.db...")
+  unique_go <- unique(go_dt$GO_ID)
+  bp_anc <- as.list(GOBPANCESTOR); mf_anc <- as.list(GOMFANCESTOR); cc_anc <- as.list(GOCCANCESTOR)
+
+  go_anc_list <- lapply(unique_go, function(id) {
+    ancs <- c(id)
+    if (id %in% names(bp_anc)) ancs <- c(ancs, bp_anc[[id]])
+    if (id %in% names(mf_anc)) ancs <- c(ancs, mf_anc[[id]])
+    if (id %in% names(cc_anc)) ancs <- c(ancs, cc_anc[[id]])
+    return(unique(ancs[!is.na(ancs) & ancs != "all"]))
+  })
+  names(go_anc_list) <- unique_go
+
+  annot_matrix_long <- go_dt[, .(TERM = unlist(go_anc_list[GO_ID])), by = IDENTIFIER]
+  annot_matrix_long <- unique(annot_matrix_long)
+
+  annot_matrix_long[, val := 1]
+  annotations_list[["GO"]] <- Matrix::sparseMatrix(
+    i = as.numeric(as.factor(annot_matrix_long$IDENTIFIER)),
+    j = as.numeric(as.factor(annot_matrix_long$TERM)),
+    x = annot_matrix_long$val,
+    dimnames = list(levels(as.factor(annot_matrix_long$IDENTIFIER)),
+                    levels(as.factor(annot_matrix_long$TERM)))
+  )
+  rm(go_dt, annot_matrix_long, go_anc_list, bp_anc, mf_anc, cc_anc)
+  gc()
 }
 
-annot_final_sparse <- annot_final_sparse[, valid_terms, drop = FALSE]
-
-net_final <- as.matrix(net_final_sparse)
-annot_final <- as.matrix(annot_final_sparse)
-mode(annot_final) <- "numeric"
-
-net_final[is.na(net_final)] <- 0
-diag(net_final) <- 0
-
 # ------------------------------------------------------------------------------
-# 4. Run EGAD
+# 3. Execution Loop
 # ------------------------------------------------------------------------------
-start_time <- Sys.time()
-term_names <- colnames(annot_final)
-res_auc <- data.table(Term = term_names)
-res_aupr <- data.table(Term = term_names)
+final_results <- list()
+start_time_global <- Sys.time()
 
-tryCatch({
+for (anno_source in names(annotations_list)) {
+  log_msg("===================================================")
+  log_msg(">> Processing Annotation Source: %s", anno_source)
+
+  annot_sparse_init <- annotations_list[[anno_source]]
+
+  log_msg(">> Intersecting Genes...")
+  common_genes <- intersect(rownames(net_sparse_init), rownames(annot_sparse_init))
+
+  if (length(common_genes) < 10) {
+    log_msg("!!! WARNING: Overlap too small (<10) for %s. Skipping.", anno_source)
+    next
+  }
+
+  net_final_sparse <- net_sparse_init[common_genes, common_genes]
+  annot_final_sparse <- annot_sparse_init[common_genes, ]
+
+  valid_terms <- colSums(annot_final_sparse) >= opt$min_genes
+  if (sum(valid_terms) < 2) {
+    log_msg("!!! WARNING: No valid terms remaining for %s after filtering. Skipping.", anno_source)
+    next
+  }
+
+  annot_final_sparse <- annot_final_sparse[, valid_terms, drop = FALSE]
+
+  log_msg(">> Clearing memory and coercing to dense...")
+  net_final <- as.matrix(net_final_sparse)
+  annot_final <- as.matrix(annot_final_sparse)
+
+  rm(net_final_sparse, annot_final_sparse)
+  gc()
+
+  mode(annot_final) <- "numeric"
+  diag(net_final) <- 0
+  net_final[is.na(net_final)] <- 0
+
+  # --- Run EGAD ---
+  term_names <- colnames(annot_final)
+  res_auc <- data.table(Term = term_names)
+  res_aupr <- data.table(Term = term_names)
+
+  tryCatch({
     if (opt$aupr) {
-        log_msg(">> Running EGAD (AUPR mode)...")
-        nv_prc <- neighbor_voting(genes.labels = annot_final, network = net_final, nFold = 3, output = "PR")
-        res_aupr <- data.table(Term = rownames(nv_prc), AUPR = as.numeric(nv_prc[, 1]))
+      log_msg(">> Running EGAD (AUPR mode)...")
+      preds_aupr <- EGAD::predictions(genes.labels = annot_final, network = net_final)
+      aupr_vals <- sapply(1:ncol(annot_final), function(i) {
+        pr_curve <- get_prc(preds_aupr[, i], annot_final[, i])
+        pr_curve <- pr_curve[order(pr_curve[, 1]), ]
+        sum(diff(pr_curve[, 1]) * (pr_curve[-1, 2] + pr_curve[-nrow(pr_curve), 2]) / 2, na.rm = TRUE)
+      })
+      res_aupr <- data.table(Term = term_names, AUPR = aupr_vals)
     }
 
     if (opt$auroc) {
-        log_msg(">> Running EGAD (AUROC mode)...")
-        nv_res <- neighbor_voting(genes.labels = annot_final, network = net_final, nFold = 3, output = "AUROC")
-        res_auc <- data.table(Term = rownames(nv_res), AUC = as.numeric(nv_res[, 1]), NodeDegreeAUC = as.numeric(nv_res[, 2]))
+      log_msg(">> Running EGAD (AUROC mode)...")
+      nv_res <- neighbor_voting(genes.labels = annot_final, network = net_final, nFold = 3, output = "AUROC")
+      res_auc <- data.table(Term = rownames(nv_res), AUC = as.numeric(nv_res[, 1]), NodeDegreeAUC = as.numeric(nv_res[, 2]))
     }
 
     if (!is.null(opt$curves)) {
-        log_msg(">> Generating raw network predictions for curves...")
-        preds <- EGAD::predictions(genes.labels = annot_final, network = net_final)
+      log_msg(">> Generating raw network predictions for curves...")
+      if (!exists("preds_aupr")) preds <- EGAD::predictions(genes.labels = annot_final, network = net_final) else preds <- preds_aupr
     }
-}, error = function(e) {
-    log_msg("!!! EGAD CRASHED: %s", e$message)
-    quit(save="no", status=1)
-})
+  }, error = function(e) {
+    log_msg("!!! EGAD CRASHED on %s: %s", anno_source, e$message)
+    # Don't quit entirely, just skip this annotation source
+    return(NULL)
+  })
 
-# Merge results based on whatever was requested
-results_dt <- merge(res_auc, res_aupr, by="Term", all=TRUE)
+  # --- Merge and Store Results ---
+  results_dt <- merge(res_auc, res_aupr, by="Term", all=TRUE)
 
-# Only print means for what was actually calculated
-if (opt$auroc) {
-    valid_auc <- results_dt[!is.na(AUC)]
-    log_msg(sprintf(">> Mean AUROC: %.4f", ifelse(nrow(valid_auc) > 0, mean(valid_auc$AUC), NA)))
-}
-if (opt$aupr) {
-    valid_aupr <- results_dt[!is.na(AUPR)]
-    log_msg(sprintf(">> Mean AUPR: %.4f", ifelse(nrow(valid_aupr) > 0, mean(valid_aupr$AUPR), NA)))
-}
+  if (nrow(results_dt) > 0) {
+    results_dt[, Annotation_Source := anno_source]
+    final_results[[anno_source]] <- results_dt
 
-fwrite(results_dt, opt$output, sep="\t")
+    if (opt$auroc) log_msg(">> %s Mean AUROC: %.4f", anno_source, mean(results_dt$AUC, na.rm=TRUE))
+    if (opt$aupr) log_msg(">> %s Mean AUPR: %.4f", anno_source, mean(results_dt$AUPR, na.rm=TRUE))
+  }
 
-# Output Curve Data if requested
-if (!is.null(opt$curves) && exists("preds")) {
-    log_msg(">> Exporting micro-average curve data & baseline...")
-    flat_preds <- as.vector(preds)
-    flat_labels <- as.vector(annot_final)
-
+  # --- Output Curves (Injected with Source Name) ---
+  if (!is.null(opt$curves) && exists("preds")) {
+    log_msg(">> Exporting curve data for %s...", anno_source)
+    flat_preds <- as.vector(preds); flat_labels <- as.vector(annot_final)
     valid_idx <- !is.na(flat_preds) & !is.na(flat_labels)
-    flat_preds <- flat_preds[valid_idx]
-    flat_labels <- flat_labels[valid_idx]
 
-    roc_data <- get_roc(flat_preds, flat_labels)
-    prc_data <- get_prc(flat_preds, flat_labels)
+    roc_data <- get_roc(flat_preds[valid_idx], flat_labels[valid_idx])
+    prc_data <- get_prc(flat_preds[valid_idx], flat_labels[valid_idx])
+    baseline_val <- sum(flat_labels[valid_idx])/length(flat_labels[valid_idx])
 
-    fwrite(data.table(FPR=roc_data[,1], TPR=roc_data[,2]), paste0(opt$curves, "_roc.tsv"), sep="\t")
-    fwrite(data.table(Recall=prc_data[,1], Precision=prc_data[,2]), paste0(opt$curves, "_prc.tsv"), sep="\t")
+    fwrite(data.table(FPR=roc_data[,1], TPR=roc_data[,2]), paste0(opt$curves, "_", anno_source, "_roc.tsv"), sep="\t")
+    fwrite(data.table(Recall=prc_data[,1], Precision=prc_data[,2]), paste0(opt$curves, "_", anno_source, "_prc.tsv"), sep="\t")
+    fwrite(data.table(Baseline=baseline_val), paste0(opt$curves, "_", anno_source, "_baseline.tsv"), sep="\t")
+  }
 
-    # Calculate global random baseline AUPR
-    baseline_pr <- sum(flat_labels) / length(flat_labels)
-    fwrite(data.table(Baseline=baseline_pr), paste0(opt$curves, "_baseline.tsv"), sep="\t")
+  # Clean up dense matrices before the next iteration
+  rm(net_final, annot_final)
+  if (exists("preds")) rm(preds)
+  if (exists("preds_aupr")) rm(preds_aupr)
+  gc()
 }
 
-end_time <- Sys.time()
-log_msg(">> Done. (Time: %.2fs)", as.numeric(difftime(end_time, start_time, units="secs")))
+# ------------------------------------------------------------------------------
+# 4. Final Output Construction
+# ------------------------------------------------------------------------------
+if (length(final_results) > 0) {
+  combined_dt <- rbindlist(final_results, use.names=TRUE, fill=TRUE)
+
+  # Reorder columns so Annotation_Source is neatly placed right after Term
+  col_order <- c("Term", "Annotation_Source", setdiff(names(combined_dt), c("Term", "Annotation_Source")))
+  setcolorder(combined_dt, col_order)
+
+  fwrite(combined_dt, opt$output, sep="\t")
+} else {
+  log_msg("!!! CRITICAL: All annotations failed or were skipped. Writing empty output.")
+  fwrite(data.table(Term="None", Annotation_Source="None", AUC=NA, AUPR=NA, NodeDegreeAUC=NA), opt$output, sep="\t")
+}
+
+log_msg("===================================================")
+log_msg(">> All Done. (Total Time: %.2fs)", as.numeric(difftime(Sys.time(), start_time_global, units="secs")))
