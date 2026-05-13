@@ -11,9 +11,6 @@ if TYPE_CHECKING:
 
 
 def get_egad_script_path() -> Path:
-    """
-    Locates the egad.R script.
-    """
     base_path = Path(__file__).parent
     script_path = base_path / "scripts" / "egad.R"
     if not script_path.exists():
@@ -34,27 +31,17 @@ def run_egad_task(
         do_auroc: bool = True,
         do_aupr: bool = False
 ) -> Dict[str, Dict[str, Optional[float]]]:
-    """
-    Wraps the R script execution. Dynamically handles multiple annotation sources.
-    Returns a dictionary mapping Annotation_Source to its AUC/AUPR scores.
-    """
     cmd = [
         "Rscript", str(script_path),
         "--network", str(network_file),
         "--output", str(out_file)
     ]
 
-    if mapman_file:
-        cmd.extend(["--mapman", str(mapman_file)])
-    if go_file:
-        cmd.extend(["--go_file", str(go_file)])
-
-    if do_auroc:
-        cmd.append("--auroc")
-    if do_aupr:
-        cmd.append("--aupr")
-    if curves_prefix:
-        cmd.extend(["--curves", str(curves_prefix)])
+    if mapman_file: cmd.extend(["--mapman", str(mapman_file)])
+    if go_file: cmd.extend(["--go_file", str(go_file)])
+    if do_auroc: cmd.append("--auroc")
+    if do_aupr: cmd.append("--aupr")
+    if curves_prefix: cmd.extend(["--curves", str(curves_prefix)])
 
     with open(log_path, "a") as log:
         log.write(f"\n{'=' * 40}\n[EXEC] {' '.join(cmd)}\n")
@@ -82,35 +69,128 @@ def run_egad_task(
                 for source, group in df.groupby("Annotation_Source"):
                     valid_group = group[group["Term"] != "None"]
                     if valid_group.empty: continue
-
                     results[source] = {
-                        "auc": valid_group["AUC"].mean() if "AUC" in valid_group.columns else None,
-                        "aupr": valid_group["AUPR"].mean() if "AUPR" in valid_group.columns else None
+                        "macro_auc": valid_group["AUC"].mean() if "AUC" in valid_group.columns else None,
+                        "macro_aupr": valid_group["AUPR"].mean() if "AUPR" in valid_group.columns else None
                     }
             else:
                 results["Legacy"] = {
-                    "auc": df["AUC"].mean() if "AUC" in df.columns else None,
-                    "aupr": df["AUPR"].mean() if "AUPR" in df.columns else None
+                    "macro_auc": df["AUC"].mean() if "AUC" in df.columns else None,
+                    "macro_aupr": df["AUPR"].mean() if "AUPR" in df.columns else None
                 }
         except Exception:
             return {}
-
     return results
+
+
+def calculate_auc_from_df(df, x_col, y_col):
+    if df is None or df.empty: return None
+    x = df[x_col].values
+    y = df[y_col].values
+    idx = np.argsort(x)
+    return np.abs(np.trapezoid(y[idx], x[idx]))
+
+
+def create_1x2_plot(source_data_list, show_baseline, title_prefix, out_file):
+    """Helper to draw Micro-Averaged ROC on the left and PRC on the right"""
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    if show_baseline:
+        ax1.plot([0, 1], [0, 1], color='grey', linestyle='--', label="Random (0.5000)")
+
+    roc_plotted, prc_plotted = False, False
+
+    for data in source_data_list:
+        src = data['src']
+        color = data['color']
+        roc_df = data['roc_df']
+        prc_df = data['prc_df']
+        baseline = data['baseline']
+
+        micro_auc = calculate_auc_from_df(roc_df, "FPR", "TPR")
+        micro_aupr = calculate_auc_from_df(prc_df, "Recall", "Precision")
+
+        if roc_df is not None and micro_auc is not None:
+            roc_plotted = True
+            ax1.plot(roc_df["FPR"], roc_df["TPR"], color=color, lw=2, label=f"{src} Micro (AUC: {micro_auc:.4f})")
+
+        if prc_df is not None and micro_aupr is not None:
+            prc_plotted = True
+            if show_baseline:
+                ax2.axhline(y=baseline, color=color, linestyle=':', alpha=0.7, label=f"{src} Random ({baseline:.4f})")
+            ax2.plot(prc_df["Recall"], prc_df["Precision"], color=color, lw=2,
+                     label=f"{src} Micro (AUPR: {micro_aupr:.4f})")
+
+    if roc_plotted:
+        ax1.set_title(f"{title_prefix} Micro-Averaged ROC")
+        ax1.set_xlabel("False Positive Rate")
+        ax1.set_ylabel("True Positive Rate")
+        ax1.legend(loc="lower right", fontsize='small')
+        ax1.grid(True, linestyle='--', alpha=0.6)
+    else:
+        ax1.text(0.5, 0.5, "ROC Data Unavailable", ha='center', va='center')
+
+    if prc_plotted:
+        ax2.set_title(f"{title_prefix} Micro-Averaged PR")
+        ax2.set_xlabel("Recall")
+        ax2.set_ylabel("Precision")
+        ax2.legend(loc="upper right", fontsize='small')
+        ax2.grid(True, linestyle='--', alpha=0.6)
+    else:
+        ax2.text(0.5, 0.5, "PR Data Unavailable", ha='center', va='center')
+
+    fig.tight_layout()
+    fig.savefig(out_file)
+    plt.close(fig)
+
+
+def create_macro_boxplots(df, out_file, colors_dict):
+    """Generates boxplots to show the distribution of MACRO performance."""
+    if df is None or df.empty: return
+    sources = [s for s in ["GO", "MapMan"] if s in df["Annotation_Source"].unique()]
+    if not sources: return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    auc_data = [df[(df["Annotation_Source"] == s) & (df["AUC"].notnull())]["AUC"].values for s in sources]
+    aupr_data = [df[(df["Annotation_Source"] == s) & (df["AUPR"].notnull())]["AUPR"].values for s in sources]
+
+    if any(len(d) > 0 for d in auc_data):
+        bplot1 = ax1.boxplot(auc_data, labels=sources, patch_artist=True)
+        for patch, src in zip(bplot1['boxes'], sources):
+            patch.set_facecolor(colors_dict.get(src, "grey"))
+            patch.set_alpha(0.8)
+        ax1.set_title("Macro-Average Distribution (AUROC)")
+        ax1.set_ylabel("Term AUROC")
+        ax1.grid(True, linestyle='--', alpha=0.6)
+
+    if any(len(d) > 0 for d in aupr_data):
+        bplot2 = ax2.boxplot(aupr_data, labels=sources, patch_artist=True)
+        for patch, src in zip(bplot2['boxes'], sources):
+            patch.set_facecolor(colors_dict.get(src, "grey"))
+            patch.set_alpha(0.8)
+        ax2.set_title("Macro-Average Distribution (AUPR)")
+        ax2.set_ylabel("Term AUPR")
+        ax2.grid(True, linestyle='--', alpha=0.6)
+
+    fig.tight_layout()
+    fig.savefig(out_file)
+    plt.close(fig)
 
 
 def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_file_path: Optional[Path] = None,
                          metrics: str = "both", custom_network: Optional[Path] = None):
-    """
-    CLI-friendly wrapper for EGAD. Computes AUROC/AUPR based on user choice.
-    Allows for a custom network input to override the default consensus.
-    """
     opts = cfg.get_tool_opts("egad")
 
     net_path = custom_network if custom_network else opts["network_file"]
-    out_path = opts["out_file"]
-    log_path = opts["log_path"]
 
-    curves_prefix = out_path.parent / "vocal_curves"
+    seidr_dir = opts["out_file"].parent
+    egad_dir = seidr_dir.parent / "egad"
+    egad_dir.mkdir(parents=True, exist_ok=True)
+
+    out_path = egad_dir / opts["out_file"].name
+    log_path = egad_dir / opts["log_path"].name
+    curves_prefix = egad_dir / "curves"
 
     if not net_path.exists():
         click.secho(f"[Error] Network file not found: {net_path}", fg="red")
@@ -122,8 +202,7 @@ def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_f
     click.secho(f"[Evaluate] Network: {net_path.name}", fg="cyan")
     if mapman_path: click.secho(f"[Evaluate] MapMan: {mapman_path.name}", fg="cyan")
     if go_file_path: click.secho(f"[Evaluate] GO: {go_file_path.name}", fg="cyan")
-    click.secho(f"[Evaluate] Metrics requested: {metrics.upper()}", fg="cyan")
-    click.secho(f"[Evaluate] Generating metrics and curves at: {out_path.parent}", fg="yellow")
+    click.secho(f"[Evaluate] Generating metrics and plots at: {egad_dir}", fg="yellow")
 
     results = run_egad_task(
         network_file=net_path,
@@ -140,152 +219,106 @@ def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_f
     if results:
         click.secho(f"\n[Success] Evaluation complete!", fg="green", bold=True)
 
+        colors = {
+            "MapMan": "firebrick",
+            "GO": "darkorange"
+        }
+
+        source_data_list = []
+
+        # Read the raw TSV once so we can use it for the boxplots
+        try:
+            full_df = pd.read_csv(out_path, sep="\t")
+        except:
+            full_df = None
+
         for src, mets in results.items():
             res_str = []
-            if do_auroc and mets["auc"] is not None: res_str.append(f"Mean AUROC: {mets['auc']:.4f}")
-            if do_aupr and mets["aupr"] is not None: res_str.append(f"Mean AUPR: {mets['aupr']:.4f}")
+            if do_auroc and mets["macro_auc"] is not None: res_str.append(f"Macro AUROC: {mets['macro_auc']:.4f}")
+            if do_aupr and mets["macro_aupr"] is not None: res_str.append(f"Macro AUPR: {mets['macro_aupr']:.4f}")
             click.secho(f"[Results - {src}] {' | '.join(res_str)}", fg="green")
 
-        try:
-            colors = {
-                "MapMan": {"roc": "darkblue", "prc": "darkred", "bar_auc": "royalblue", "bar_prc": "firebrick"},
-                "GO": {"roc": "teal", "prc": "darkorange", "bar_auc": "lightseagreen", "bar_prc": "orange"}
+            roc_file = Path(f"{curves_prefix}_{src}_roc.tsv")
+            prc_file = Path(f"{curves_prefix}_{src}_prc.tsv")
+            base_file = Path(f"{curves_prefix}_{src}_baseline.tsv")
+
+            data_pack = {
+                'src': src,
+                'color': colors.get(src, "purple"),
+                'roc_df': pd.read_csv(roc_file, sep="\t") if roc_file.exists() else None,
+                'prc_df': pd.read_csv(prc_file, sep="\t") if prc_file.exists() else None,
+                'baseline': 0.0
             }
-            default_colors = {"roc": "purple", "prc": "brown", "bar_auc": "mediumpurple", "bar_prc": "sienna"}
 
-            # --- LOOP TO GENERATE BOTH WITH AND WITHOUT BASELINE ---
-            for show_baseline in [True, False]:
-                suffix = "_with_baseline" if show_baseline else "_no_baseline"
+            if base_file.exists():
+                b_df = pd.read_csv(base_file, sep="\t")
+                if not b_df.empty and "Baseline" in b_df.columns:
+                    data_pack['baseline'] = b_df["Baseline"].iloc[0]
 
-                fig_comb, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-                fig_roc, ax_roc = plt.subplots(figsize=(6, 5))
-                fig_pr, ax_pr = plt.subplots(figsize=(6, 5))
+            source_data_list.append(data_pack)
 
-                if show_baseline:
-                    ax1.plot([0, 1], [0, 1], color='grey', linestyle='--', label="Random (AUROC: 0.5000)")
-                    ax_roc.plot([0, 1], [0, 1], color='grey', linestyle='--', label="Random (AUROC: 0.5000)")
+        try:
+            # 1. MICRO-AVERAGE LINE PLOTS (No prefix requested)
+            for data in source_data_list:
+                src = data['src']
+                create_1x2_plot([data], show_baseline=False, title_prefix=src,
+                                out_file=egad_dir / f"{src}_no_baseline.pdf")
+                create_1x2_plot([data], show_baseline=True, title_prefix=src,
+                                out_file=egad_dir / f"{src}_with_baseline.pdf")
 
-                roc_plotted = False
-                prc_plotted = False
+            if len(source_data_list) > 1:
+                create_1x2_plot(source_data_list, show_baseline=False, title_prefix="Combined",
+                                out_file=egad_dir / "combined_no_baseline.pdf")
+                create_1x2_plot(source_data_list, show_baseline=True, title_prefix="Combined",
+                                out_file=egad_dir / "combined_with_baseline.pdf")
 
-                for src, mets in results.items():
-                    src_color = colors.get(src, default_colors)
-                    mean_auc = mets["auc"]
-                    mean_aupr = mets["aupr"]
-
-                    roc_file = Path(f"{curves_prefix}_{src}_roc.tsv")
-                    prc_file = Path(f"{curves_prefix}_{src}_prc.tsv")
-                    base_file = Path(f"{curves_prefix}_{src}_baseline.tsv")
-
-                    roc_df = pd.read_csv(roc_file, sep="\t") if roc_file.exists() else None
-                    prc_df = pd.read_csv(prc_file, sep="\t") if prc_file.exists() else None
-
-                    baseline_val = 0.0
-                    if base_file.exists():
-                        b_df = pd.read_csv(base_file, sep="\t")
-                        if not b_df.empty and "Baseline" in b_df.columns:
-                            baseline_val = b_df["Baseline"].iloc[0]
-
-                    if do_auroc and mean_auc is not None and roc_df is not None:
-                        roc_plotted = True
-                        label = f"{src} Model"
-                        ax1.plot(roc_df["FPR"], roc_df["TPR"], color=src_color["roc"], lw=2, label=label)
-                        ax_roc.plot(roc_df["FPR"], roc_df["TPR"], color=src_color["roc"], lw=2, label=label)
-
-                    if do_aupr and mean_aupr is not None and prc_df is not None:
-                        prc_plotted = True
-                        label = f"{src} Model"
-
-                        if show_baseline:
-                            base_label = f"{src} Random ({baseline_val:.4f})"
-                            ax2.axhline(y=baseline_val, color=src_color["roc"], linestyle=':', label=base_label,
-                                        alpha=0.7)
-                            ax_pr.axhline(y=baseline_val, color=src_color["roc"], linestyle=':', label=base_label,
-                                          alpha=0.7)
-
-                        ax2.plot(prc_df["Recall"], prc_df["Precision"], color=src_color["prc"], lw=2, label=label)
-                        ax_pr.plot(prc_df["Recall"], prc_df["Precision"], color=src_color["prc"], lw=2, label=label)
-
-                # Finalize plots for this baseline iteration
-                if roc_plotted:
-                    for ax in [ax1, ax_roc]:
-                        ax.set_title("Combined ROC Curves")
-                        ax.set_xlabel("False Positive Rate")
-                        ax.set_ylabel("True Positive Rate")
-                        ax.legend(loc="lower right")
-                        ax.grid(True, linestyle='--', alpha=0.6)
-                    fig_roc.tight_layout()
-                    fig_roc.savefig(out_path.parent / f"vocal_evaluation_roc{suffix}.pdf")
-                else:
-                    ax1.text(0.5, 0.5, "ROC Data Unavailable", ha='center', va='center')
-
-                if prc_plotted:
-                    for ax in [ax2, ax_pr]:
-                        ax.set_title("Combined PR Curves")
-                        ax.set_xlabel("Recall")
-                        ax.set_ylabel("Precision")
-                        ax.legend(loc="upper right", fontsize='small')
-                        ax.grid(True, linestyle='--', alpha=0.6)
-                    fig_pr.tight_layout()
-                    fig_pr.savefig(out_path.parent / f"vocal_evaluation_prc{suffix}.pdf")
-                else:
-                    ax2.text(0.5, 0.5, "PR Data Unavailable", ha='center', va='center')
-
-                fig_comb.tight_layout()
-                fig_comb.savefig(out_path.parent / f"vocal_evaluation_curves{suffix}.pdf")
-
-                plt.close(fig_comb)
-                plt.close(fig_roc)
-                plt.close(fig_pr)
-
-            # --- COMPARISON BAR CHART (Generated once) ---
-            if len(results) > 1:
+                # 2. MACRO-AVERAGE BAR PLOT
                 fig_bar, ax_bar = plt.subplots(figsize=(8, 6))
-
                 sources = list(results.keys())
-                auc_vals = [results[s]["auc"] if results[s]["auc"] is not None else 0 for s in sources]
-                aupr_vals = [results[s]["aupr"] if results[s]["aupr"] is not None else 0 for s in sources]
+                auc_vals = [results[s]["macro_auc"] if results[s]["macro_auc"] is not None else 0 for s in sources]
+                aupr_vals = [results[s]["macro_aupr"] if results[s]["macro_aupr"] is not None else 0 for s in sources]
 
                 x = np.arange(len(sources))
+                bar_colors = [colors.get(s, "purple") for s in sources]
 
                 if do_auroc and do_aupr:
                     width = 0.35
-                    bars1 = ax_bar.bar(x - width / 2, auc_vals, width, label='Mean AUROC',
-                                       color=[colors.get(s, default_colors)["bar_auc"] for s in sources])
-                    bars2 = ax_bar.bar(x + width / 2, aupr_vals, width, label='Mean AUPR',
-                                       color=[colors.get(s, default_colors)["bar_prc"] for s in sources])
+                    bars1 = ax_bar.bar(x - width / 2, auc_vals, width, label='Macro AUROC', color=bar_colors, alpha=0.8)
+                    bars2 = ax_bar.bar(x + width / 2, aupr_vals, width, label='Macro AUPR', color=bar_colors,
+                                       hatch='//')
                     ax_bar.bar_label(bars1, fmt='%.3f', padding=3)
                     ax_bar.bar_label(bars2, fmt='%.3f', padding=3)
                 elif do_auroc:
                     width = 0.5
-                    bars1 = ax_bar.bar(x, auc_vals, width, label='Mean AUROC',
-                                       color=[colors.get(s, default_colors)["bar_auc"] for s in sources])
+                    bars1 = ax_bar.bar(x, auc_vals, width, label='Macro AUROC', color=bar_colors)
                     ax_bar.bar_label(bars1, fmt='%.3f', padding=3)
                 elif do_aupr:
                     width = 0.5
-                    bars2 = ax_bar.bar(x, aupr_vals, width, label='Mean AUPR',
-                                       color=[colors.get(s, default_colors)["bar_prc"] for s in sources])
+                    bars2 = ax_bar.bar(x, aupr_vals, width, label='Macro AUPR', color=bar_colors, hatch='//')
                     ax_bar.bar_label(bars2, fmt='%.3f', padding=3)
 
                 ax_bar.set_ylabel('Score')
-                ax_bar.set_title('EGAD Performance Comparison')
+                ax_bar.set_title('Macro-Averaged Performance')
                 ax_bar.set_xticks(x)
                 ax_bar.set_xticklabels(sources)
                 ax_bar.set_ylim(0, 1.1)
 
                 from matplotlib.patches import Patch
                 legend_elements = []
-                if do_auroc: legend_elements.append(Patch(facecolor='grey', label='Mean AUROC'))
-                if do_aupr: legend_elements.append(Patch(facecolor='black', label='Mean AUPR'))
+                if do_auroc: legend_elements.append(Patch(facecolor='grey', alpha=0.8, label='Macro AUROC'))
+                if do_aupr: legend_elements.append(Patch(facecolor='grey', hatch='//', label='Macro AUPR'))
                 ax_bar.legend(handles=legend_elements, loc='upper left')
 
                 fig_bar.tight_layout()
-                fig_bar.savefig(out_path.parent / "vocal_evaluation_comparison_bars.pdf")
+                fig_bar.savefig(egad_dir / "bar_comparison.pdf")
                 plt.close(fig_bar)
 
-            click.secho(f"[Plots] Saved ALL plot variations to {out_path.parent}", fg="blue")
+                # 3. MACRO-AVERAGE BOXPLOTS
+                create_macro_boxplots(full_df, egad_dir / "macro_boxplot_comparison.pdf", colors)
+
+            click.secho(f"[Plots] Saved strictly formatted PDF array to {egad_dir}", fg="blue")
 
         except Exception as e:
-            click.secho(f"[Warn] Plot generation failed. Files might be corrupt: {e}", fg="yellow")
+            click.secho(f"[Warn] Plot generation failed. {e}", fg="yellow")
     else:
-        click.secho(f"[Error] EGAD failed entirely or returned no valid data. Check logs at {log_path}", fg="red")
+        click.secho(f"[Error] EGAD failed entirely. Check logs at {log_path}", fg="red")

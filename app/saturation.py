@@ -7,6 +7,7 @@ from tqdm import tqdm
 import random
 import os
 import shutil
+import json
 
 # --- MATPLOTLIB SILENCER & SETUP ---
 os.environ["MPLCONFIGDIR"] = "/tmp"
@@ -101,6 +102,84 @@ class BatchOrchestrator:
             steps.append(current)
         return sorted(list(set(steps)))
 
+    def _create_1x2_saturation_plot(self, source_data_list, samp_df, show_samples, title_prefix, out_file):
+        """Helper to draw Saturation AUROC on the left and AUPR on the right, dynamically handling sample axes."""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+        ax1_twin = ax1.twinx() if show_samples else None
+        ax2_twin = ax2.twinx() if show_samples else None
+
+        roc_plotted = False
+        prc_plotted = False
+
+        lines_ax1, labels_ax1 = [], []
+        lines_ax2, labels_ax2 = [], []
+
+        for data in source_data_list:
+            src = data['src']
+            color = data['color']
+            df = data['df']
+
+            if self.do_auroc and "auc_mean" in df.columns:
+                roc_plotted = True
+                l1 = ax1.plot(df["n_bps"], df["auc_mean"], color=color, linewidth=2, marker='o', label=f"{src} AUROC")
+                ax1.errorbar(df["n_bps"], df["auc_mean"], yerr=df["auc_std"], fmt='none', ecolor=color, capsize=3,
+                             alpha=0.6)
+                lines_ax1.extend(l1)
+                labels_ax1.append(f"{src} AUROC")
+
+            if self.do_aupr and "aupr_mean" in df.columns:
+                prc_plotted = True
+                l2 = ax2.plot(df["n_bps"], df["aupr_mean"], color=color, linewidth=2, marker='^', label=f"{src} AUPR")
+                ax2.errorbar(df["n_bps"], df["aupr_mean"], yerr=df["aupr_std"], fmt='none', ecolor=color, capsize=3,
+                             alpha=0.6)
+                lines_ax2.extend(l2)
+                labels_ax2.append(f"{src} AUPR")
+
+        if show_samples and not samp_df.empty:
+            color_samp = 'gray'
+            ls1 = ax1_twin.plot(samp_df["n_bps"], samp_df["n_samples_mean"], color=color_samp, linewidth=2,
+                                linestyle='--', marker='s', label="Samples")
+            ax1_twin.errorbar(samp_df["n_bps"], samp_df["n_samples_mean"], yerr=samp_df["n_samples_std"], fmt='none',
+                              ecolor=color_samp, capsize=3, alpha=0.5)
+            lines_ax1.extend(ls1)
+            labels_ax1.append("Samples")
+            ax1_twin.set_ylabel('Total Samples', color=color_samp)
+            ax1_twin.tick_params(axis='y', labelcolor=color_samp)
+
+            ls2 = ax2_twin.plot(samp_df["n_bps"], samp_df["n_samples_mean"], color=color_samp, linewidth=2,
+                                linestyle='--', marker='s', label="Samples")
+            ax2_twin.errorbar(samp_df["n_bps"], samp_df["n_samples_mean"], yerr=samp_df["n_samples_std"], fmt='none',
+                              ecolor=color_samp, capsize=3, alpha=0.5)
+            lines_ax2.extend(ls2)
+            labels_ax2.append("Samples")
+            ax2_twin.set_ylabel('Total Samples', color=color_samp)
+            ax2_twin.tick_params(axis='y', labelcolor=color_samp)
+
+        if roc_plotted:
+            ax1.set_title(f"{title_prefix} Saturation (AUROC)")
+            ax1.set_xlabel("Number of BioProjects")
+            ax1.set_ylabel("Mean AUROC")
+            ax1.legend(lines_ax1, labels_ax1, loc="best", fontsize='small')
+            ax1.grid(True, linestyle='--', alpha=0.6)
+        else:
+            ax1.text(0.5, 0.5, "AUROC Data Unavailable", ha='center', va='center')
+            if show_samples: ax1_twin.set_yticks([])
+
+        if prc_plotted:
+            ax2.set_title(f"{title_prefix} Saturation (AUPR)")
+            ax2.set_xlabel("Number of BioProjects")
+            ax2.set_ylabel("Mean AUPR")
+            ax2.legend(lines_ax2, labels_ax2, loc="best", fontsize='small')
+            ax2.grid(True, linestyle='--', alpha=0.6)
+        else:
+            ax2.text(0.5, 0.5, "AUPR Data Unavailable", ha='center', va='center')
+            if show_samples: ax2_twin.set_yticks([])
+
+        fig.tight_layout()
+        fig.savefig(out_file)
+        plt.close(fig)
+
     def _generate_plots(self, results: List[dict]):
         if not results:
             print("[Saturation] No results to plot.")
@@ -109,36 +188,11 @@ class BatchOrchestrator:
         df = pd.DataFrame(results)
         df.to_csv(self.base_outdir / "saturation_results_raw.tsv", sep="\t", index=False)
 
-        # 1. Aggregate samples independently (they don't care about MapMan vs GO)
         samp_agg = df[["n_bps", "iter", "n_samples"]].drop_duplicates().groupby("n_bps").agg(
             n_samples_mean=("n_samples", "mean"),
             n_samples_std=("n_samples", "std")
         ).reset_index().fillna(0)
 
-        color_samp = '#d35400'
-        colors = {
-            "MapMan": {"auc": "royalblue", "aupr": "firebrick"},
-            "GO": {"auc": "lightseagreen", "aupr": "orange"},
-            "Legacy": {"auc": "#2c3e50", "aupr": "#8e44ad"}
-        }
-
-        # Plot Single Sample Accumulation
-        try:
-            plt.figure(figsize=(8, 6))
-            plt.plot(samp_agg["n_bps"], samp_agg["n_samples_mean"], color=color_samp, linewidth=2, marker='s')
-            plt.errorbar(samp_agg["n_bps"], samp_agg["n_samples_mean"], yerr=samp_agg["n_samples_std"], fmt='none',
-                         ecolor='black', capsize=3)
-            plt.title("Sample Accumulation vs BioProject Count")
-            plt.xlabel("Number of BioProjects")
-            plt.ylabel("Total Samples")
-            plt.grid(True, linestyle='--', alpha=0.6)
-            plt.tight_layout()
-            plt.savefig(self.base_outdir / "saturation_samples.pdf")
-            plt.close()
-        except Exception as e:
-            print(f"[Plot Error - Samples] {e}")
-
-        # 2. Aggregate Metrics grouping by BioProjects AND Annotation Source
         if "source" not in df.columns:
             df["source"] = "Legacy"
 
@@ -153,121 +207,45 @@ class BatchOrchestrator:
         metric_agg = df.groupby(["n_bps", "source"]).agg(agg_dict).reset_index().fillna(0)
         metric_agg.columns = ['_'.join(col).strip('_') for col in metric_agg.columns.values]
 
-        # Merge sample stats back into the flat summary
         summary_df = pd.merge(metric_agg, samp_agg, on="n_bps", how="left")
         summary_df.to_csv(self.base_outdir / "saturation_results_summary.tsv", sep="\t", index=False)
 
+        colors = {
+            "MapMan": "firebrick",
+            "GO": "darkorange",
+            "Legacy": "purple"
+        }
+
         sources = metric_agg["source"].unique()
+        source_data_list = []
 
-        # --- AUROC PLOTS ---
-        if self.do_auroc and "auc_mean" in metric_agg.columns:
-            try:
-                plt.figure(figsize=(8, 6))
-                for src in sources:
-                    src_data = metric_agg[metric_agg["source"] == src]
-                    c = colors.get(src, colors["Legacy"])["auc"]
-                    plt.plot(src_data["n_bps"], src_data["auc_mean"], color=c, linewidth=2, marker='o',
-                             label=f"{src} AUROC")
-                    plt.errorbar(src_data["n_bps"], src_data["auc_mean"], yerr=src_data["auc_std"], fmt='none',
-                                 ecolor=c, capsize=3, alpha=0.6)
+        for src in sources:
+            src_df = metric_agg[metric_agg["source"] == src]
+            source_data_list.append({
+                'src': src,
+                'color': colors.get(src, "purple"),
+                'df': src_df
+            })
 
-                plt.title("Performance vs BioProject Count (AUROC)")
-                plt.xlabel("Number of BioProjects")
-                plt.ylabel("Mean AUROC")
-                plt.legend(loc="best")
-                plt.grid(True, linestyle='--', alpha=0.6)
-                plt.tight_layout()
-                plt.savefig(self.base_outdir / "saturation_auroc.pdf")
-                plt.close()
+        try:
+            for data in source_data_list:
+                src = data['src']
+                self._create_1x2_saturation_plot([data], samp_agg, show_samples=False, title_prefix=src,
+                                                 out_file=self.base_outdir / f"{src}_no_samples.pdf")
+                self._create_1x2_saturation_plot([data], samp_agg, show_samples=True, title_prefix=src,
+                                                 out_file=self.base_outdir / f"{src}_with_samples.pdf")
 
-                # Combined Plot
-                fig, ax1 = plt.subplots(figsize=(10, 6))
-                ax1.set_xlabel('Number of BioProjects')
-                ax1.set_ylabel('Mean AUROC')
+            if len(source_data_list) > 1:
+                self._create_1x2_saturation_plot(source_data_list, samp_agg, show_samples=False,
+                                                 title_prefix="Combined",
+                                                 out_file=self.base_outdir / "combined_no_samples.pdf")
+                self._create_1x2_saturation_plot(source_data_list, samp_agg, show_samples=True, title_prefix="Combined",
+                                                 out_file=self.base_outdir / "combined_with_samples.pdf")
 
-                lines = []
-                for src in sources:
-                    src_data = metric_agg[metric_agg["source"] == src]
-                    c = colors.get(src, colors["Legacy"])["auc"]
-                    l = ax1.plot(src_data["n_bps"], src_data["auc_mean"], color=c, linewidth=2, marker='o',
-                                 label=f"{src} AUROC")
-                    ax1.errorbar(src_data["n_bps"], src_data["auc_mean"], yerr=src_data["auc_std"], fmt='none',
-                                 ecolor=c, capsize=3, alpha=0.5)
-                    lines.extend(l)
+            print(f"\n[Saturation] Plots updated in {self.base_outdir}")
 
-                ax2 = ax1.twinx()
-                ax2.set_ylabel('Mean Samples', color=color_samp)
-                l2 = ax2.plot(samp_agg["n_bps"], samp_agg["n_samples_mean"], color=color_samp, linewidth=2,
-                              linestyle='--', marker='s', label="Samples")
-                ax2.errorbar(samp_agg["n_bps"], samp_agg["n_samples_mean"], yerr=samp_agg["n_samples_std"], fmt='none',
-                             ecolor='black', capsize=3, alpha=0.5)
-                lines.extend(l2)
-
-                plt.title("Saturation Analysis Summary (AUROC)")
-                labels = [l.get_label() for l in lines]
-                ax1.legend(lines, labels, loc='best')
-
-                fig.tight_layout()
-                plt.savefig(self.base_outdir / "saturation_combined_auroc.pdf")
-                plt.close()
-            except Exception as e:
-                print(f"[Plot Error - AUROC] {e}")
-
-        # --- AUPR PLOTS ---
-        if self.do_aupr and "aupr_mean" in metric_agg.columns:
-            try:
-                plt.figure(figsize=(8, 6))
-                for src in sources:
-                    src_data = metric_agg[metric_agg["source"] == src]
-                    c = colors.get(src, colors["Legacy"])["aupr"]
-                    plt.plot(src_data["n_bps"], src_data["aupr_mean"], color=c, linewidth=2, marker='^',
-                             label=f"{src} AUPR")
-                    plt.errorbar(src_data["n_bps"], src_data["aupr_mean"], yerr=src_data["aupr_std"], fmt='none',
-                                 ecolor=c, capsize=3, alpha=0.6)
-
-                plt.title("Performance vs BioProject Count (AUPR)")
-                plt.xlabel("Number of BioProjects")
-                plt.ylabel("Mean AUPR")
-                plt.legend(loc="best")
-                plt.grid(True, linestyle='--', alpha=0.6)
-                plt.tight_layout()
-                plt.savefig(self.base_outdir / "saturation_aupr.pdf")
-                plt.close()
-
-                # Combined Plot
-                fig, ax1 = plt.subplots(figsize=(10, 6))
-                ax1.set_xlabel('Number of BioProjects')
-                ax1.set_ylabel('Mean AUPR')
-
-                lines = []
-                for src in sources:
-                    src_data = metric_agg[metric_agg["source"] == src]
-                    c = colors.get(src, colors["Legacy"])["aupr"]
-                    l = ax1.plot(src_data["n_bps"], src_data["aupr_mean"], color=c, linewidth=2, marker='^',
-                                 label=f"{src} AUPR")
-                    ax1.errorbar(src_data["n_bps"], src_data["aupr_mean"], yerr=src_data["aupr_std"], fmt='none',
-                                 ecolor=c, capsize=3, alpha=0.5)
-                    lines.extend(l)
-
-                ax2 = ax1.twinx()
-                ax2.set_ylabel('Mean Samples', color=color_samp)
-                l2 = ax2.plot(samp_agg["n_bps"], samp_agg["n_samples_mean"], color=color_samp, linewidth=2,
-                              linestyle='--', marker='s', label="Samples")
-                ax2.errorbar(samp_agg["n_bps"], samp_agg["n_samples_mean"], yerr=samp_agg["n_samples_std"], fmt='none',
-                             ecolor='black', capsize=3, alpha=0.5)
-                lines.extend(l2)
-
-                plt.title("Saturation Analysis Summary (AUPR)")
-                labels = [l.get_label() for l in lines]
-                ax1.legend(lines, labels, loc='best')
-
-                fig.tight_layout()
-                plt.savefig(self.base_outdir / "saturation_combined_aupr.pdf")
-                plt.close()
-            except Exception as e:
-                print(f"[Plot Error - AUPR] {e}")
-
-        print(f"\n[Saturation] Plots updated in {self.base_outdir}")
+        except Exception as e:
+            print(f"[Plot Error] {e}")
 
     def regenerate_plots_from_raw(self):
         raw_file = self.base_outdir / "saturation_results_raw.tsv"
@@ -291,8 +269,31 @@ class BatchOrchestrator:
             print(f"[Error] Failed to read {raw_file}: {e}")
 
     def run(self):
+        # --- STATE VALIDATION LOGIC ---
+        state_file = self.base_outdir / "run_state.json"
+        current_state = {
+            "seed": self.seed,
+            "iterations": self.iterations,
+            "num_steps": self.num_steps,
+            "seidr_preset": getattr(self.config, "seidr_preset", "FAST")
+        }
+
+        if state_file.exists() and not self.force:
+            try:
+                with open(state_file, "r") as f:
+                    old_state = json.load(f)
+
+                if old_state != current_state:
+                    print(f"\n[Warn] Experimental parameters have changed since the last run!")
+                    print(f"[Warn] Old: {old_state}")
+                    print(f"[Warn] New: {current_state}")
+                    print(f"[Warn] Mixing structural parameters invalidates the saturation curve. Forcing a clean run.")
+                    self.force = True
+            except Exception:
+                self.force = True  # Corrupted JSON, burn it
+
         if self.force and self.base_outdir.exists():
-            print(f"[Saturation] Force=True: Purging {self.base_outdir}...")
+            print(f"[Saturation] Purging {self.base_outdir}...")
             for item in self.base_outdir.iterdir():
                 try:
                     if item.is_dir():
@@ -302,7 +303,13 @@ class BatchOrchestrator:
                 except Exception as e:
                     print(f"[Warn] Failed to delete {item}: {e}")
         else:
-            print(f"[Saturation] Smart Resume: Reusing existing files.")
+            print(f"[Saturation] Smart Resume: State validated. Reusing existing structural files.")
+
+        # Save current valid state
+        self.base_outdir.mkdir(parents=True, exist_ok=True)
+        with open(state_file, "w") as f:
+            json.dump(current_state, f, indent=4)
+        # ------------------------------
 
         bp_meta = []
         for bp in self.dataset.bioprojects:
@@ -396,13 +403,11 @@ class BatchOrchestrator:
 
             egad_tasks = []
             for item in egad_queue:
-                # 1. FIRST, check if we already have the valid output
                 if not self.force and item["out"].exists():
                     try:
                         df_check = pd.read_csv(item["out"], sep="\t")
                         if not df_check.empty:
                             if "Annotation_Source" in df_check.columns:
-                                # Multi-annotation extraction
                                 for src, group in df_check.groupby("Annotation_Source"):
                                     valid_group = group[group["Term"] != "None"]
                                     if valid_group.empty: continue
@@ -420,7 +425,6 @@ class BatchOrchestrator:
                                     final_results.append(res_dict)
                                 continue
                             else:
-                                # Legacy fallback
                                 valid = True
                                 auc_val, aupr_val = None, None
                                 if self.do_auroc:
@@ -449,11 +453,9 @@ class BatchOrchestrator:
                     except Exception as e:
                         print(f"[Warn] Corrupted EGAD output at {item['out']} ({e}). Re-queueing.")
 
-                # 2. THEN, if we actually need to calculate it, check if the network exists
                 if not item["net"].exists():
-                    continue  # Can't evaluate a network that failed to generate
+                    continue
 
-                # 3. If we made it here, the output is missing/bad AND the network exists. Queue it.
                 egad_tasks.append(item)
 
             if egad_tasks:
@@ -468,7 +470,7 @@ class BatchOrchestrator:
                                 out_file=i["out"],
                                 script_path=r_script,
                                 log_path=i["dir"] / "egad.log",
-                                curves_prefix=None,  # Explicitly no curves requested for saturation
+                                curves_prefix=None,
                                 do_auroc=self.do_auroc,
                                 do_aupr=self.do_aupr
                             ): i for i in egad_tasks
