@@ -377,8 +377,17 @@ def run_seidr_batch(cfg: Config, genes_file: Path, expression_file: Path, outdir
     _build_network_task(outdir, genes_file, expression_file, (threads or cfg.max_threads), 1, 1.28, "irp", algos, tools,
                         "saturation", False, None, True, log_path, True)
 
-    for d in [p for p in outdir.glob("*-*-*-*") if p.is_dir()]:
-        shutil.rmtree(d, ignore_errors=True)
+    # --- AGGRESSIVE CLEANUP & MARKER ---
+    allowed_files = {"expression.tsv", "genes.txt", "network_saturation_edges.tsv", "network_edges.tsv", ".seidr.done"}
+
+    for item in outdir.iterdir():
+        if item.is_dir():
+            shutil.rmtree(item, ignore_errors=True)
+        elif item.name not in allowed_files:
+            item.unlink(missing_ok=True)
+
+    # Emit the success marker
+    (outdir / ".seidr.done").touch()
 
 
 def run_seidr_agg_batch(batch_dir: Path, cfg: Config) -> None:

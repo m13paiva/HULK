@@ -958,7 +958,7 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
              help="Run data saturation analysis: Subsampling -> Seidr -> EGAD (AUROC/AUPR).")
 @click.option("-o", "--output", "output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
               default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
-@click.option("-i", "--iterations", type=int, default=10, show_default=True,
+@click.option("-i", "--iterations", type=int, default=3, show_default=True,
               help="Number of random subsampling iterations per step.")
 @click.option("-s", "--steps", type=int, default=10, show_default=True,
               help="Number of BioProject steps in the saturation curve.")

@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Optional, List, Tuple, TYPE_CHECKING, Dict, Any
+from typing import Optional, List, TYPE_CHECKING
 import concurrent.futures
 from tqdm import tqdm
 import random
@@ -72,7 +72,6 @@ class BatchOrchestrator:
             return df
 
     def _write_seidr_files(self, df: pd.DataFrame, out_dir: Path):
-        """Matrix is Sample x Gene. Seidr needs no headers/index."""
         df = df.fillna(0)
         g_file, e_file = out_dir / "genes.txt", out_dir / "expression.tsv"
         with open(g_file, "w") as f:
@@ -89,13 +88,11 @@ class BatchOrchestrator:
             return 0
 
     def _calculate_steps(self, total_bps: int) -> List[int]:
-        if total_bps <= self.num_steps:
-            return list(range(1, total_bps + 1))
+        if total_bps <= self.num_steps: return list(range(1, total_bps + 1))
         base = total_bps // self.num_steps
         remainder = total_bps % self.num_steps
         increments = [base] * self.num_steps
-        for i in range(1, remainder + 1):
-            increments[-i] += 1
+        for i in range(1, remainder + 1): increments[-i] += 1
         steps, current = [], 0
         for inc in increments:
             current += inc
@@ -103,22 +100,15 @@ class BatchOrchestrator:
         return sorted(list(set(steps)))
 
     def _create_1x2_saturation_plot(self, source_data_list, samp_df, show_samples, title_prefix, out_file):
-        """Helper to draw Saturation AUROC on the left and AUPR on the right, dynamically handling sample axes."""
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
         ax1_twin = ax1.twinx() if show_samples else None
         ax2_twin = ax2.twinx() if show_samples else None
 
-        roc_plotted = False
-        prc_plotted = False
-
-        lines_ax1, labels_ax1 = [], []
-        lines_ax2, labels_ax2 = [], []
+        roc_plotted, prc_plotted = False, False
+        lines_ax1, labels_ax1, lines_ax2, labels_ax2 = [], [], [], []
 
         for data in source_data_list:
-            src = data['src']
-            color = data['color']
-            df = data['df']
+            src, color, df = data['src'], data['color'], data['df']
 
             if self.do_auroc and "auc_mean" in df.columns:
                 roc_plotted = True
@@ -193,8 +183,7 @@ class BatchOrchestrator:
             n_samples_std=("n_samples", "std")
         ).reset_index().fillna(0)
 
-        if "source" not in df.columns:
-            df["source"] = "Legacy"
+        if "source" not in df.columns: df["source"] = "Legacy"
 
         agg_dict = {}
         if self.do_auroc and "auc" in df.columns: agg_dict["auc"] = ["mean", "std"]
@@ -210,106 +199,127 @@ class BatchOrchestrator:
         summary_df = pd.merge(metric_agg, samp_agg, on="n_bps", how="left")
         summary_df.to_csv(self.base_outdir / "saturation_results_summary.tsv", sep="\t", index=False)
 
-        colors = {
-            "MapMan": "firebrick",
-            "GO": "darkorange",
-            "Legacy": "purple"
-        }
-
+        colors = {"MapMan": "firebrick", "GO": "darkorange", "Legacy": "purple"}
         sources = metric_agg["source"].unique()
-        source_data_list = []
-
-        for src in sources:
-            src_df = metric_agg[metric_agg["source"] == src]
-            source_data_list.append({
-                'src': src,
-                'color': colors.get(src, "purple"),
-                'df': src_df
-            })
+        source_data_list = [
+            {'src': src, 'color': colors.get(src, "purple"), 'df': metric_agg[metric_agg["source"] == src]} for src in
+            sources]
 
         try:
             for data in source_data_list:
                 src = data['src']
-                self._create_1x2_saturation_plot([data], samp_agg, show_samples=False, title_prefix=src,
-                                                 out_file=self.base_outdir / f"{src}_no_samples.pdf")
-                self._create_1x2_saturation_plot([data], samp_agg, show_samples=True, title_prefix=src,
-                                                 out_file=self.base_outdir / f"{src}_with_samples.pdf")
+                self._create_1x2_saturation_plot([data], samp_agg, False, src,
+                                                 self.base_outdir / f"{src}_no_samples.pdf")
+                self._create_1x2_saturation_plot([data], samp_agg, True, src,
+                                                 self.base_outdir / f"{src}_with_samples.pdf")
 
             if len(source_data_list) > 1:
-                self._create_1x2_saturation_plot(source_data_list, samp_agg, show_samples=False,
-                                                 title_prefix="Combined",
-                                                 out_file=self.base_outdir / "combined_no_samples.pdf")
-                self._create_1x2_saturation_plot(source_data_list, samp_agg, show_samples=True, title_prefix="Combined",
-                                                 out_file=self.base_outdir / "combined_with_samples.pdf")
+                self._create_1x2_saturation_plot(source_data_list, samp_agg, False, "Combined",
+                                                 self.base_outdir / "combined_no_samples.pdf")
+                self._create_1x2_saturation_plot(source_data_list, samp_agg, True, "Combined",
+                                                 self.base_outdir / "combined_with_samples.pdf")
 
             print(f"\n[Saturation] Plots updated in {self.base_outdir}")
-
         except Exception as e:
             print(f"[Plot Error] {e}")
 
     def regenerate_plots_from_raw(self):
         raw_file = self.base_outdir / "saturation_results_raw.tsv"
         if not raw_file.exists():
-            print(f"[Error] Cannot plot. Missing {raw_file}. Did you even run it completely once?")
+            print(f"[Error] Cannot plot. Missing {raw_file}.")
             return
         try:
             print(f"[Saturation] Plot-only mode active. Reading {raw_file}...")
             df = pd.read_csv(raw_file, sep="\t")
-
-            required_cols = ["n_bps", "n_samples"]
-            if self.do_auroc: required_cols.append("auc")
-            if self.do_aupr: required_cols.append("aupr")
-
-            if not all(col in df.columns for col in required_cols):
-                print(
-                    f"[Error] The file {raw_file} is malformed. Missing required columns based on your metrics request.")
-                return
             self._generate_plots(df.to_dict('records'))
         except Exception as e:
             print(f"[Error] Failed to read {raw_file}: {e}")
 
     def run(self):
-        # --- STATE VALIDATION LOGIC ---
+        # --- CASCADING STATE VALIDATION LOGIC ---
         state_file = self.base_outdir / "run_state.json"
+
         current_state = {
             "seed": self.seed,
             "iterations": self.iterations,
             "num_steps": self.num_steps,
-            "seidr_preset": getattr(self.config, "seidr_preset", "FAST")
+            "seidr_preset": getattr(self.config, "seidr_preset", "FAST"),
+            "mapman_file": str(self.mapman_file) if self.mapman_file else None,
+            "go_file": str(self.go_file) if self.go_file else None,
+            "do_auroc": self.do_auroc,
+            "do_aupr": self.do_aupr
         }
 
-        if state_file.exists() and not self.force:
+        force_wipe_level = 0
+
+        if self.force:
+            force_wipe_level = 3
+        elif state_file.exists():
             try:
                 with open(state_file, "r") as f:
                     old_state = json.load(f)
 
-                if old_state != current_state:
-                    print(f"\n[Warn] Experimental parameters have changed since the last run!")
-                    print(f"[Warn] Old: {old_state}")
-                    print(f"[Warn] New: {current_state}")
-                    print(f"[Warn] Mixing structural parameters invalidates the saturation curve. Forcing a clean run.")
-                    self.force = True
-            except Exception:
-                self.force = True  # Corrupted JSON, burn it
+                # Level 3: Structural changes require complete nuke
+                if old_state.get("seed") != current_state["seed"] or \
+                        old_state.get("iterations") != current_state["iterations"] or \
+                        old_state.get("num_steps") != current_state["num_steps"]:
+                    print("[Saturation] Structural parameters changed. Forcing Level 3 wipe (Complete Restart).")
+                    force_wipe_level = 3
 
-        if self.force and self.base_outdir.exists():
-            print(f"[Saturation] Purging {self.base_outdir}...")
+                # Level 2: Preset changes require Seidr + EGAD wipe (Batches remain intact)
+                elif old_state.get("seidr_preset") != current_state["seidr_preset"]:
+                    print("[Saturation] Seidr preset changed. Forcing Level 2 wipe (Restarting from Inference).")
+                    force_wipe_level = 2
+
+                # Level 1: Metric/Annotation changes require EGAD wipe (Batches and Networks remain intact)
+                elif old_state.get("mapman_file") != current_state["mapman_file"] or \
+                        old_state.get("go_file") != current_state["go_file"] or \
+                        old_state.get("do_auroc") != current_state["do_auroc"] or \
+                        old_state.get("do_aupr") != current_state["do_aupr"]:
+                    print("[Saturation] Evaluation metrics changed. Forcing Level 1 wipe (Restarting EGAD Analysis).")
+                    force_wipe_level = 1
+
+                else:
+                    print("[Saturation] Parameters identical. Resuming execution using phase markers.")
+
+            except Exception:
+                print("[Warn] Corrupted state file. Forcing Level 3 complete restart.")
+                force_wipe_level = 3
+        else:
+            force_wipe_level = 3
+
+        # Apply targeted wipes
+        if force_wipe_level == 3 and self.base_outdir.exists():
+            print(f"[Saturation] Purging entire directory: {self.base_outdir}...")
             for item in self.base_outdir.iterdir():
                 try:
                     if item.is_dir():
                         shutil.rmtree(item)
                     else:
                         item.unlink()
-                except Exception as e:
-                    print(f"[Warn] Failed to delete {item}: {e}")
-        else:
-            print(f"[Saturation] Smart Resume: State validated. Reusing existing structural files.")
+                except Exception:
+                    pass
+
+        elif force_wipe_level == 2:
+            print("[Saturation] Purging previous Network and Evaluation outputs...")
+            for iter_dir in self.base_outdir.glob("step*/iter*"):
+                for f in [".seidr.done", ".egad.done", "network_saturation_edges.tsv", "egad_results.tsv",
+                          "seidr_batch.log", "egad.log"]:
+                    (iter_dir / f).unlink(missing_ok=True)
+            (self.base_outdir / ".saturation.done").unlink(missing_ok=True)
+
+        elif force_wipe_level == 1:
+            print("[Saturation] Purging previous Evaluation outputs...")
+            for iter_dir in self.base_outdir.glob("step*/iter*"):
+                for f in [".egad.done", "egad_results.tsv", "egad.log"]:
+                    (iter_dir / f).unlink(missing_ok=True)
+            (self.base_outdir / ".saturation.done").unlink(missing_ok=True)
 
         # Save current valid state
         self.base_outdir.mkdir(parents=True, exist_ok=True)
         with open(state_file, "w") as f:
             json.dump(current_state, f, indent=4)
-        # ------------------------------
+        # ----------------------------------------------
 
         bp_meta = []
         for bp in self.dataset.bioprojects:
@@ -323,8 +333,7 @@ class BatchOrchestrator:
         step_name_map = {n: f"step{i + 1}" for i, n in enumerate(bp_steps)}
 
         print(f"\n[Saturation] BioProject Steps (Total {total_bps} BPs):")
-        for n, sname in step_name_map.items():
-            print(f"  {sname}: {n} BPs")
+        for n, sname in step_name_map.items(): print(f"  {sname}: {n} BPs")
 
         work_definitions = []
         for n_bps in bp_steps:
@@ -345,17 +354,14 @@ class BatchOrchestrator:
                 e_path = global_expr if n_bps == total_bps else iter_dir / "expression.tsv"
 
                 seidr_queue.append((g_path, e_path, iter_dir, s_name, iter_num))
-
                 egad_queue.append({
                     "n_bps": n_bps, "iter": iter_num, "dir": iter_dir,
                     "net": iter_dir / "network_saturation_edges.tsv",
                     "out": iter_dir / "egad_results.tsv", "expr": e_path
                 })
 
-                if n_bps < total_bps:
-                    if not self.force and g_path.exists() and e_path.exists():
-                        pass
-                    else:
+                if not (iter_dir / ".batch.done").exists():
+                    if n_bps < total_bps:
                         target_samples = n_bps * avg_samples_per_bp
                         current_selection = random.sample(bp_meta, n_bps)
                         current_n = sum(x['size'] for x in current_selection)
@@ -383,27 +389,30 @@ class BatchOrchestrator:
                             sub = matrix.loc[final_s].copy().fillna(0)
                             sub = sub.loc[:, sub.var(axis=0) > 0.1]
                             if not sub.empty: self._write_seidr_files(sub, iter_dir)
+
+                    (iter_dir / ".batch.done").touch()
+
                 pbar.update(1)
 
         print(f"\n[Phase 2] Seidr Inference...")
-        tasks = [i for i in seidr_queue if self.force or not (i[2] / ".saturation.done").exists()]
-        if tasks:
+        seidr_tasks = [i for i in seidr_queue if not (i[2] / ".seidr.done").exists()]
+        if seidr_tasks:
             threads = max(1, self.total_thread_budget // self.workers)
             preset = getattr(self.config, "seidr_preset", "FAST")
-            with tqdm(total=len(seidr_queue), initial=len(seidr_queue) - len(tasks), desc="Seidr Inf") as p_inf:
+            with tqdm(total=len(seidr_queue), initial=len(seidr_queue) - len(seidr_tasks), desc="Seidr Inf") as p_inf:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
                     f_map = {executor.submit(run_seidr_batch, self.config, i[0], i[1], i[2], preset, threads): i for i
-                             in tasks}
+                             in seidr_tasks}
                     for f in concurrent.futures.as_completed(f_map): p_inf.update(1)
 
         final_results = []
         if self.mapman_file or self.go_file:
             print(f"\n[Phase 3] EGAD Analysis...")
             r_script = get_egad_script_path()
-
             egad_tasks = []
+
             for item in egad_queue:
-                if not self.force and item["out"].exists():
+                if (item["dir"] / ".egad.done").exists() and item["out"].exists():
                     try:
                         df_check = pd.read_csv(item["out"], sep="\t")
                         if not df_check.empty:
@@ -411,82 +420,54 @@ class BatchOrchestrator:
                                 for src, group in df_check.groupby("Annotation_Source"):
                                     valid_group = group[group["Term"] != "None"]
                                     if valid_group.empty: continue
-
-                                    res_dict = {
-                                        'n_bps': item['n_bps'],
-                                        'iter': item['iter'],
-                                        'n_samples': self._count_samples_from_file(item["expr"]),
-                                        'source': src
-                                    }
-                                    if self.do_auroc and "AUC" in valid_group.columns:
-                                        res_dict['auc'] = valid_group["AUC"].mean()
-                                    if self.do_aupr and "AUPR" in valid_group.columns:
-                                        res_dict['aupr'] = valid_group["AUPR"].mean()
-                                    final_results.append(res_dict)
-                                continue
-                            else:
-                                valid = True
-                                auc_val, aupr_val = None, None
-                                if self.do_auroc:
-                                    if "AUC" not in df_check.columns:
-                                        valid = False
-                                    else:
-                                        auc_val = df_check["AUC"].mean()
-                                if self.do_aupr:
-                                    if "AUPR" not in df_check.columns:
-                                        valid = False
-                                    else:
-                                        aupr_val = df_check["AUPR"].mean()
-
-                                if valid:
                                     res_dict = {
                                         'n_bps': item['n_bps'], 'iter': item['iter'],
                                         'n_samples': self._count_samples_from_file(item["expr"]),
-                                        'source': "Legacy"
+                                        'source': src
                                     }
-                                    if self.do_auroc: res_dict['auc'] = auc_val
-                                    if self.do_aupr: res_dict['aupr'] = aupr_val
+                                    if self.do_auroc and "AUC" in valid_group.columns: res_dict['auc'] = valid_group[
+                                        "AUC"].mean()
+                                    if self.do_aupr and "AUPR" in valid_group.columns: res_dict['aupr'] = valid_group[
+                                        "AUPR"].mean()
                                     final_results.append(res_dict)
-                                    continue
-                        else:
-                            print(f"[Warn] Output {item['out']} is missing requested metrics or empty. Re-queueing.")
+                            else:
+                                res_dict = {
+                                    'n_bps': item['n_bps'], 'iter': item['iter'],
+                                    'n_samples': self._count_samples_from_file(item["expr"]),
+                                    'source': "Legacy"
+                                }
+                                if self.do_auroc and "AUC" in df_check.columns: res_dict['auc'] = df_check["AUC"].mean()
+                                if self.do_aupr and "AUPR" in df_check.columns: res_dict['aupr'] = df_check[
+                                    "AUPR"].mean()
+                                final_results.append(res_dict)
                     except Exception as e:
-                        print(f"[Warn] Corrupted EGAD output at {item['out']} ({e}). Re-queueing.")
-
-                if not item["net"].exists():
-                    continue
-
-                egad_tasks.append(item)
+                        print(f"[Warn] Failed reading {item['out']}: {e}")
+                else:
+                    if (item["dir"] / ".seidr.done").exists():
+                        egad_tasks.append(item)
 
             if egad_tasks:
                 with tqdm(total=len(egad_queue), initial=len(egad_queue) - len(egad_tasks), desc="EGAD Eval") as p_egad:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
                         f_map = {
                             executor.submit(
-                                run_egad_task,
-                                network_file=i["net"],
-                                mapman_file=self.mapman_file,
+                                run_egad_task, network_file=i["net"], mapman_file=self.mapman_file,
                                 go_file=self.go_file,
-                                out_file=i["out"],
-                                script_path=r_script,
-                                log_path=i["dir"] / "egad.log",
+                                out_file=i["out"], script_path=r_script, log_path=i["dir"] / "egad.log",
                                 curves_prefix=None,
-                                do_auroc=self.do_auroc,
-                                do_aupr=self.do_aupr
+                                do_auroc=self.do_auroc, do_aupr=self.do_aupr
                             ): i for i in egad_tasks
                         }
 
                         for f in concurrent.futures.as_completed(f_map):
                             it = f_map[f]
                             results_dict = f.result()
-
                             if results_dict:
+                                (it["dir"] / ".egad.done").touch()
                                 for src, mets in results_dict.items():
                                     res_dict = {
-                                        'n_bps': it['n_bps'],
-                                        'iter': it['iter'],
-                                        'n_samples': self._count_samples_from_file(it["expr"]),
-                                        'source': src
+                                        'n_bps': it['n_bps'], 'iter': it['iter'],
+                                        'n_samples': self._count_samples_from_file(it["expr"]), 'source': src
                                     }
                                     if self.do_auroc and mets.get('auc') is not None: res_dict['auc'] = mets['auc']
                                     if self.do_aupr and mets.get('aupr') is not None: res_dict['aupr'] = mets['aupr']
@@ -494,3 +475,4 @@ class BatchOrchestrator:
                             p_egad.update(1)
 
             self._generate_plots(final_results)
+            (self.base_outdir / ".saturation.done").touch()
