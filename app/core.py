@@ -14,10 +14,14 @@ from .seidr import run_seidr_single
 
 def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
     """
-    Sets up the output directory structure and log files.
-    """
+    Prepares the file system layout, clears hazardous directories safely,
+    and initializes primary global logging interfaces.
 
-    # 1. The Purge (rem-missing-bps)
+    Args:
+        cfg (Config): System configuration state object.
+        dataset (Dataset): Validated dataset tracking the expected BioProject domains.
+    """
+    # 1. Structural cleanup procedure for extraneous paths
     if cfg.rem_missing_bps and cfg.outdir.exists():
         if getattr(dataset, "mode", "SRR") != "SRR":
             print("[WARNING] --rem-missing-bps ignored: Only applicable in SRA mode.")
@@ -44,12 +48,12 @@ def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
                             except Exception as ex:
                                 print(f"Failed to remove {folder}: {ex}")
 
-    # 2. Standard Directory Setup
+    # 2. Base Output Structural Layout
     cfg.outdir.mkdir(parents=True, exist_ok=True)
     cfg.shared.mkdir(parents=True, exist_ok=True)
     cfg.cache.mkdir(parents=True, exist_ok=True)
 
-    # Initialize Log
+    # 3. Log System Initialization
     if not cfg.dry_run:
         mode = 'a'
         with open(cfg.log, mode, encoding="utf-8") as f:
@@ -61,8 +65,16 @@ def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
                 f.write("!! Run mode: REM_MISSING_BPS (Destructive Cleanup) !!\n")
             f.write(f"{'=' * 60}\n")
 
-def pipeline(data: "Dataset", cfg: "Config") -> None:
 
+def pipeline(data: "Dataset", cfg: "Config") -> None:
+    """
+    Executes the central processing sequence of the application, managing orchestrator bounds
+    and firing global aggregation endpoints post execution.
+
+    Args:
+        data (Dataset): Context dataset loaded into memory.
+        cfg (Config): Running configuration variables.
+    """
     prepare_runtime_environment(cfg,data)
     data.update_status()
     outdir: Path = cfg.outdir
@@ -70,7 +82,6 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     cache_dir: Path = cfg.cache
     log_path: Path = cfg.log
     reference: Path = cfg.reference_path
-    tximport_opts = getattr(cfg, "tximport_opts", {})
 
     temp_dir: Path = getattr(cfg, "temp_dir", shared / "tmp")
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -88,6 +99,7 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         bp_ids = [bp.id for bp in getattr(data, "bioprojects", [])]
         log(f"BioProjects ({bp_total}, done {bp_done}): {', '.join(sorted(bp_ids))}", log_path)
 
+    # Execute reference indexing if source is standard FASTA
     if reference and reference.suffix.lower() != ".idx":
         transcripts_index = build_transcriptome_index(reference, shared, log_path)
     else:
@@ -111,7 +123,7 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         for s in getattr(data, "samples", []):
             log(f"[PLAN] FASTQ sample {s.id} -> {s.outdir}", log_path)
 
-    # Run orchestrator
+    # Delegate sequence to parallel processing manager
     run_download_and_process(
         dataset=data,
         cfg=cfg,
@@ -121,7 +133,7 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         log_path=log_path,
     )
 
-    # Global MultiQC
+    # Finalize MultiQC summarization
     if not cfg.no_global_postprocessing:
         try:
             log("Generating Global MultiQC report...", log_path)
@@ -132,8 +144,7 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     else:
         log("Skipping Global MultiQC (--no-global-postprocessing).", log_path)
 
-
-    # Post-processing
+    # Invoke R dependency chains
     if getattr(cfg, "tx2gene", None) is not None:
         run__postprocessing(data, cfg, skip_bp=True)
 

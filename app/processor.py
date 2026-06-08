@@ -12,7 +12,7 @@ from threading import BoundedSemaphore
 from tqdm.auto import tqdm
 
 from .utils import log, run_cmd, pad_desc
-from .prefetcher import prefetch_one  # ← used in no-cache mode
+from .prefetcher import prefetch_one
 from .align import (
     kallisto_single_cmd,
     kallisto_paired_cmd,
@@ -22,12 +22,13 @@ POLL_SECS = 3.0
 
 
 def _temp_fs_free_bytes(temp_dir: Path) -> int:
+    """Calculates the available free space on the host temporary file system."""
     st = os.statvfs(str(temp_dir))
-    # use f_bavail to respect reserved blocks
     return st.f_bavail * st.f_frsize
 
 
-def _rm(p: Path):
+def _rm(p: Path) -> None:
+    """Atomically resolves file unlinking or directory tree removal structures."""
     if not p.exists():
         return
     if p.is_dir():
@@ -40,44 +41,49 @@ def _rm(p: Path):
 
 
 def _bundle_srr(
-    sample: "Sample",
-    *,
-    cfg: "Config",
-    cache_dir: Path,
-    work_root: Path,
-    temp_dir: Path,
-    dump_threads: int = 1,
-    fastp_threads: int = 4,
-    kallisto_threads: int = 12,
+        sample: "Sample",
+        *,
+        cfg: "Config",
+        cache_dir: Path,
+        work_root: Path,
+        temp_dir: Path,
+        dump_threads: int = 1,
+        fastp_threads: int = 4,
+        kallisto_threads: int = 12,
 ) -> Dict[str, str]:
     """
-    One SRR end-to-end: prefetch (optionally) → fasterq-dump → fastp → kallisto quant.
+    Executes a complete standard preprocessing sub-routine handling public SRR targets.
 
-    In cache mode:
-      • SRA is expected in shared cache (prefetch thread).
-    In no-cache mode:
-      • prefetch_one() is called here, writing a temporary .sra into sample.outdir.
+    Includes runtime dispatch for prefetch operations, read splitting using fasterq-dump,
+    adapter trimming via fastp, and pseudo-alignment utilizing kallisto.
+
+    Args:
+        sample (Sample): Target record.
+        cfg (Config): Running profile logic.
+        cache_dir (Path): Pre-allocated shared cache block.
+        work_root (Path): Output generation structure.
+        temp_dir (Path): Volatile temporary path for pipeline artifacts.
+        dump_threads (int, optional): Toolkit threads limit. Defaults to 1.
+        fastp_threads (int, optional): Worker limit for trimming logic. Defaults to 4.
+        kallisto_threads (int, optional): Worker limit for pseudo-alignment. Defaults to 12.
+
+    Returns:
+        Dict[str, str]: Operation tracking map linking identifier to finalized status.
     """
     srr = sample.id
-
-    # SRR output directory: should already be something like <outdir>/<BioProject>/<SRR>
     outdir = sample.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
-    # temp dir for fasterq-dump
     tmp = (temp_dir / f"{srr}_tmp").resolve()
     tmp.mkdir(parents=True, exist_ok=True)
 
-    # how many bootstraps? come from cfg.align settings, default 100
     bootstraps = int(getattr(cfg, "kallisto_bootstrap", 100))
 
-    # Determine .sra location depending on cache mode
     if getattr(cfg, "no_cache", False):
-        # no-cache mode: prefetch directly into run directory if needed
         if getattr(sample, "sra_path", None) is None or not Path(sample.sra_path).exists():
             pre_res = prefetch_one(
                 sample,
-                outdir,       # use SRR directory as "cache_dir" → SRR.sra lives here
+                outdir,
                 sample.log_path,
                 overwrite=True,
             )
@@ -88,15 +94,11 @@ def _bundle_srr(
         else:
             sra = Path(sample.sra_path)
     else:
-        # cache mode: use shared cache location
         sra = sample.sra_path or (cache_dir / f"{srr}.sra")
 
     try:
         sample.status = "processing"
 
-        # -------------------------------
-        # fasterq-dump → raw FASTQs in outdir
-        # -------------------------------
         run_cmd(
             [
                 "fasterq-dump",
@@ -114,7 +116,6 @@ def _bundle_srr(
             sample.log_path,
         )
 
-        # detect FASTQs (and ignore empty mates)
         fq1 = outdir / f"{srr}_1.fastq"
         fq2 = outdir / f"{srr}_2.fastq"
         se = outdir / f"{srr}.fastq"
@@ -129,19 +130,14 @@ def _bundle_srr(
             if se.exists() and se.stat().st_size > 0:
                 fqs = [se]
             elif fq1.exists() and fq1.stat().st_size > 0:
-                # fallback: treat as SE but normalize name for downstream
                 new_se = outdir / f"{srr}.fastq"
                 fq1.rename(new_se)
                 fqs = [new_se]
             else:
                 raise FileNotFoundError(f"No usable FASTQ files for {srr} in {outdir}")
 
-        # remove .sra as soon as we have fastqs on disk
         _rm(sra)
 
-        # -------------------------------
-        # fastp → trimmed FASTQs (CANONICAL NAMES)
-        # -------------------------------
         cmd = ["fastp", "-w", str(fastp_threads)]
 
         if len(fqs) == 2:
@@ -161,25 +157,19 @@ def _bundle_srr(
 
         run_cmd(cmd, outdir, sample.log_path)
 
-        # CLEANUP STEP 1 — remove *raw* FASTQs produced by fasterq-dump
         for p in fqs:
             if p is not None and p.exists():
                 _rm(p)
 
-        # -------------------------------
-        # kallisto quant (via align.py helpers)
-        # -------------------------------
         idx = Path(cfg.reference_path).resolve()
         if not idx.exists():
             raise FileNotFoundError(f"kallisto index not found at {idx}")
 
-        # Prefer sample's own Model (from input table). Fall back to global seq_tech if needed.
         platform = None
         meta = getattr(sample, "metadata", None) or {}
         platform = meta.get("Model") or meta.get("Platform") or getattr(cfg, "seq_tech", None)
 
         if len(trimmed) == 2:
-            # paired-end
             qcmd = kallisto_paired_cmd(
                 run_dir=outdir,
                 run_id=srr,
@@ -190,7 +180,6 @@ def _bundle_srr(
                 bootstraps=bootstraps,
             )
         else:
-            # single-end
             qcmd = kallisto_single_cmd(
                 run_dir=outdir,
                 run_id=srr,
@@ -204,16 +193,13 @@ def _bundle_srr(
 
         run_cmd(qcmd, outdir, sample.log_path)
 
-        # CLEANUP STEP 2 — remove trimmed FASTQs unless user requested to keep them
         if not getattr(cfg, "keep_fastq", False):
             for p in trimmed:
                 if p.exists():
                     _rm(p)
 
-        # CLEANUP STEP 3 — temp dir for fasterq-dump
         _rm(tmp)
 
-        # CLEANUP STEP 4 — in no-cache mode, remove the local .sra as well
         if getattr(cfg, "no_cache", False) and sra.exists() and sra.parent == outdir:
             _rm(sra)
 
@@ -227,23 +213,27 @@ def _bundle_srr(
 
 
 def _process_fastq(
-    sample: "Sample",
-    *,
-    cfg: "Config",
-    work_root: Path,
-    fastp_threads: int = 4,
-    kallisto_threads: int = 12,
+        sample: "Sample",
+        *,
+        cfg: "Config",
+        work_root: Path,
+        fastp_threads: int = 4,
+        kallisto_threads: int = 12,
 ) -> Dict[str, str]:
     """
-    FASTQ-only mode:
-      • use sample.fastq_paths (1 = SE, 2 = PE)
-      • fastp → trimmed FASTQs under a per-sample outdir
-      • kallisto quant on trimmed FASTQs using align.py helpers.
+    Executes a complete standard preprocessing sub-routine managing local unarchived sources.
+
+    Args:
+        sample (Sample): Target localized record.
+        cfg (Config): Running profile logic.
+        work_root (Path): Output generation structure.
+        fastp_threads (int, optional): Worker limit for trimming logic. Defaults to 4.
+        kallisto_threads (int, optional): Worker limit for pseudo-alignment. Defaults to 12.
+
+    Returns:
+        Dict[str, str]: Operation tracking map connecting target strings to finalized status strings.
     """
     sid = sample.id
-
-    # Prefer sample.outdir if already set (e.g. <outdir>/samples/<sid>),
-    # otherwise fall back to <work_root>/<sid>.
     outdir = getattr(sample, "outdir", None)
     if outdir is None:
         outdir = (work_root / sid).resolve()
@@ -257,18 +247,12 @@ def _process_fastq(
     if not fqs:
         raise FileNotFoundError(f"No FASTQ paths registered for FASTQ sample '{sid}'")
 
-    # how many bootstraps? come from cfg.align settings, default 100
     bootstraps = int(getattr(cfg, "kallisto_bootstrap", 100))
 
     try:
         sample.status = "processing"
 
-        # -------------------------------
-        # fastp → trimmed FASTQs
-        # -------------------------------
-        # We never touch the original FASTQs (they're user-provided).
         if len(fqs) == 2:
-            # paired-end: canonical trimmed names <sid>_1.trim.fastq, <sid>_2.trim.fastq
             trimmed_r1 = outdir / f"{sid}_1.trim.fastq"
             trimmed_r2 = outdir / f"{sid}_2.trim.fastq"
             trimmed = [trimmed_r1, trimmed_r2]
@@ -282,7 +266,6 @@ def _process_fastq(
                 "-O", str(trimmed_r2),
             ]
         elif len(fqs) == 1:
-            # single-end: canonical trimmed name <sid>.trim.fastq
             trimmed_se = outdir / f"{sid}.trim.fastq"
             trimmed = [trimmed_se]
 
@@ -293,25 +276,19 @@ def _process_fastq(
                 "-o", str(trimmed_se),
             ]
         else:
-            # more than 2 FASTQs per sample is not supported in this simple layout
             raise ValueError(
                 f"Sample '{sid}' has {len(fqs)} FASTQ files; expected 1 (SE) or 2 (PE)."
             )
 
         run_cmd(cmd, outdir, sample.log_path)
 
-        # -------------------------------
-        # kallisto quant (via align.py helpers)
-        # -------------------------------
         idx = Path(cfg.reference_path).resolve()
         if not idx.exists():
             raise FileNotFoundError(f"kallisto index not found at {idx}")
 
-        # In FASTQ mode we rely on global CLI-provided technology
         platform = getattr(cfg, "seq_tech", None)
 
         if len(trimmed) == 2:
-            # paired-end
             qcmd = kallisto_paired_cmd(
                 run_dir=outdir,
                 run_id=sid,
@@ -322,7 +299,6 @@ def _process_fastq(
                 bootstraps=bootstraps,
             )
         else:
-            # single-end
             qcmd = kallisto_single_cmd(
                 run_dir=outdir,
                 run_id=sid,
@@ -336,7 +312,6 @@ def _process_fastq(
 
         run_cmd(qcmd, outdir, sample.log_path)
 
-        # CLEANUP — keep or remove trimmed FASTQs according to cfg.keep_fastq
         if not getattr(cfg, "keep_fastq", False):
             for p in trimmed:
                 if p.exists():
@@ -352,28 +327,39 @@ def _process_fastq(
 
 
 def process(
-    dataset: "Dataset",
-    *,
-    cfg: "Config",
-    cache_dir: Path,
-    work_root: Path,
-    temp_dir: Path,
-    log_path: Path,
-    max_bundles: int = 2,
-    poll_secs: float = POLL_SECS,
-    tmp_low_water_gb: int = 0,
-    dump_threads: int = 1,
-    fastp_threads: int = 4,
-    kallisto_threads: int = 12,
+        dataset: "Dataset",
+        *,
+        cfg: "Config",
+        cache_dir: Path,
+        work_root: Path,
+        temp_dir: Path,
+        log_path: Path,
+        max_bundles: int = 2,
+        poll_secs: float = POLL_SECS,
+        tmp_low_water_gb: int = 0,
+        dump_threads: int = 1,
+        fastp_threads: int = 4,
+        kallisto_threads: int = 12,
 ) -> Dict[str, str]:
     """
-    Daemon that launches SRR / FASTQ bundles with concurrency control.
+    Manages the concurrent processing loop launching task pipelines against hardware block limits.
 
-    In cache mode:
-      • waits for samples to be 'prefetched' by the prefetch thread.
+    Args:
+        dataset (Dataset): Complete data block array matrix.
+        cfg (Config): Environmental configuration profiles.
+        cache_dir (Path): Pre-allocated shared cache layer block.
+        work_root (Path): Finalized output structural anchor.
+        temp_dir (Path): Volatile temporary path for artifact holding arrays.
+        log_path (Path): Logging routing destination tracking thread logs.
+        max_bundles (int, optional): System task concurrency constraints. Defaults to 2.
+        poll_secs (float, optional): Block wait loop intervals. Defaults to POLL_SECS.
+        tmp_low_water_gb (int, optional): Hard block limit pausing extraction loops. Defaults to 0.
+        dump_threads (int, optional): Worker limit for extraction modules. Defaults to 1.
+        fastp_threads (int, optional): Worker limit for trimming logic. Defaults to 4.
+        kallisto_threads (int, optional): Worker limit for alignment. Defaults to 12.
 
-    In no-cache mode (cfg.no_cache=True):
-      • does NOT wait for 'prefetched' status — _bundle_srr() will call prefetch_one() itself.
+    Returns:
+        Dict[str, str]: Collection object tracking finalized completion identifiers mapped to output statuses.
     """
     cache_dir = cache_dir.resolve()
     work_root = work_root.resolve()
@@ -388,7 +374,6 @@ def process(
 
     total = len(dataset)
 
-    # Count already finished samples
     initial_offset = sum(
         1 for s in dataset.samples
         if getattr(s, "status", None) in {"done", "failed", "skipped"}
@@ -408,13 +393,10 @@ def process(
         pbar.refresh()
 
     def maybe_launch(sample: "Sample"):
-        # Only launch when ready
         if dataset.mode == "SRR":
             if getattr(cfg, "no_cache", False):
-                # no-cache mode → don't wait for prefetch thread; _bundle_srr will prefetch
                 pass
             else:
-                # cache mode → require prefetch thread to have set status="prefetched"
                 if getattr(sample, "status", None) != "prefetched":
                     return False
         elif dataset.mode == "FASTQ":
@@ -452,7 +434,6 @@ def process(
 
     try:
         while True:
-            # collect finished bundles
             for f in list(futures):
                 if f.done():
                     futures.remove(f)
@@ -461,14 +442,12 @@ def process(
                     results[res["run_id"]] = res["status"]
                     pbar.update(1)
 
-            # launch new work
             for s in dataset.to_do():
                 maybe_launch(s)
 
-            # exit condition
             if not futures and all(
-                getattr(s, "status", None) in {"done", "failed", "skipped"}
-                for s in dataset.to_do()
+                    getattr(s, "status", None) in {"done", "failed", "skipped"}
+                    for s in dataset.to_do()
             ):
                 break
 

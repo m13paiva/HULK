@@ -14,12 +14,12 @@ suppressPackageStartupMessages({
   library(circlize)
 })
 
+# Helper function providing fallback value evaluation
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
-## ===========================
-## CLI OPTIONS
-## ===========================
-
+# ==============================================================================
+# CLI OPTIONS SPECIFICATION
+# ==============================================================================
 option_list <- list(
   make_option(c("-s", "--search-dir"), dest = "search_dir", type = "character", default = "output"),
   make_option(c("-x", "--exclude-dir"), dest = "exclude_dir", type = "character", action = "append", default = c("_mqc_inputs", "multiqc_data", "multiqc", "shared", "logs")),
@@ -47,15 +47,18 @@ option_list <- list(
 
 opt <- parse_args(OptionParser(option_list = option_list))
 
-# --- CRITICAL LOCALE FIX ---
+# ------------------------------------------------------------------------------
+# LOCALE NORMALIZATION
+# Forces computational evaluation logic outside of environment variable pollution.
+# ------------------------------------------------------------------------------
 Sys.setlocale("LC_NUMERIC", "C")
 options(scipen = 999)
 options(OutDec = ".")
 
 msg <- function(...) cat(sprintf(...), "\n", sep = "")
 
-# --- MANUAL WRITER FUNCTION ---
 write_seidr_manual <- function(mat, outfile) {
+  # Forces a manual line-by-line format writing logic avoiding serialization edge cases
   msg("[ManualWrite] Starting manual write to %s", outfile)
   mat[is.na(mat)] <- 0
   con <- file(outfile, "w")
@@ -72,12 +75,10 @@ write_seidr_manual <- function(mat, outfile) {
   cat("\n")
   msg("[ManualWrite] Finished writing.")
 
-  msg("[DEBUG] Verifying first 100 characters of output file:")
   raw_head <- readLines(outfile, n = 1, warn = FALSE)
   msg("'%s'", substr(raw_head, 1, 100))
 }
 
-# ... [Setup functions] ...
 find_files <- function(dir, excludes) {
   all_files <- list.files(dir, pattern="^abundance\\.tsv$", recursive=TRUE, full.names=TRUE)
   if (length(excludes) > 0) {
@@ -94,13 +95,15 @@ read_tx2gene <- function(p) {
   if(ncol(d)<2) stop("tx2gene needs 2 cols")
   colnames(d)[1:2] <- c("transcript_id","gene_id"); d[,1:2]
 }
+
 read_targets <- function(p) {
   if(is.null(p)||!file.exists(p)) return(NULL)
   unique(trimws(readLines(p, warn=FALSE)))
 }
 
-# --- GLOBAL VARIABLES ---
-# FIX: Handle double nested plots folder
+# ==============================================================================
+# STATE INITIALIZATION
+# ==============================================================================
 OUT_DIR <- opt$out_dir
 if (basename(OUT_DIR) == "plots") {
   OUT_DIR <- dirname(OUT_DIR)
@@ -110,7 +113,6 @@ SEARCH_DIR    <- opt$search_dir
 EXCLUDE_DIRS  <- opt$exclude_dir
 TX2GENE_PATH  <- opt$tx2gene
 
-# <--- UPDATED: Handle comma-separated list of BioProjects
 BIOPROJECT_IDS <- if(!is.null(opt$bioproject)) unlist(strsplit(opt$bioproject, ",")) else NULL
 PER_BP_MODE   <- !is.null(BIOPROJECT_IDS)
 
@@ -133,7 +135,6 @@ if (!is.null(opt$target_genes)) {
   msg("[Setup] No target genes provided (Global mode only).")
 }
 
-# Paths
 dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
 plots_dir  <- file.path(OUT_DIR, "plots")
 deseq2_dir <- file.path(OUT_DIR, "deseq2")
@@ -156,17 +157,16 @@ heatmap_pdf <- file.path(plots_dir, "expression_heatmap_global.pdf")
 var_hm_pdf <- file.path(plots_dir, "variance_heatmap.pdf")
 scor_pdf   <- file.path(plots_dir, "sample_correlation.pdf")
 
-
-# --- Plotting Function ---
-# UPDATED: Now accepts `vst_top` directly to avoid re-calculation
+# ==============================================================================
+# PLOTTING DELEGATE
+# ==============================================================================
 make_plots <- function(vst_mat, vst_top, info, targets = NULL) {
   if(!DO_PCA && !DO_HEATMAP && !DO_VAR_HM && !DO_SAMPLE_COR) return()
 
   n_plot <- nrow(vst_top)
 
-  # 1. PCA
+  # 1. Component Analysis Generation
   if(DO_PCA && ncol(vst_top)>1) {
-    # Use vst_top directly
     pca <- prcomp(t(vst_top[apply(vst_top,1,var)>0,]), center=TRUE)
     df <- as.data.frame(pca$x[,1:2]) %>% tibble::rownames_to_column("sample") %>%
       left_join(info, by="sample")
@@ -194,7 +194,7 @@ make_plots <- function(vst_mat, vst_top, info, targets = NULL) {
     msg("[PCA] Saved %s", pca_pdf)
   }
 
-  # Heatmap Helper
+  # 2. Expression Profile Heatmaps
   grp_vec <- if(PER_BP_MODE || MODE=="FASTQ") info$sample else info$bioproject
   title   <- if(PER_BP_MODE || MODE=="FASTQ") "Samples" else "BioProject"
 
@@ -222,10 +222,8 @@ make_plots <- function(vst_mat, vst_top, info, targets = NULL) {
     msg("[Heatmap] Saved %s", f)
   }
 
-  # 2. GLOBAL HEATMAP (Uses vst_top)
   if(DO_HEATMAP) draw_hm(vst_top, "Global Expression (Top N)", heatmap_pdf)
 
-  # 3. TARGETED HEATMAPS (Still searches full vst_mat)
   if(DO_HEATMAP && !is.null(targets)) {
      targets_vec <- as.character(unlist(targets))
      bases <- make.unique(tools::file_path_sans_ext(basename(targets_vec)), sep="_")
@@ -240,7 +238,7 @@ make_plots <- function(vst_mat, vst_top, info, targets = NULL) {
      }
   }
 
-  # 4. SAMPLE CORRELATION (Still uses full vst_mat for robustness)
+  # 3. Covariance Evaluation Mappings
   if(DO_SAMPLE_COR) {
       msg("[SampleCor] Computing Pearson correlation...")
       cor_mat <- cor(vst_mat)
@@ -264,10 +262,9 @@ make_plots <- function(vst_mat, vst_top, info, targets = NULL) {
       msg("[SampleCor] Saved %s", scor_pdf)
   }
 
-  # 5. VARIANCE HEATMAP (Global uses vst_top)
+  # 4. Variance Discrepancy
   if(DO_VAR_HM) {
       draw_var_hm <- function(genes, t, f) {
-        # Note: We still access the full matrix for plotting, but `genes` limits it
         df <- t(vst_mat[genes, , drop=FALSE]) %>% as.data.frame() %>%
           tibble::rownames_to_column("sample") %>% left_join(info, by="sample") %>%
           tidyr::pivot_longer(cols = all_of(genes), names_to="gene", values_to="vst")
@@ -302,7 +299,6 @@ make_plots <- function(vst_mat, vst_top, info, targets = NULL) {
       msg("[VarHeatmap] Generating Global Variance Heatmap")
       draw_var_hm(rownames(vst_top), "Global Variance", var_hm_pdf)
 
-      # --- TARGETED VARIANCE HEATMAPS ---
       if (!is.null(targets)) {
          targets_vec <- as.character(unlist(targets))
          bases <- make.unique(tools::file_path_sans_ext(basename(targets_vec)), sep="_")
@@ -320,28 +316,22 @@ make_plots <- function(vst_mat, vst_top, info, targets = NULL) {
 }
 
 # ==============================================================================
-# MAIN PIPELINE
+# ROUTING CONTROLLER
 # ==============================================================================
-
 files <- find_files(SEARCH_DIR, EXCLUDE_DIRS)
 info <- tibble(sample=basename(dirname(files)), bioproject=basename(dirname(dirname(files))))
 names(files) <- info$sample
 
-# <--- UPDATED: Check for membership in the provided LIST of IDs, not just equality to a single string
 if(PER_BP_MODE) {
   info <- info[info$bioproject %in% BIOPROJECT_IDS,]
   files <- files[info$sample]
 }
 
-# --- LOAD / CALCULATE ---
-
-# Shared logic for selecting Top N genes
 select_top_genes <- function(mat, n_genes) {
     all_vars <- apply(mat, 1, var, na.rm=TRUE)
     n_select <- min(n_genes, length(all_vars))
     top_idx <- order(all_vars, decreasing=TRUE)[seq_len(n_select)]
 
-    # Return list with both the sub-matrix and the variance dataframe for saving
     list(
         mat = mat[top_idx, , drop=FALSE],
         df  = tibble(gene_id = rownames(mat)[top_idx], variance = all_vars[top_idx])
@@ -361,11 +351,9 @@ if(PLOTS_ONLY) {
   readr::write_tsv(vst_transposed_out, vst_transposed_tsv)
   msg("[Output] Saved transposed VST matrix to %s", vst_transposed_tsv)
 
-  # --- CALCULATE TOP N ONCE ---
   res <- select_top_genes(vst_mat, TOP_N)
   vst_top <- res$mat
 
-  # Save the Top N file (even in plots-only mode)
   top_var_outfile <- file.path(deseq2_dir, sprintf("top_%d_variable_genes.tsv", TOP_N))
   readr::write_tsv(res$df, top_var_outfile)
   msg("[Analysis] Saved Top %d Variable Genes to %s", nrow(res$df), top_var_outfile)
@@ -392,8 +380,6 @@ if(opt$tximport_only) quit(status=0)
 coldata <- info[match(colnames(txi$counts), info$sample),]
 dds <- DESeqDataSetFromTximport(txi, colData=coldata, design=~1)
 
-# --- FILTERING ---
-# Calculate 10% of sample size
 min_samples <- round(ncol(dds) * 0.1)
 dds <- dds[rowSums(counts(dds) >= 10) >= min_samples, ]
 msg("[DESeq2] Estimating size factors (poscounts)...")
@@ -430,9 +416,6 @@ vst_transposed_out <- tibble::rownames_to_column(as.data.frame(vst_mat), "gene_i
 readr::write_tsv(vst_transposed_out, vst_transposed_tsv)
 msg("[Output] Saved transposed VST matrix to %s", vst_transposed_tsv)
 
-# ==============================================================================
-# CALCULATE TOP N (MAIN MODE)
-# ==============================================================================
 msg("[Analysis] Calculating Top %d Most Variable Genes...", TOP_N)
 res <- select_top_genes(vst_mat, TOP_N)
 vst_top <- res$mat
@@ -441,18 +424,11 @@ top_var_outfile <- file.path(deseq2_dir, sprintf("top_%d_variable_genes.tsv", TO
 readr::write_tsv(res$df, top_var_outfile)
 msg("[Analysis] Saved Top %d Variable Genes to %s", nrow(res$df), top_var_outfile)
 
-
-# ==============================================================================
-# SEIDR OUTPUT
-# ==============================================================================
 msg("[Seidr] Saving %d genes for Network Inference...", nrow(vst_mat))
 clean_genes <- gsub("\\s+", "_", rownames(vst_mat))
 writeLines(clean_genes, seidr_genes)
 seidr_mat <- t(vst_mat)
 write_seidr_manual(seidr_mat, seidr_expr)
 
-# ==============================================================================
-# PLOTS (Passing pre-calculated vst_top)
-# ==============================================================================
 make_plots(vst_mat, vst_top, coldata, TARGET_GENES_LIST)
 msg("Done.")

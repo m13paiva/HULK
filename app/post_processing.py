@@ -13,6 +13,15 @@ R_SCRIPT_PATH = Path(__file__).with_name("post_processing.R")
 
 
 def _map_counts_from_abundance(mode: str | None) -> str:
+    """
+    Maps the specified quantification mode to its corresponding tximport parameter string.
+
+    Args:
+        mode (str | None): The quantification mode (e.g., 'length_scaled_tpm').
+
+    Returns:
+        str: The mapped string recognized by the tximport R package. Defaults to "no".
+    """
     if mode == "length_scaled_tpm":
         return "lengthScaledTPM"
     elif mode == "scaled_tpm":
@@ -24,7 +33,18 @@ def _map_counts_from_abundance(mode: str | None) -> str:
 
 def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) -> List[str]:
     """
-    Build BASE argument list for a *global* run.
+    Constructs the base argument list for a global execution of the post-processing R script.
+
+    Args:
+        cfg (Config): The configuration object containing runtime parameters.
+        out_dir (Path): The designated output directory for the global run.
+        mode (str | None): The operational mode (e.g., "SRR" or "FASTQ").
+
+    Raises:
+        ValueError: If the `tx2gene` mapping file is missing from the configuration.
+
+    Returns:
+        List[str]: A list of command-line arguments formatted for subprocess execution.
     """
     if cfg.tx2gene is None:
         raise ValueError("tx2gene is required for post-processing but cfg.tx2gene is None.")
@@ -70,11 +90,10 @@ def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) ->
     if (not deseq2_enabled) or txi_only_mode:
         args.append("--tximport-only")
 
-    # --- DISPERSION PLOT ---
     if getattr(cfg, "plot_dispersion", False):
         args.append("--dispersion")
 
-    # Always force update in global mode
+    # Enforce forced re-computation of tximport structures in global aggregation context.
     args.append("--force-txi")
 
     return args
@@ -82,7 +101,16 @@ def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) ->
 
 def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[str], bool]:
     """
-    Build argument list for a *per-BioProject* run.
+    Constructs the argument list for a per-BioProject execution of the post-processing R script.
+
+    Args:
+        bp_id (str): The specific BioProject identifier.
+        cfg (Config): The configuration object containing runtime parameters.
+        out_dir (Path): The designated output directory for the isolated run.
+
+    Returns:
+        tuple[List[str], bool]: A tuple containing the argument list and a boolean flag
+        indicating whether the execution is operating in tximport-only mode.
     """
     counts_from_abundance = _map_counts_from_abundance(getattr(cfg, "tximport_mode", None))
     args: List[str] = [
@@ -140,8 +168,15 @@ def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[s
 
 def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) -> Path | None:
     """
-    Run post-processing for a SINGLE BioProject.
-    Returns path to gene counts if successful.
+    Executes post-processing logic for a single, isolated BioProject block.
+
+    Args:
+        bp (Any): A BioProject instance or generic namespace mapping.
+        cfg (Config): Runtime configuration.
+        r_script (Path | None): Explicit override path to the R script.
+
+    Returns:
+        Path | None: The path to the generated plots directory if successful, otherwise None.
     """
     log_path = cfg.log
     if hasattr(bp, 'log_path'):
@@ -170,6 +205,17 @@ def run_postprocessing(
         skip_bp: bool | None = None,
         skip_global: bool | None = None
 ) -> None:
+    """
+    Manages the overarching execution schedule for all post-processing analytics,
+    distinguishing between global summaries and distinct BioProject reports.
+
+    Args:
+        dataset (Dataset): Loaded dataset tracking the execution context.
+        cfg (Config): Configuration profile tracking active analytics flags.
+        r_script (Path | None): Override script location.
+        skip_bp (bool | None): Override boolean blocking per-project computations.
+        skip_global (bool | None): Override boolean blocking global computations.
+    """
     log_path = cfg.log
 
     do_global = not (skip_global if skip_global is not None else cfg.no_global_postprocessing)
@@ -184,9 +230,9 @@ def run_postprocessing(
         print(f"[post-processing] R script not found at {script_path}.")
         return
 
-    # ------------------------------------------------------------------
-    # 1. Global Analysis
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────────────────────
+    # 1. Global Analysis Phase
+    # ─────────────────────────────────────────────────────────────────────────────
     if do_global:
         out_dir = cfg.shared
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -224,7 +270,7 @@ def run_postprocessing(
         else:
             log("[post-processing] Phase 1: Skipped (Fast Mode).", log_path)
 
-        # --- PHASE 2: PLOTTING ---
+        # --- Plot Generation ---
         if active_plots:
             SAFE_PLOT_WORKERS = 2
             log(f"[post-processing] Phase 2: Generating {len(active_plots)} plot types (Concurrency: {SAFE_PLOT_WORKERS})...", log_path)
@@ -259,9 +305,9 @@ def run_postprocessing(
     else:
         log("[post-processing] Skipping Global Analysis (--no-global-postprocessing).", log_path)
 
-    # ------------------------------------------------------------------
-    # 3. Per-BioProject Run
-    # ------------------------------------------------------------------
+    # ─────────────────────────────────────────────────────────────────────────────
+    # 2. Per-BioProject Phase
+    # ─────────────────────────────────────────────────────────────────────────────
     if not do_bp:
         log("[post-processing] Skipping per-BioProject analysis (--no-bp-postprocessing).", log_path)
         return

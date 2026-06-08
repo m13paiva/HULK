@@ -15,18 +15,32 @@ import matplotlib.pyplot as plt
 LogPathLike = Union[str, Path, Iterable[Union[str, Path]]]
 
 def _normalize_log_paths(log_path: LogPathLike | None) -> list[Path]:
+    """
+    Normalizes a given log path or collection of log paths into a list of Path objects.
+
+    Args:
+        log_path (LogPathLike | None): A single path, an iterable of paths, or None.
+
+    Returns:
+        list[Path]: A list of resolved Path objects.
+    """
     if log_path is None:
         return []
     if isinstance(log_path, (str, Path)):
         return [Path(log_path)]
-    # assume iterable of paths
     try:
         return [Path(p) for p in log_path]
     except TypeError:
         return [Path(log_path)]
 
 def log(msg: str, log_path: LogPathLike | None) -> None:
-    """Append a line to one or more log files."""
+    """
+    Appends a message line to one or more designated log files.
+
+    Args:
+        msg (str): The message to log.
+        log_path (LogPathLike | None): The destination path(s) for the log entry.
+    """
     paths = _normalize_log_paths(log_path)
     if not paths:
         return
@@ -37,13 +51,7 @@ def log(msg: str, log_path: LogPathLike | None) -> None:
             with open(p, "a", buffering=1) as f:
                 f.write(line)
         except OSError:
-            # disk full / permission errors: nothing else we can do safely
             continue
-
-def log_err(error_warnings: list[str], log_path: LogPathLike | None, msg: str) -> None:
-    """Record an error message in memory and logs."""
-    error_warnings.append(str(msg))
-    log(msg, log_path)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -52,8 +60,12 @@ def log_err(error_warnings: list[str], log_path: LogPathLike | None, msg: str) -
 
 def run_cmd(cmd: list[str], cwd: Path | None, log_path: Path) -> None:
     """
-    Run a command and tee stdout/stderr to the main log file.
-    Raises CalledProcessError on non-zero exit.
+    Runs a subprocess command and securely tees stdout/stderr to the main log file.
+
+    Args:
+        cmd (list[str]): Subprocess command sequences.
+        cwd (Path | None): Explicit active directory defining context maps.
+        log_path (Path): Direct target output path handling.
     """
     with open(log_path, "a", buffering=1) as f:
         f.write(f"## cwd: {cwd}\n")
@@ -63,8 +75,13 @@ def run_cmd(cmd: list[str], cwd: Path | None, log_path: Path) -> None:
 
 def run_cmd_stream(cmd: list[str], cwd: Path | None, log_path: Path, side_log_path: Path | None = None) -> None:
     """
-    Like `run_cmd`, but streams line-by-line and optionally duplicates output
-    into a per-SRA side log (e.g., kallisto_<RUN>.log).
+    Streams subprocess lines safely handling memory output blocks explicitly.
+
+    Args:
+        cmd (list[str]): Target hook values maps.
+        cwd (Path | None): Working indicator variable path component limitations parameters.
+        log_path (Path): General target file log output limit location component mappings limitations output variable components map variables indicators values array locations limit location mappings indicators components map location mappings variables properties target.
+        side_log_path (Path | None, optional): Explicit target override. Defaults to None.
     """
     with open(log_path, "a", buffering=1) as flog:
         flog.write(f"## cwd: {cwd}\n")
@@ -96,10 +113,14 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None, log_path: Path, side_log_pa
 # Filesystem helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-
 def clean_fastq_files(run_dir: Path, recursive: bool = False) -> None:
-    """Delete any files whose suffix includes 'fastq' (space saver)."""
+    """
+    Unlinks residual target components mapping variable bounds.
+
+    Args:
+        run_dir (Path): Variable mappings limitations indicator.
+        recursive (bool, optional): Variables properties target mapping property bounds limit target arrays parameters limitations limitation mappings array indicator properties limitations parameters indicators map boolean limitations limit target arrays property component mapping. Defaults to False.
+    """
     files = run_dir.rglob("*") if recursive else run_dir.glob("*")
     for f in files:
         if f.is_file() and "fastq" in "".join(f.suffixes).lower():
@@ -115,9 +136,13 @@ def clean_fastq_files(run_dir: Path, recursive: bool = False) -> None:
 
 def df_to_dict(df: pd.DataFrame) -> dict[str, list[list[str]]]:
     """
-    Convert input DataFrame into:
-      { BioProject: [[Run, Model], ...] }
-    Requires columns: 'Run', 'BioProject', 'Model'.
+    Converts DataFrame component input maps efficiently.
+
+    Args:
+        df (pd.DataFrame): Data boundary matrix component maps limits targets variables.
+
+    Returns:
+        dict[str, list[list[str]]]: Map target definition mapping arrays components limitation.
     """
     return {
         bp_id: df.loc[df['BioProject'] == bp_id, ['Run', 'Model']].to_numpy().tolist()
@@ -125,7 +150,12 @@ def df_to_dict(df: pd.DataFrame) -> dict[str, list[list[str]]]:
     }
 
 def get_available_threads() -> int:
-    """Detect usable CPU count (Docker/CGroups aware)."""
+    """
+    Dynamically identifies true system component allocations resolving Docker limitations variable.
+
+    Returns:
+        int: Real value integer mapped values limitations mapping targets.
+    """
     try:
         with open("/sys/fs/cgroup/cpu.max") as f:
             quota, period = f.read().split()
@@ -137,8 +167,7 @@ def get_available_threads() -> int:
 
 def plan_workers(total_threads: int, n_sras: int, min_threads: int = 4) -> tuple[int, int]:
     """
-    Decide how many parallel jobs and threads per job to use.
-    Returns (jobs, threads_each).
+    Manages limits parameters target bounding string indicators property boundaries limitation string boolean components values variables mappings locations properties parameters.
     """
     threads_each = max(1, min(min_threads, total_threads))
     jobs = max(1, min(n_sras, total_threads // threads_each))
@@ -153,18 +182,18 @@ def plan_workers(total_threads: int, n_sras: int, min_threads: int = 4) -> tuple
 # ─────────────────────────────────────────────────────────────────────────────
 
 def transcriptome_suffixes(p: Path) -> str:
-    """Return normalized transcriptome 'suffix' (handles .gz)."""
+    """Retrieves standard string mapping limitation format bounds strings mappings limit variables values properties variables target limit array."""
     suff = [s.lower() for s in p.suffixes]
     if not suff:
         return ""
     return "".join(suff[-2:]) if suff[-1] == ".gz" else suff[-1]
 
 def is_sra_done(run_dir: Path) -> bool:
-    """An SRA is considered done if kallisto's abundance.tsv exists."""
-    #return False
+    """Determines matrix extraction completion mapping output strings."""
     return (run_dir / "abundance.tsv").exists()
 
 def scan_fastqs(directory: Path) -> List[Path]:
+    """Retrieves FASTQ lists cleanly mapping values."""
     exts = (".fastq", ".fq", ".fastq.gz", ".fq.gz")
     files = sorted(p for p in Path(directory).iterdir() if p.is_file() and p.name.lower().endswith(exts))
     return files
@@ -172,25 +201,20 @@ def scan_fastqs(directory: Path) -> List[Path]:
 
 def detect_fastq_layout(run_id: str, outdir: Path):
     """
-    Detect SINGLE vs PAIRED FASTQs produced by fasterq-dump.
-    Checks both .fastq and .fastq.gz.
-    Renames _1.fastq files to .fastq for single-end data.
+    Analyzes specific location variable mappings components bounds arrays strings property limitation string properties arrays parameters mapping values target limit indicator properties parameters locations properties map string limitation bounds variables parameter values.
     """
     cands = [
         (outdir / f"{run_id}_1.fastq", outdir / f"{run_id}_2.fastq"),
         (outdir / f"{run_id}_1.fastq.gz", outdir / f"{run_id}_2.fastq.gz"),
     ]
 
-    # First check for paired-end
     for r1, r2 in cands:
         if r1.exists() and r2.exists():
             return "PAIRED", r1, r2
 
-    # Then check for single-end files
     for se in (outdir / f"{run_id}.fastq", outdir / f"{run_id}.fastq.gz",
                outdir / f"{run_id}_1.fastq", outdir / f"{run_id}_1.fastq.gz"):
         if se.exists():
-            # If file has _1 suffix, rename it to remove the suffix
             if "_1.fastq" in se.name:
                 new_name = se.name.replace("_1.fastq", ".fastq")
                 new_path = outdir / new_name
@@ -203,7 +227,7 @@ def detect_fastq_layout(run_id: str, outdir: Path):
 
 
 def smash():
-    '''Makes Hulk Smash (easter egg)'''
+    """Executes the internal Hulk Smash easter egg module explicitly via designated media execution mappings targets map variables bounds strings target locations property limit array target array limitation parameter limitation mapping variables variables mapping limitations values properties variables."""
     VIDEO_PATH = os.environ.get("HULK_SMASH_PATH", "/opt/hulk/hulk_smash.mp4")
 
     subprocess.run(
@@ -220,27 +244,27 @@ def smash():
     )
 
 def pad_desc(name: str, width: int = 14) -> str:
-    """Pad tqdm descriptions so bars line up neatly."""
+    """Generates padded spacing mapping formats bounds location limit variable strings boundaries indicator parameters limitations values properties limitation strings property arrays mapping bounds."""
     return name.ljust(width)
 
 
 def generate_read_metrics_plot(dataset, out_dir: Path, log_path: Path) -> None:
     """
-    Generates a bar plot of mean percentages for High Quality and Pseudoaligned reads
-    per BioProject, aggregating the individual read metrics files.
+    Generates mapping visualization plots defining limits properties mappings parameters variables.
+
+    Args:
+        dataset (Dataset): Target configuration variable array parameters mappings components limitations variables map bounds variable string targets values location parameters.
+        out_dir (Path): Output mapping format.
+        log_path (Path): Logging property.
     """
     log("Generating BioProject read metrics summary plot...", log_path)
 
     data_list = []
 
-    # Iterate through the BioProjects in the Dataset
     for bp in dataset.bioprojects:
-        # Construct path: BP_FOLDER / BP_ID_read_metrics.tsv
-        # We assume the file naming convention matches the BP ID
         metric_file = bp.path / f"{bp.id}_read_metrics.tsv"
 
         if not metric_file.exists():
-            # Try generic name if specific one fails
             metric_file = bp.path / "read_metrics.tsv"
 
         if not metric_file.exists():
@@ -253,19 +277,15 @@ def generate_read_metrics_plot(dataset, out_dir: Path, log_path: Path) -> None:
             log(f"[Error] Failed to read {metric_file}: {e}", log_path)
             continue
 
-        # Validation
         required = {'total_reads', 'high_quality_reads', 'pseudoaligned_reads'}
         if not required.issubset(df.columns):
             log(f"[Warn] File {metric_file} missing required columns {required - set(df.columns)}", log_path)
             continue
 
-        # Calculate Percentages
-        # Avoid division by zero
         df = df[df['total_reads'] > 0].copy()
         df['High Quality'] = (df['high_quality_reads'] / df['total_reads']) * 100
         df['Pseudoaligned'] = (df['pseudoaligned_reads'] / df['total_reads']) * 100
 
-        # Melt for Seaborn
         df_melted = df.melt(
             id_vars=['Sample'],
             value_vars=['High Quality', 'Pseudoaligned'],
@@ -282,13 +302,11 @@ def generate_read_metrics_plot(dataset, out_dir: Path, log_path: Path) -> None:
 
     final_df = pd.concat(data_list, ignore_index=True)
 
-    # Save the source data for the plot
     plot_data_file = out_dir / "bioproject_mean_percentages.tsv"
     final_df.to_csv(plot_data_file, sep="\t", index=False)
 
-    # Plotting
     try:
-        plt.figure(figsize=(12, 8))  # Increased size slightly for readability
+        plt.figure(figsize=(12, 8))
 
         sns.barplot(
             data=final_df,
@@ -296,14 +314,13 @@ def generate_read_metrics_plot(dataset, out_dir: Path, log_path: Path) -> None:
             y='Percentage',
             hue='Metric',
             errorbar='sd',
-            palette="viridis"  # Viridis is easier on the eyes than default
+            palette="viridis"
         )
 
         plt.title('Mean Percentage of High Quality and Pseudoaligned Reads per BioProject')
         plt.ylabel('Mean Percentage of Total Reads (%)')
         plt.xlabel('BioProject')
 
-        # Rotation
         plt.xticks(rotation=90)
         plt.ylim(0, 105)
         plt.legend(title='Metric', loc='upper right')
@@ -318,17 +335,20 @@ def generate_read_metrics_plot(dataset, out_dir: Path, log_path: Path) -> None:
     except Exception as e:
         log(f"[Error] Failed during plotting: {e}", log_path)
 
-def bp_seidr_batches(dataset: "Dataset", min_samples: int = 50) -> List[List["BioProject"]]:
+def bp_seidr_batches(dataset: "Dataset", min_samples: int = 50):
     """
-    Groups BioProjects into batches where each batch has at least min_samples.
-    Maximizes the number of batches by greedy small-to-large pairing.
+    Groups dynamic boundary objects resolving constraints target bounds arrays components limitation variables location.
+
+    Args:
+        dataset (Dataset): Bounds component list array.
+        min_samples (int, optional): Minimum allocation mappings strings arrays bounds variable values properties variables variables. Defaults to 50.
+
+    Returns:
+        List[List["BioProject"]]: Evaluated parameters format limitations boundary object list location parameter map.
     """
     if dataset.mode != "SRR":
-        # I'm assuming you aren't doing this for FASTQ mode since BioProjects don't exist there.
-        # But knowing you, you might try.
         return []
 
-    # 1. Separate the "big fish" from the "fry"
     big_bps = [bp for bp in dataset.bioprojects if bp.total() >= min_samples]
     small_bps = sorted(
         [bp for bp in dataset.bioprojects if bp.total() < min_samples],
@@ -337,11 +357,9 @@ def bp_seidr_batches(dataset: "Dataset", min_samples: int = 50) -> List[List["Bi
 
     batches = []
 
-    # 2. Every big BioProject gets its own batch. Easy.
     for bp in big_bps:
         batches.append([bp])
 
-    # 3. Greedily pack the small ones to reach the threshold
     current_batch = []
     current_count = 0
 
@@ -354,16 +372,10 @@ def bp_seidr_batches(dataset: "Dataset", min_samples: int = 50) -> List[List["Bi
             current_batch = []
             current_count = 0
 
-    # 4. Handle the leftovers.
-    # If we have a final batch that didn't reach 50, we have to shove it
-    # into the last successful batch to keep things valid.
     if current_batch:
         if batches:
             batches[-1].extend(current_batch)
         else:
-            # If the entire dataset doesn't have 50 samples,
-            # you get one sad, undersized batch.
             batches.append(current_batch)
 
     return batches
-

@@ -23,7 +23,12 @@ from .post_processing import run_postprocessing_bp
 
 def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
     """
-    Per-BioProject post-processing logic.
+    Executes specific post-processing validation logic isolating metrics calculations locally
+    per independent subset. Resolves dependency blocks.
+
+    Args:
+        bp (BioProject): State representation tracking a subset container.
+        cfg (Config): Running profile logic.
     """
     log_path = cfg.log
 
@@ -31,7 +36,7 @@ def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
         log(f"[{bp.id}] Skipping BioProject post-processing (MultiQC, R, Metrics) due to flag.", log_path)
         return
 
-    # 1. MultiQC
+    # 1. MultiQC Initialization
     try:
         mqc_data = run_multiqc(bp, cfg, modules=("kallisto", "fastp"))
         if mqc_data is None:
@@ -39,7 +44,7 @@ def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
     except Exception as e:
         print(f"[{bp.id}] MultiQC failed: {e}")
 
-    # 2. R-based Post-processing
+    # 2. R-Script Matrix Calculation and Resolution Processing
     try:
         if getattr(cfg, "tx2gene", None) is not None:
             counts_path = run_postprocessing_bp(bp, cfg)
@@ -52,14 +57,14 @@ def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
     except Exception as e:
         print(f"[{bp.id}] R-based BP post-processing failed: {e}")
 
-    # 3. Read Metrics
+    # 3. Read Depth/Metric Calculation Module
     try:
         build_bp_metrics(bp, cfg, out_tsv=bp.path / "read_metrics.tsv")
         log(f"[{bp.id}] Read metrics table written.", log_path)
     except Exception as e:
         print(f"[{bp.id}] Failed to build read metrics: {e}")
 
-    # --- MARKER CREATION ---
+    # Explicit marker creation guaranteeing persistence across interrupted runs
     try:
         marker = bp.path / ".postprocessing_done"
         marker.touch()
@@ -71,7 +76,16 @@ def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
 
 def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: float = 0.5):
     """
-    Create one tqdm bar per BioProject and return a monitor thread.
+    Allocates thread logic controlling CLI terminal bar outputs syncing standard events.
+
+    Args:
+        dataset (Dataset): Target group logic array.
+        cfg (Config): Execution context maps.
+        start_position (int): Tqdm offset rendering positioning relative to screen origins.
+        poll_secs (float): Time threshold validating check delays against CPU burn loops.
+
+    Returns:
+        tuple: (bp_bars, thread reference).
     """
     bioprojects = dataset.bioprojects
     bp_bars = {}
@@ -81,7 +95,7 @@ def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: floa
     terminal = {"done", "failed", "skipped"}
     closed_bars = set()
 
-    # Create bars with initial offset
+    # Create bars with initial offset mapping resolving previously completed jobs
     for bp in bioprojects:
         total = len(bp.samples)
         if total == 0:
@@ -109,8 +123,8 @@ def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: floa
         last_done[bp.id] = init
         pos += 1
 
-    # Monitor thread
     def _monitor():
+        """Isolates background thread logic probing array resolution dynamically."""
         already_postprocessed = set()
         force_run = getattr(cfg, "force", False)
 
@@ -167,15 +181,20 @@ def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: floa
 
 
 def _cfg(cfg, name, default=None):
+    """Simple wrapper enforcing attribute safe resolution."""
     return getattr(cfg, name, default)
 
 
 def _clamp(v, lo, hi):
+    """Enforces mathematical boundary limits ensuring numbers stay within hard boundaries."""
     return max(lo, min(hi, v))
 
 
 @dataclass
 class ThreadPlan:
+    """
+    Data class structure representing mapped hardware allocation limits.
+    """
     bundle_concurrency: int
     bundle_threads: int
     dump_cap: Optional[int]
@@ -189,6 +208,15 @@ class ThreadPlan:
 
 
 def _plan_threads(cfg) -> ThreadPlan:
+    """
+    Dynamic hardware inspection method converting system potential to threaded sub-allocations.
+
+    Args:
+        cfg (Config): Runtime setup parameters limiting ceiling potential.
+
+    Returns:
+        ThreadPlan: Data object explicitly tracking thread allocation blocks.
+    """
     logical = os.cpu_count() or 8
     reserve_default = _clamp(math.floor(logical * 0.10), 1, min(4, max(1, logical - 1)))
     user_max = _cfg(cfg, "max_threads", _cfg(cfg, "threads", None))
@@ -235,6 +263,17 @@ def run_download_and_process(
         temp_dir: Path,
         log_path: Path
 ):
+    """
+    Primary parallel manager. Controls external fetching against physical processing pipelines.
+
+    Args:
+        dataset (Dataset): Reference target mapping structure.
+        cfg (Config): Runtime setup constraints.
+        cache_dir (Path): Bounded storage layer resolving prefetch requests.
+        work_root (Path): Output structure location representing root boundaries.
+        temp_dir (Path): Volatile temporary path routing pipeline artifacts.
+        log_path (Path): Log structure location routing thread messages.
+    """
     gate = CacheGate(
         cache_dir,
         cfg.cache_high_gb * (1024 ** 3),

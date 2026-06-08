@@ -11,6 +11,15 @@ if TYPE_CHECKING:
 
 
 def get_egad_script_path() -> Path:
+    """
+    Locates the underlying R execution script required for EGAD analytics.
+
+    Returns:
+        Path: Absolute path to `egad.R`.
+
+    Raises:
+        FileNotFoundError: If the internal file structure has been disrupted.
+    """
     base_path = Path(__file__).parent
     script_path = base_path / "scripts" / "egad.R"
     if not script_path.exists():
@@ -31,6 +40,23 @@ def run_egad_task(
         do_auroc: bool = True,
         do_aupr: bool = False
 ) -> Dict[str, Dict[str, Optional[float]]]:
+    """
+    Delegates to the external R script to generate evaluation distributions.
+
+    Args:
+        network_file (Path): The network adjacency input.
+        out_file (Path): File destination for results TSV.
+        script_path (Path): Resolved path to `egad.R`.
+        log_path (Path): Path for appending execution output.
+        mapman_file (Path, optional): Path to MapMan mappings.
+        go_file (Path, optional): Path to BioMart GO exports.
+        curves_prefix (Path, optional): Base destination for storing graph interpolation data.
+        do_auroc (bool): Toggle AUROC analysis.
+        do_aupr (bool): Toggle AUPR analysis.
+
+    Returns:
+        Dict: Extracted performance dictionaries keyed by annotation source.
+    """
     cmd = [
         "Rscript", str(script_path),
         "--network", str(network_file),
@@ -84,6 +110,17 @@ def run_egad_task(
 
 
 def calculate_auc_from_df(df, x_col, y_col):
+    """
+    Calculates Area Under Curve using standard geometric summation.
+
+    Args:
+        df (DataFrame): DataFrame holding curve points.
+        x_col (str): DataFrame key for x-axis points.
+        y_col (str): DataFrame key for y-axis points.
+
+    Returns:
+        float | None: Geometric AUC approximation or None.
+    """
     if df is None or df.empty: return None
     x = df[x_col].values
     y = df[y_col].values
@@ -92,7 +129,15 @@ def calculate_auc_from_df(df, x_col, y_col):
 
 
 def create_1x2_plot(source_data_list, show_baseline, title_prefix, out_file):
-    """Helper to draw Micro-Averaged ROC on the left and PRC on the right"""
+    """
+    Builds standard dual-plot layout (ROC left, PR right).
+
+    Args:
+        source_data_list (list): Configuration arrays defining the curve content.
+        show_baseline (bool): Toggle for rendering random chance markers.
+        title_prefix (str): Text tag for the title header.
+        out_file (Path): Destination output path.
+    """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
     if show_baseline:
@@ -145,7 +190,14 @@ def create_1x2_plot(source_data_list, show_baseline, title_prefix, out_file):
 
 
 def create_macro_boxplots(df, out_file, colors_dict):
-    """Generates boxplots to show the distribution of MACRO performance."""
+    """
+    Renders boxplot layouts mapping term distribution profiles based on macro values.
+
+    Args:
+        df (DataFrame): The merged results DataFrame containing raw performance numbers.
+        out_file (Path): Export path.
+        colors_dict (dict): Dictionary mapping source types to display colors.
+    """
     if df is None or df.empty: return
     sources = [s for s in ["GO", "MapMan"] if s in df["Annotation_Source"].unique()]
     if not sources: return
@@ -180,6 +232,16 @@ def create_macro_boxplots(df, out_file, colors_dict):
 
 def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_file_path: Optional[Path] = None,
                          metrics: str = "both", custom_network: Optional[Path] = None):
+    """
+    Main execution wrapper orchestrating R execution and downstream plot rendering for analytical feedback.
+
+    Args:
+        cfg (Config): Runtime setup state.
+        mapman_path (Path, optional): Explicit override for MapMan mappings.
+        go_file_path (Path, optional): Explicit override for GO exports.
+        metrics (str): Select which metrics to process ('both', 'auroc', 'aupr').
+        custom_network (Path, optional): Network edges file override.
+    """
     opts = cfg.get_tool_opts("egad")
 
     net_path = custom_network if custom_network else opts["network_file"]
@@ -226,7 +288,6 @@ def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_f
 
         source_data_list = []
 
-        # Read the raw TSV once so we can use it for the boxplots
         try:
             full_df = pd.read_csv(out_path, sep="\t")
         except:
@@ -258,7 +319,7 @@ def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_f
             source_data_list.append(data_pack)
 
         try:
-            # 1. MICRO-AVERAGE LINE PLOTS (No prefix requested)
+            # Generate unconstrained line graphs
             for data in source_data_list:
                 src = data['src']
                 create_1x2_plot([data], show_baseline=False, title_prefix=src,
@@ -266,13 +327,13 @@ def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_f
                 create_1x2_plot([data], show_baseline=True, title_prefix=src,
                                 out_file=egad_dir / f"{src}_with_baseline.pdf")
 
+            # Generate cross-comparison aggregates if viable
             if len(source_data_list) > 1:
                 create_1x2_plot(source_data_list, show_baseline=False, title_prefix="Combined",
                                 out_file=egad_dir / "combined_no_baseline.pdf")
                 create_1x2_plot(source_data_list, show_baseline=True, title_prefix="Combined",
                                 out_file=egad_dir / "combined_with_baseline.pdf")
 
-                # 2. MACRO-AVERAGE BAR PLOT
                 fig_bar, ax_bar = plt.subplots(figsize=(8, 6))
                 sources = list(results.keys())
                 auc_vals = [results[s]["macro_auc"] if results[s]["macro_auc"] is not None else 0 for s in sources]
@@ -313,7 +374,6 @@ def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_f
                 fig_bar.savefig(egad_dir / "bar_comparison.pdf")
                 plt.close(fig_bar)
 
-                # 3. MACRO-AVERAGE BOXPLOTS
                 create_macro_boxplots(full_df, egad_dir / "macro_boxplot_comparison.pdf", colors)
 
             click.secho(f"[Plots] Saved strictly formatted PDF array to {egad_dir}", fg="blue")

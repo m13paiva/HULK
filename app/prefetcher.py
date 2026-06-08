@@ -9,41 +9,70 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm.auto import tqdm
 from .utils import log, run_cmd, pad_desc
 
-# Try to import the real cache gate; provide a no-op fallback if missing
 try:
-    from .cache_manager import CacheGate  # pragma: no cover
+    from .cache_manager import CacheGate
 except Exception:
-    class CacheGate:  # minimal fallback
+    class CacheGate:
+        """Fallback class mirroring the basic methods if cache gating fails to import."""
+
         def __init__(self, _cache_dir: Path, _high: int, _low: int, _poll: float) -> None:
             pass
+
         def wait_for_window(self, _logger, _run_id: str):
             return
 
 PREFETCH_MAX_DEFAULT = "200G"
-POLL_SECS_DEFAULT    = 3.0
-MAX_WORKERS_DEFAULT  = 16
+POLL_SECS_DEFAULT = 3.0
+MAX_WORKERS_DEFAULT = 16
+
 
 def _normalize_sra_layout(cache_dir: Path, run_id: str) -> Path:
+    """
+    Standardizes SRA output locations from nested structures created by `prefetch`.
+
+    Args:
+        cache_dir (Path): The designated target cache path.
+        run_id (str): The accession identifier determining expected file naming.
+
+    Returns:
+        Path: The absolute path to the properly structured SRA file.
+    """
     cache_dir = cache_dir.expanduser().resolve()
     sra_file = cache_dir / f"{run_id}.sra"
-    alt_dir  = cache_dir / run_id
+    alt_dir = cache_dir / run_id
     alt_file = alt_dir / f"{run_id}.sra"
+
     if (not sra_file.exists()) and alt_file.exists():
         alt_file.replace(sra_file)
         shutil.rmtree(alt_dir, ignore_errors=True)
     return sra_file
 
+
 def prefetch_one(sample: "Sample", cache_dir: Path, *,
-                     overwrite=False, retries=3, prefetch_max=PREFETCH_MAX_DEFAULT,
-                     cache_high_gb=300, cache_low_gb=250, poll_secs=POLL_SECS_DEFAULT,
-                     mode: str = "cache") -> Dict[str, str]:
+                 overwrite=False, retries=3, prefetch_max=PREFETCH_MAX_DEFAULT,
+                 cache_high_gb=300, cache_low_gb=250, poll_secs=POLL_SECS_DEFAULT,
+                 mode: str = "cache") -> Dict[str, str]:
+    """
+    Retrieves individual SRA archives utilizing SRA Toolkit logic while respecting capacity gates.
 
+    Args:
+        sample (Sample): The sample representing the target accession.
+        cache_dir (Path): Base destination layer.
+        overwrite (bool, optional): Overwrite existing valid cached files. Defaults to False.
+        retries (int, optional): Max connection retries. Defaults to 3.
+        prefetch_max (str, optional): Max download boundary string recognized by toolkit. Defaults to '200G'.
+        cache_high_gb (int, optional): High watermark block trigger. Defaults to 300.
+        cache_low_gb (int, optional): Low watermark unblock trigger. Defaults to 250.
+        poll_secs (float, optional): Blocked polling interval. Defaults to 3.0.
+        mode (str, optional): Cache mode operation flag. Defaults to "cache".
 
+    Returns:
+        Dict[str, str]: Dictionary mapping the target accession to completion status and path.
+    """
     cache_dir = cache_dir.expanduser().resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
     run_id = sample.id
 
-    # pause/resume by watermarks
     if mode == "cache":
         CacheGate(
             cache_dir,
@@ -55,7 +84,6 @@ def prefetch_one(sample: "Sample", cache_dir: Path, *,
     if mode == "cache":
         sra_file = cache_dir / f"{run_id}.sra"
     else:
-        # no-cache mode → write inside sample output directory
         run_dir = sample.outdir
         run_dir.mkdir(parents=True, exist_ok=True)
         sra_file = run_dir / f"{run_id}.sra"
@@ -103,7 +131,7 @@ def prefetch_one(sample: "Sample", cache_dir: Path, *,
                 log(f"[{run_id}] strategy {i} error: {last_err}", sample.log_path)
 
         if attempt < retries:
-            delay = min(60, 2**attempt + random.random())
+            delay = min(60, 2 ** attempt + random.random())
             log(f"[{run_id}] retrying in {delay:.1f}s …", sample.log_path)
             time.sleep(delay)
 
@@ -111,16 +139,35 @@ def prefetch_one(sample: "Sample", cache_dir: Path, *,
     log(f"❌ Prefetch FAILED [{run_id}]: {last_err or 'unknown error'}", sample.log_path)
     return {"run_id": run_id, "status": "failed", "sra_path": str(sra_file)}
 
+
 def prefetch(dataset: "Dataset", cache_dir: Path, log_path: Path, *,
              max_workers=MAX_WORKERS_DEFAULT, retries=3, prefetch_max=PREFETCH_MAX_DEFAULT,
              cache_high_gb=300, cache_low_gb=250, poll_secs=POLL_SECS_DEFAULT,
              overwrite=False, mode="cache") -> Dict[str, Dict[str, str]]:
+    """
+    Manages concurrent retrieval scheduling mapped against dataset state.
+
+    Args:
+        dataset (Dataset): System state matrix containing target resolution objects.
+        cache_dir (Path): Output caching layer.
+        log_path (Path): Logging routing destination.
+        max_workers (int, optional): Parallel download threads limit. Defaults to MAX_WORKERS_DEFAULT.
+        retries (int, optional): Internal failure retries per worker block. Defaults to 3.
+        prefetch_max (str, optional): Connection max parameter. Defaults to PREFETCH_MAX_DEFAULT.
+        cache_high_gb (int, optional): Pause trigger threshold limit. Defaults to 300.
+        cache_low_gb (int, optional): Unpause trigger threshold limit. Defaults to 250.
+        poll_secs (float, optional): Block cycle interval checking. Defaults to 3.0.
+        overwrite (bool, optional): Allow block overwrites if True. Defaults to False.
+        mode (str, optional): Target operation structure. Defaults to "cache".
+
+    Returns:
+        Dict[str, Dict[str, str]]: Mapped aggregation of retrieval statuses across all queued samples.
+    """
     results: Dict[str, Dict[str, str]] = {}
 
     cache_dir = cache_dir.expanduser().resolve()
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- TOTAL SRRs (for progress bar total) ----
     all_srrs = [
         s for bp in dataset.bioprojects
         for s in bp.samples
@@ -128,15 +175,13 @@ def prefetch(dataset: "Dataset", cache_dir: Path, log_path: Path, *,
     ]
     total = len(all_srrs)
     if total == 0:
-        return results  # FASTQ mode → nothing to prefetch
+        return results
 
-    # ---- Pending SRRs (for actual work) ----
     candidates = [
         s for s in dataset.to_do()
         if s.type == "SRR" and s.status != "prefetched"
     ]
 
-    # ---- Initial offset (already done + already prefetched) ----
     already_done = sum(1 for s in all_srrs if s.status == "done")
     already_prefetched = sum(1 for s in all_srrs if s.status == "prefetched")
     initial_offset = already_done + already_prefetched
@@ -147,7 +192,6 @@ def prefetch(dataset: "Dataset", cache_dir: Path, log_path: Path, *,
         log_path,
     )
 
-    # ---- Prefetch task wrapper ----
     def task(s: "Sample"):
         return prefetch_one(
             s, cache_dir,
@@ -158,27 +202,23 @@ def prefetch(dataset: "Dataset", cache_dir: Path, log_path: Path, *,
             mode=mode,
         )
 
-    # ---- Launch workers ----
     with ThreadPoolExecutor(max_workers=max_workers,
                             thread_name_prefix="prefetch") as ex:
         futs = [ex.submit(task, s) for s in candidates]
 
-        # ---- Progress bar ----
         with tqdm(
-            total=total,
-            desc=pad_desc("Prefetch"),
-            unit="Sample",
-            position=0,
-            leave=True,
-            mininterval=0,       # always redraw
+                total=total,
+                desc=pad_desc("Prefetch"),
+                unit="Sample",
+                position=0,
+                leave=True,
+                mininterval=0,
         ) as pbar:
 
-            # Apply initial offset and force redraw
             if initial_offset:
                 pbar.update(initial_offset)
                 pbar.refresh()
 
-            # Update bar as futures complete
             for fut in as_completed(futs):
                 res = fut.result()
                 results[res["run_id"]] = res
@@ -191,11 +231,9 @@ def prefetch(dataset: "Dataset", cache_dir: Path, log_path: Path, *,
                 pbar.refresh()
 
     log(
-        f"[prefetch] done. ok={sum(1 for r in results.values() if r['status']=='prefetched')}, "
-        f"fail={sum(1 for r in results.values() if r['status']=='failed')}",
+        f"[prefetch] done. ok={sum(1 for r in results.values() if r['status'] == 'prefetched')}, "
+        f"fail={sum(1 for r in results.values() if r['status'] == 'failed')}",
         log_path,
     )
 
     return results
-
-

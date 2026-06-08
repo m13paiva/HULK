@@ -9,7 +9,6 @@ import os
 import shutil
 import json
 
-# --- MATPLOTLIB SILENCER & SETUP ---
 os.environ["MPLCONFIGDIR"] = "/tmp"
 import matplotlib.pyplot as plt
 
@@ -21,6 +20,10 @@ if TYPE_CHECKING:
 
 
 class BatchOrchestrator:
+    """
+    Manages the overall execution state processing saturation loops and mapping batch subset intervals
+    to dynamically evaluate network prediction performance bounds.
+    """
     def __init__(self, dataset: "Dataset", config: "Config",
                  seed: Optional[int] = None,
                  workers: int = 4,
@@ -30,6 +33,9 @@ class BatchOrchestrator:
                  force: bool = False,
                  num_steps: int = 10,
                  metrics: str = "both"):
+        """
+        Initializes the dynamic evaluator resolving limits based on system capacities and configured scopes.
+        """
         self.dataset = dataset
         self.config = config
         self.seed = seed
@@ -61,6 +67,7 @@ class BatchOrchestrator:
         self.master_df = None
 
     def _get_master_df(self) -> pd.DataFrame:
+        """Retrieves and caches the master variance-stabilized data transformation output globally mapping samples."""
         if self.master_df is not None: return self.master_df
         try:
             df = pd.read_csv(self.vst_path, sep="\t", index_col=0, engine="pyarrow")
@@ -72,6 +79,7 @@ class BatchOrchestrator:
             return df
 
     def _write_seidr_files(self, df: pd.DataFrame, out_dir: Path):
+        """Builds temporary subset files specifically formatting raw values to align against native Seidr expectations."""
         df = df.fillna(0)
         g_file, e_file = out_dir / "genes.txt", out_dir / "expression.tsv"
         with open(g_file, "w") as f:
@@ -80,6 +88,7 @@ class BatchOrchestrator:
         return g_file, e_file
 
     def _count_samples_from_file(self, expr_file: Path) -> int:
+        """Determines the number of active observation metrics based exclusively on internal file lines."""
         if not expr_file.exists(): return 0
         try:
             with open(expr_file, 'rb') as f:
@@ -88,6 +97,7 @@ class BatchOrchestrator:
             return 0
 
     def _calculate_steps(self, total_bps: int) -> List[int]:
+        """Calculates discrete sub-grouping boundaries maximizing interval distribution ranges cleanly."""
         if total_bps <= self.num_steps: return list(range(1, total_bps + 1))
         base = total_bps // self.num_steps
         remainder = total_bps % self.num_steps
@@ -100,6 +110,7 @@ class BatchOrchestrator:
         return sorted(list(set(steps)))
 
     def _create_1x2_saturation_plot(self, source_data_list, samp_df, show_samples, title_prefix, out_file):
+        """Generates dynamic dual-axis charting tracking algorithmic subset expansion results."""
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
         ax1_twin = ax1.twinx() if show_samples else None
         ax2_twin = ax2.twinx() if show_samples else None
@@ -171,6 +182,7 @@ class BatchOrchestrator:
         plt.close(fig)
 
     def _generate_plots(self, results: List[dict]):
+        """Isolates the external plotting components linking output maps across final results definitions."""
         if not results:
             print("[Saturation] No results to plot.")
             return
@@ -224,6 +236,7 @@ class BatchOrchestrator:
             print(f"[Plot Error] {e}")
 
     def regenerate_plots_from_raw(self):
+        """Forces an isolated plot build cycle parsing available raw metrics dynamically bypassing execution phases."""
         raw_file = self.base_outdir / "saturation_results_raw.tsv"
         if not raw_file.exists():
             print(f"[Error] Cannot plot. Missing {raw_file}.")
@@ -236,7 +249,10 @@ class BatchOrchestrator:
             print(f"[Error] Failed to read {raw_file}: {e}")
 
     def run(self):
-        # --- CASCADING STATE VALIDATION LOGIC ---
+        """
+        Coordinates full saturation tracking pipelines, linking internal definitions cleanly between
+        generation constraints and algorithmic evaluation blocks.
+        """
         state_file = self.base_outdir / "run_state.json"
 
         current_state = {
@@ -259,26 +275,20 @@ class BatchOrchestrator:
                 with open(state_file, "r") as f:
                     old_state = json.load(f)
 
-                # Level 3: Structural changes require complete nuke
                 if old_state.get("seed") != current_state["seed"] or \
                         old_state.get("iterations") != current_state["iterations"] or \
                         old_state.get("num_steps") != current_state["num_steps"]:
                     print("[Saturation] Structural parameters changed. Forcing Level 3 wipe (Complete Restart).")
                     force_wipe_level = 3
-
-                # Level 2: Preset changes require Seidr + EGAD wipe (Batches remain intact)
                 elif old_state.get("seidr_preset") != current_state["seidr_preset"]:
                     print("[Saturation] Seidr preset changed. Forcing Level 2 wipe (Restarting from Inference).")
                     force_wipe_level = 2
-
-                # Level 1: Metric/Annotation changes require EGAD wipe (Batches and Networks remain intact)
                 elif old_state.get("mapman_file") != current_state["mapman_file"] or \
                         old_state.get("go_file") != current_state["go_file"] or \
                         old_state.get("do_auroc") != current_state["do_auroc"] or \
                         old_state.get("do_aupr") != current_state["do_aupr"]:
                     print("[Saturation] Evaluation metrics changed. Forcing Level 1 wipe (Restarting EGAD Analysis).")
                     force_wipe_level = 1
-
                 else:
                     print("[Saturation] Parameters identical. Resuming execution using phase markers.")
 
@@ -288,7 +298,6 @@ class BatchOrchestrator:
         else:
             force_wipe_level = 3
 
-        # Apply targeted wipes
         if force_wipe_level == 3 and self.base_outdir.exists():
             print(f"[Saturation] Purging entire directory: {self.base_outdir}...")
             for item in self.base_outdir.iterdir():
@@ -299,7 +308,6 @@ class BatchOrchestrator:
                         item.unlink()
                 except Exception:
                     pass
-
         elif force_wipe_level == 2:
             print("[Saturation] Purging previous Network and Evaluation outputs...")
             for iter_dir in self.base_outdir.glob("step*/iter*"):
@@ -307,7 +315,6 @@ class BatchOrchestrator:
                           "seidr_batch.log", "egad.log"]:
                     (iter_dir / f).unlink(missing_ok=True)
             (self.base_outdir / ".saturation.done").unlink(missing_ok=True)
-
         elif force_wipe_level == 1:
             print("[Saturation] Purging previous Evaluation outputs...")
             for iter_dir in self.base_outdir.glob("step*/iter*"):
@@ -315,11 +322,9 @@ class BatchOrchestrator:
                     (iter_dir / f).unlink(missing_ok=True)
             (self.base_outdir / ".saturation.done").unlink(missing_ok=True)
 
-        # Save current valid state
         self.base_outdir.mkdir(parents=True, exist_ok=True)
         with open(state_file, "w") as f:
             json.dump(current_state, f, indent=4)
-        # ----------------------------------------------
 
         bp_meta = []
         for bp in self.dataset.bioprojects:

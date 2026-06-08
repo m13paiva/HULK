@@ -51,10 +51,17 @@ HELP_BODY = (
 # ---------------------------- Persisted config I/O ----------------------------
 
 def _cfg_path(_: Path | None = None) -> Path:
+    """Returns the persistent file path used for system configuration."""
     return CFG_FIXED_PATH
 
 
 def _cfg_load(_: Path | None = None) -> Dict[str, Any]:
+    """
+    Loads and parses the persisted JSON configuration file.
+
+    Returns:
+        Dict[str, Any]: Parsed configuration dictionary. Returns an empty dict if the file is missing or corrupt.
+    """
     p = _cfg_path(None)
     if not p.exists():
         return {}
@@ -66,6 +73,15 @@ def _cfg_load(_: Path | None = None) -> Dict[str, Any]:
 
 
 def _cfg_save(cfg: dict[str, Any], _: Path | None = None) -> Path:
+    """
+    Writes the provided configuration dictionary to the persistent JSON file.
+
+    Args:
+        cfg (dict): The configuration dictionary to save.
+
+    Returns:
+        Path: The path to the updated configuration file.
+    """
     p = _cfg_path(None)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -77,6 +93,16 @@ def _cfg_save(cfg: dict[str, Any], _: Path | None = None) -> Path:
 
 
 def _cfg_update(section: str, payload: dict[str, Any], _: Path | None = None) -> Path:
+    """
+    Updates a specific subsystem section within the global configuration file.
+
+    Args:
+        section (str): The configuration section to modify.
+        payload (dict): The specific settings to apply.
+
+    Returns:
+        Path: The path to the updated configuration file.
+    """
     cfg = _cfg_load(None)
     sect = cfg.get(section, {})
     for k, v in payload.items():
@@ -87,6 +113,15 @@ def _cfg_update(section: str, payload: dict[str, Any], _: Path | None = None) ->
 
 
 def _cfg_reset(section: str, _: Path | None = None) -> Path:
+    """
+    Purges a specific subsystem section from the global configuration file.
+
+    Args:
+        section (str): The configuration section to reset.
+
+    Returns:
+        Path: The path to the updated configuration file.
+    """
     cfg = _cfg_load(None)
     if section in cfg:
         del cfg[section]
@@ -95,17 +130,21 @@ def _cfg_reset(section: str, _: Path | None = None) -> Path:
 
 # ---------------------------- Help formatting ----------------------------
 def _pad_block(text: str, n: int) -> str:
+    """Applies block indentation to a multiline string block."""
     lines = text.rstrip("\n").splitlines()
     return "\n".join((" " * n) + line for line in lines)
 
 
 class SpacedFormatterMixin:
+    """Mixin class to strictly format Click help menus with wide column alignment."""
+
     def _fmt_rows_with_spacing(
             self,
             formatter: click.HelpFormatter,
             title: str,
             rows: list[tuple[str, str | None]],
     ) -> None:
+        """Renders aligned command descriptions."""
         rows = [r for r in rows if r]
         if not rows:
             return
@@ -132,6 +171,8 @@ class SpacedFormatterMixin:
 
 
 class HulkGroup(SpacedFormatterMixin, click.Group):
+    """Custom command group mapping that utilizes the SpacedFormatterMixin for formatting."""
+
     def make_context(self, info_name, args, parent=None, **extra):
         ctx = super().make_context(info_name, args, parent=parent, **extra)
         ctx.max_content_width = WIDE_HELP
@@ -164,6 +205,8 @@ class HulkGroup(SpacedFormatterMixin, click.Group):
 
 
 class HulkCommand(SpacedFormatterMixin, click.Command):
+    """Custom standard command utilizing SpacedFormatterMixin styling."""
+
     def make_context(self, info_name, args, parent=None, **extra):
         ctx = super().make_context(info_name, args, parent=parent, **extra)
         ctx.max_content_width = WIDE_HELP
@@ -273,6 +316,7 @@ def cli(
         no_bp_postprocessing: bool,
         no_global_postprocessing: bool,
 ):
+    """Primary pipeline interface block. Evaluates subcommand state or drops into main execution."""
     if ctx.invoked_subcommand is not None:
         return
     _run_pipeline(
@@ -319,7 +363,7 @@ def _warn(s): return click.style(f"!!! {s} !!!", fg="red", bold=True)
 
 
 def _print_config_summary(dataset: Dataset, cfg: Config) -> None:
-    """Print complete summary of Config and Dataset options."""
+    """Outputs a pre-flight execution summary validating loaded arguments."""
 
     # --- Danger Zone First ---
     if cfg.force or cfg.rem_missing_bps:
@@ -415,30 +459,25 @@ def _run_pipeline(
         no_bp_postprocessing: bool,
         no_global_postprocessing: bool,
 ) -> None:
+    """Executes the core logic sequence, assembling configs, building datasets, and initiating tasks."""
     if input_path is None or reference_path is None:
         raise click.UsageError("Missing required options: -i/--input and -r/--reference. See 'hulk -h'.")
 
-    # Load persisted sections from ~/.hulk.json (or fixed path)
+    # Load persisted sections from fixed settings file.
     persisted = _cfg_load(None)
     trim_cfg = persisted.get("trim", {}) or {}
     align_cfg = persisted.get("align", {}) or {}
     txi_cfg = persisted.get("tximport", {}) or {}
     plot_cfg = persisted.get("plot", {}) or {}
 
-    # ---- Trim defaults ----
     ws = trim_cfg.get("window_size", 4)
     mq = trim_cfg.get("mean_quality", 20)
-
-    # ---- Align defaults ----
     align_method = (align_cfg.get("method") or "kallisto").lower()
     kallisto_bootstrap = int(align_cfg.get("bootstrap", 100))
 
-    # ---- tximport defaults ----
     txi_mode = txi_cfg.get("mode") or "raw_counts"
     txi_ignore = bool(txi_cfg.get("ignore_tx_version", False))
 
-    # ---- Plot defaults ----
-    # Default to TRUE for globals if not found in JSON
     global_pca = bool(plot_cfg.get("global_pca", True))
     global_heatmap = bool(plot_cfg.get("global_heatmap", True))
     global_var_heatmap = bool(plot_cfg.get("global_var_heatmap", True))
@@ -452,8 +491,6 @@ def _run_pipeline(
     plot_heatmap = global_heatmap or bp_heatmap
     plot_var_heatmap = global_var_heatmap
 
-
-    # Build Config
     cfg = Config(
         input_path=input_path,
         reference_path=reference_path,
@@ -465,49 +502,38 @@ def _run_pipeline(
         dry_run=dry_run,
         tx2gene=tx2gene_path,
         keep_fastq=keep_fastq,
-
         no_cache=no_cache,
         cache_gb=cache_gb,
-
         trim_window_size=ws,
         trim_mean_quality=mq,
         align_method=align_method,
         kallisto_bootstrap=kallisto_bootstrap,
         tximport_mode=txi_mode,
         tximport_ignore_tx_version=txi_ignore,
-
         plot_pca=plot_pca,
         plot_heatmap=plot_heatmap,
         plot_var_heatmap=plot_var_heatmap,
-
-        # New Params
         plot_sample_cor=sample_cor,
         plot_dispersion=dispersion,
         top_n_vars=top_n,
-
         seq_tech=seq_tech,
         target_genes_files=target_genes_files,
         rem_missing_bps=rem_missing_bps,
-
-        # Post-processing control
         no_bp_postprocessing=no_bp_postprocessing,
         no_global_postprocessing=no_global_postprocessing,
     )
 
-    # Validate reference
     trans_suff = transcriptome_suffixes(reference_path)
     if trans_suff not in TRANSCRIPTOME_FORMATS:
         raise click.UsageError(
             f"Transcriptome file must be one of: {', '.join(sorted(TRANSCRIPTOME_FORMATS))} (got: {reference_path.name})"
         )
 
-    # Dataset Loading
+    # Dataset evaluation logic based on input mode types.
     df = None
     if input_path.is_dir():
-        # FASTQ mode
         dataset = Dataset.from_fastq_dir(input_path, cfg)
     else:
-        # SRA mode
         suf = input_path.suffix.lower()
         if suf not in INPUT_FORMATS:
             raise click.UsageError(f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))}")
@@ -527,7 +553,6 @@ def _run_pipeline(
         df = df[list(REQUIRED_INPUT_COLS)]
         dataset = Dataset.from_dataframe(df, cfg)
 
-    # tx2gene validation
     if tx2gene_path is not None:
         try:
             tx2gene_df = pd.read_csv(tx2gene_path, sep=None, engine="python")
@@ -536,7 +561,6 @@ def _run_pipeline(
         except Exception as e:
             raise click.ClickException(str(e))
 
-    # FASTQ mode technology check
     if getattr(dataset, "mode", None) == "FASTQ":
         from .align import list_known_seq_techs, _MODEL_PARAMS
         known_techs = list_known_seq_techs()
@@ -547,7 +571,7 @@ def _run_pipeline(
             raise click.UsageError(f"Unknown seq-tech '{seq_tech}'. Known: {', '.join(known_techs)}")
 
     # ------------------------------------------------------------------
-    # DANGEROUS LOGIC: rem-missing-bps
+    # Destructive operations handling. Be careful.
     # ------------------------------------------------------------------
     if rem_missing_bps:
         if getattr(dataset, "mode", None) != "SRA":
@@ -573,14 +597,12 @@ def _run_pipeline(
             else:
                 click.secho("[INFO] Output directory does not exist, nothing to clean.", fg="blue")
 
-    # Print summary (Cleanly passing both objects to the view function)
     _print_config_summary(dataset, cfg)
 
     if dry_run:
         click.secho("✅ Dry run complete. No tools executed.\n", fg="green")
         sys.exit(0)
 
-    # Extra warning for the reckless
     if (force or rem_missing_bps) and not yes:
         click.secho("WARNING: You have selected DESTRUCTIVE options (Force and/or Rem-Missing).", fg="red", blink=True,
                     bold=True)
@@ -604,12 +626,12 @@ def _run_pipeline(
               help="fastp mean quality threshold.")
 @click.option("--reset-defaults", is_flag=True, help="Reset trim options.")
 def trim(window_size: int | None, mean_quality: int | None, reset_defaults: bool):
+    """Saves fastp parameter defaults to persistent configuration storage."""
     if reset_defaults:
         p = _cfg_reset("trim")
         click.secho(f"Reset trim settings to defaults at {p}", fg="green")
         return
 
-    # Load current to merge
     current_cfg = _cfg_load()
     trim_cfg = current_cfg.get("trim", {})
 
@@ -619,7 +641,6 @@ def trim(window_size: int | None, mean_quality: int | None, reset_defaults: bool
     p = _cfg_update("trim", trim_cfg)
     click.secho(f"Saved trim settings to {p}", fg="green")
 
-    # Summary
     click.echo("\nCurrent Trim Configuration:")
     click.echo(f"  Window Size:  {trim_cfg.get('window_size', 4)}")
     click.echo(f"  Mean Quality: {trim_cfg.get('mean_quality', 20)}")
@@ -633,6 +654,7 @@ def trim(window_size: int | None, mean_quality: int | None, reset_defaults: bool
               help="Ignore transcript version (e.g. ENST.1 -> ENST).")
 @click.option("--reset-defaults", is_flag=True)
 def tximport(mode: str | None, ignore_tx_version: bool | None, reset_defaults: bool):
+    """Saves tximport parameter defaults to persistent configuration storage."""
     if reset_defaults:
         p = _cfg_reset("tximport")
         click.secho(f"Reset tximport settings at {p}", fg="green")
@@ -647,7 +669,6 @@ def tximport(mode: str | None, ignore_tx_version: bool | None, reset_defaults: b
     p = _cfg_update("tximport", txi_cfg)
     click.secho(f"Saved tximport settings to {p}", fg="green")
 
-    # Summary
     click.echo("\nCurrent tximport Configuration:")
     click.echo(f"  Mode:           {txi_cfg.get('mode', 'raw_counts')}")
     click.echo(f"  Ignore Tx Ver:  {txi_cfg.get('ignore_tx_version', False)}")
@@ -659,6 +680,7 @@ def tximport(mode: str | None, ignore_tx_version: bool | None, reset_defaults: b
 @click.option("-b", "--bootstrap", type=int, default=None, show_default="100")
 @click.option("--reset-defaults", is_flag=True)
 def align(method: str | None, bootstrap: int | None, reset_defaults: bool):
+    """Saves pseudo-alignment defaults to persistent configuration storage."""
     if reset_defaults:
         p = _cfg_reset("align")
         click.secho(f"Reset align settings at {p}", fg="green")
@@ -673,7 +695,6 @@ def align(method: str | None, bootstrap: int | None, reset_defaults: bool):
     p = _cfg_update("align", align_cfg)
     click.secho(f"Saved align settings to {p}", fg="green")
 
-    # Summary
     click.echo("\nCurrent Alignment Configuration:")
     click.echo(f"  Method:     {align_cfg.get('method', 'kallisto')}")
     click.echo(f"  Bootstraps: {align_cfg.get('bootstrap', 100)}")
@@ -686,6 +707,7 @@ def align(method: str | None, bootstrap: int | None, reset_defaults: bool):
               help="Low variance threshold. Genes below this var are excluded.")
 @click.option("--reset-defaults", is_flag=True, help="Reset DESeq2 options to defaults.")
 def deseq2(enabled: bool | None, var_threshold: float | None, reset_defaults: bool):
+    """Saves variance-stabilizing transformation defaults to persistent configuration storage."""
     if reset_defaults:
         p = _cfg_reset("deseq2")
         click.secho(f"Reset DESeq2 settings to defaults at {p}", fg="green")
@@ -700,7 +722,6 @@ def deseq2(enabled: bool | None, var_threshold: float | None, reset_defaults: bo
     p = _cfg_update("deseq2", deseq_cfg)
     click.secho(f"Saved DESeq2 settings to {p}", fg="green")
 
-    # Summary
     click.echo("\nCurrent DESeq2 Configuration:")
     click.echo(f"  Enabled:        {deseq_cfg.get('enabled', True)}")
     click.echo(f"  Var Threshold:  {deseq_cfg.get('var_threshold', 0.1)}")
@@ -721,6 +742,7 @@ def deseq2(enabled: bool | None, var_threshold: float | None, reset_defaults: bo
 @click.option("--reset-defaults", is_flag=True)
 def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sample_cor, dispersion, top_n,
          reset_defaults):
+    """Saves visualization and plotting configurations to persistent storage."""
     if reset_defaults:
         p = _cfg_reset("plot")
         click.secho(f"Reset plot settings at {p}", fg="green")
@@ -741,7 +763,6 @@ def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sam
     p = _cfg_update("plot", plot_cfg)
     click.secho(f"Saved plot settings to {p}", fg="green")
 
-    # Summary
     click.echo("\nCurrent Plot Configuration:")
     click.echo(f"  Global PCA:     {plot_cfg.get('global_pca', True)}")
     click.echo(f"  Global Heatmap: {plot_cfg.get('global_heatmap', True)}")
@@ -812,7 +833,6 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
     p = _cfg_update("seidr", seidr_cfg)
     click.secho(f"Seidr settings saved to {p}", fg="green")
 
-    # Print summary for user verification
     click.echo("\nCurrent Seidr Configuration:")
     click.echo(f"  Enabled:      {seidr_cfg.get('enabled', True)}")
     click.echo(f"  Force Mode:  {seidr_cfg.get('force', False)}")
@@ -825,6 +845,7 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
     saved_targets = seidr_cfg.get("targets", [])
     if saved_targets:
         click.echo(f"  Default Targets: {len(saved_targets)} files")
+
 
 @cli.command("report", cls=HulkCommand,
              help="Regenerate (or generate snapshots while hulk is running) plots and matrices using saved settings.")
@@ -840,61 +861,44 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
 @click.option("-f", "--force", is_flag=True, help="Force full recalculation (overwrites existing matrices).")
 def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, no_global_postprocessing, fast, force):
     """
-    Scans output directory and runs post-processing using settings defined in 'hulk plot'.
+    Standalone command to process downstream analysis reports utilizing already completed pipeline components.
     """
     click.secho("\n[Report] Scanning output directory...", fg="yellow")
 
-    # 1. LOAD PERSISTED SETTINGS
     persisted = _cfg_load()
     plot_cfg = persisted.get("plot", {})
     deseq_cfg = persisted.get("deseq2", {})
     txi_cfg = persisted.get("tximport", {})
     expr_cfg = persisted.get("expression", {})
 
-    # Determine "Fast Mode" logic
     if force:
         plots_only = False
     else:
         plots_only = fast
 
-    # 2. Build Configuration
-    # We only pass arguments that Config.__init__ actually accepts.
     cfg = Config(
         outdir=output_dir,
         tx2gene=tx2gene_path,
         target_genes_files=list(target_genes_files) if target_genes_files else None,
         plots_only_mode=plots_only,
-
         no_bp_postprocessing=no_bp_postprocessing,
         no_global_postprocessing=no_global_postprocessing,
-
-        # Plot Settings (Accepted by __init__)
         plot_pca=plot_cfg.get("global_pca", True),
         plot_heatmap=plot_cfg.get("global_heatmap", True),
         plot_var_heatmap=plot_cfg.get("global_var_heatmap", True),
         plot_sample_cor=plot_cfg.get("sample_cor", True),
         plot_dispersion=plot_cfg.get("dispersion", True),
         top_n_vars=plot_cfg.get("top_n", 500),
-
-        # Tximport Settings (Accepted by __init__)
         tximport_mode=txi_cfg.get("mode", "length_scaled_tpm"),
         tximport_ignore_tx_version=txi_cfg.get("ignore_tx_version", False),
         tximport_only_mode=txi_cfg.get("tximport_only", False)
     )
 
-    # 3. MANUAL OVERRIDES
-    # Since Config.__init__ doesn't accept these, we inject them directly
-    # to ensure the report uses the saved JSON values, not class defaults.
-
-    # DESeq2
     cfg.deseq2_var_threshold = float(deseq_cfg.get("var_threshold", 0.1))
     cfg.deseq2_vst_enabled = bool(deseq_cfg.get("vst", True))
-
-    # Expression Matrix
     cfg.expr_use_matrix = expr_cfg.get("use_matrix", "vst")
     cfg.drop_nonvarying_genes = bool(expr_cfg.get("drop_nonvarying", True))
 
-    # Fallback for tx2gene lookup if not provided in CLI
     if not cfg.tx2gene:
         saved_tx = persisted.get("general", {}).get("tx2gene")
         if saved_tx:
@@ -905,7 +909,6 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
         return
 
     try:
-        # 4. Reconstruct Dataset
         dataset = Dataset.reconstruct_from_output(cfg)
 
         click.secho(f"[Report] Found {len(dataset)} samples across {len(dataset.bioprojects)} BioProjects.", fg="green")
@@ -928,8 +931,7 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
         else:
             click.secho("[Report] Recalculating expression matrices (this may take a moment)...", fg="magenta")
 
-        # 5. Run Post-Processing
-        generate_read_metrics_plot(dataset, cfg.shared / "plots",cfg.log)
+        generate_read_metrics_plot(dataset, cfg.shared / "plots", cfg.log)
         run_postprocessing(
             dataset,
             cfg,
@@ -969,14 +971,10 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
 @click.option("--metrics", type=click.Choice(['auroc', 'aupr', 'both'], case_sensitive=False),
               default='both', show_default=True, help="Which EGAD metrics to calculate.")
 @click.option("--plot-only", is_flag=True, help="Skip processing and only regenerate plots from existing raw results.")
-def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threads, force, mapman, go_file, metrics, plot_only):
+def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threads, force, mapman, go_file, metrics,
+               plot_only):
     """
-    Performs a data saturation analysis to assess network reconstruction quality.
-
-    \b
-    1. Generates balanced BioProject batches (defined by --steps).
-    2. Runs Seidr network inference.
-    3. (If mapman or go-file provided) Runs EGAD to calculate the requested metrics.
+    Executes a comprehensive data saturation check to infer correlation reliability as network subsets expand.
     """
     click.secho("\n[Saturation] Initializing Data Saturation Analysis...", fg="cyan", bold=True)
     click.secho(
@@ -986,7 +984,6 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
     if seed: click.secho(f"[Saturation] Seed: {seed}", fg="magenta")
 
     try:
-        # Pass the annotation files to Config so they are centrally stored
         cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only, mapman_file=mapman, go_file=go_file)
         cfg.seidr_preset = seidr_preset.upper()
 
@@ -998,7 +995,6 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
         return
 
     try:
-        # Note: This will instantly crash until you let me fix BatchOrchestrator
         orch = BatchOrchestrator(
             dataset, cfg,
             seed=seed,
@@ -1050,8 +1046,7 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
               default=None, help="Optional custom edges .tsv table (Source, Target, weight).")
 def evaluate(output_dir, mapman_path, go_file_path, metrics, custom_network):
     """
-    Evaluates the primary consensus network using MapMan or GO functional annotations.
-    Delegates execution and output to the EGAD vocal wrapper.
+    Wraps the secondary R-based EGAD execution module to evaluate generated consensus files based on external annotations.
     """
     from .egad import run_vocal_evaluation
 
@@ -1062,13 +1057,13 @@ def evaluate(output_dir, mapman_path, go_file_path, metrics, custom_network):
         return
 
     if mapman_path and go_file_path:
-        click.secho("[Warning] Both MapMan and GO provided. The underlying R script will halt until dual-run logic is finalized.", fg="yellow")
+        click.secho(
+            "[Warning] Both MapMan and GO provided. The underlying R script will halt until dual-run logic is finalized.",
+            fg="yellow")
 
     try:
-        # Standard config loading
         cfg = Config(outdir=output_dir, plots_only_mode=True, mapman_file=mapman_path, go_file=go_file_path)
 
-        # Execute using the vocal wrapper
         run_vocal_evaluation(
             cfg,
             mapman_path=mapman_path,
@@ -1080,7 +1075,9 @@ def evaluate(output_dir, mapman_path, go_file_path, metrics, custom_network):
     except Exception as e:
         click.secho(f"[Error] Evaluation failed: {e}", fg="red")
 
+
 def main():
+    """Application entry point overriding standard terminal rendering bounds."""
     os.environ.setdefault("COLUMNS", str(WIDE_HELP))
     cli(standalone_mode=True)
 

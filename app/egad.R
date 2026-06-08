@@ -7,7 +7,10 @@ suppressPackageStartupMessages({
   library(Matrix)
 })
 
-# --- DEBUG LOGGER ---
+# ------------------------------------------------------------------------------
+# Debug Logging Routine
+# Prints formatted console messages dynamically capturing arguments.
+# ------------------------------------------------------------------------------
 log_msg <- function(...) {
   print(sprintf(...))
 }
@@ -35,7 +38,8 @@ log_msg("---------------------------------------------------")
 log_msg("Starting EGAD Analysis (Micro & Macro Mode)")
 
 # ------------------------------------------------------------------------------
-# 1. Loading Network
+# 1. Loading Network Data Structure
+# Aggregates raw edge relations into sparse matrices representing topological graphs.
 # ------------------------------------------------------------------------------
 log_msg(">> Loading Network...")
 edges <- fread(opt$network)
@@ -46,6 +50,7 @@ if (ncol(edges) >= 3) {
   stop("Network file must have at least 3 columns.")
 }
 
+# Standardizing node identifiers to guarantee reliable hashing
 edges[, source := toupper(source)]
 edges[, target := toupper(target)]
 edges[, weight := as.numeric(weight)]
@@ -55,6 +60,7 @@ all_genes <- unique(c(edges$source, edges$target))
 n_genes <- length(all_genes)
 gene_map <- setNames(1:n_genes, all_genes)
 
+# Bi-directional mapping resolution (ensure symmetric index logic without duplicating edges)
 edges[, idx1 := gene_map[source]]
 edges[, idx2 := gene_map[target]]
 edges[, i := pmin(idx1, idx2)]
@@ -73,7 +79,8 @@ net_sparse_init <- Matrix::sparseMatrix(
 rm(edges_unique); gc()
 
 # ------------------------------------------------------------------------------
-# 2. Annotation Parsing
+# 2. Annotation Parsing and Functional Set Generation
+# Translates hierarchical taxonomies into unweighted categorical indicator matrices.
 # ------------------------------------------------------------------------------
 annotations_list <- list()
 
@@ -81,18 +88,22 @@ if (use_mapman) {
   log_msg(">> Parsing MapMan file...")
   mm <- fread(opt$mapman, header = TRUE, quote = "", fill = TRUE, sep = "\t")
   colnames(mm) <- gsub("'", "", colnames(mm))
+
   if (!"IDENTIFIER" %in% colnames(mm)) {
     if(ncol(mm) >= 3) {
       mm <- mm[, 1:3]
       colnames(mm) <- c("BINCODE", "NAME", "IDENTIFIER")
     }
   }
+
   mm_clean <- mm[IDENTIFIER != "" & IDENTIFIER != "''"]
   mm_clean[, IDENTIFIER := toupper(gsub("'", "", IDENTIFIER))]
   mm_clean[, BINCODE := gsub("'", "", BINCODE)]
   mm_clean[, NAME := gsub("'", "", NAME)]
 
   unique_pairs <- unique(mm_clean[, .(IDENTIFIER, BINCODE)])
+
+  # Recursively derive ancestral parent mappings for hierarchical nodes
   get_parents <- function(bincode) {
     parts <- unlist(strsplit(bincode, "\\."))
     sapply(1:length(parts), function(i) paste(parts[1:i], collapse = "."))
@@ -155,7 +166,7 @@ if (use_go) {
 }
 
 # ------------------------------------------------------------------------------
-# 3. Execution Loop
+# 3. Execution Cycle processing the loaded annotations natively against network boundaries
 # ------------------------------------------------------------------------------
 final_results <- list()
 start_time_global <- Sys.time()
@@ -190,6 +201,7 @@ for (anno_source in names(annotations_list)) {
   res_aupr <- data.table(Term = term_names)
 
   tryCatch({
+    # Evaluate Precision-Recall Dynamics if enabled
     if (opt$aupr) {
       log_msg(">> Running EGAD (AUPR mode)...")
       preds_aupr <- EGAD::predictions(genes.labels = annot_final, network = net_final)
@@ -201,12 +213,14 @@ for (anno_source in names(annotations_list)) {
       res_aupr <- data.table(Term = term_names, AUPR = aupr_vals)
     }
 
+    # Evaluate Node Neighbor Voting AUROC if enabled
     if (opt$auroc) {
       log_msg(">> Running EGAD (AUROC mode)...")
       nv_res <- neighbor_voting(genes.labels = annot_final, network = net_final, nFold = 3, output = "AUROC")
       res_auc <- data.table(Term = rownames(nv_res), AUC = as.numeric(nv_res[, 1]), NodeDegreeAUC = as.numeric(nv_res[, 2]))
     }
 
+    # Extract coordinate point clusters for exterior downstream graphing mechanisms
     if (!is.null(opt$curves)) {
       log_msg(">> Generating MICRO-AVERAGED curve data...")
       if (!exists("preds_aupr")) preds <- EGAD::predictions(genes.labels = annot_final, network = net_final) else preds <- preds_aupr
@@ -219,7 +233,6 @@ for (anno_source in names(annotations_list)) {
       prc_data <- get_prc(flat_preds[valid_idx], flat_labels[valid_idx])
       baseline_val <- sum(flat_labels[valid_idx]) / length(flat_labels[valid_idx])
 
-      # Calculate Micro Integrations
       micro_auc <- sum(diff(roc_data[,1]) * (roc_data[-1,2] + roc_data[-nrow(roc_data),2]) / 2, na.rm = TRUE)
       prc_ordered <- prc_data[order(prc_data[,1]), ]
       micro_aupr <- sum(diff(prc_ordered[,1]) * (prc_ordered[-1,2] + prc_ordered[-nrow(prc_ordered),2]) / 2, na.rm = TRUE)
