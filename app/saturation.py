@@ -469,8 +469,10 @@ class BatchOrchestrator:
                                         'n_bps': it['n_bps'], 'iter': it['iter'],
                                         'n_samples': self._count_samples_from_file(it["expr"]), 'source': src
                                     }
-                                    if self.do_auroc and mets.get('auc') is not None: res_dict['auc'] = mets['auc']
-                                    if self.do_aupr and mets.get('aupr') is not None: res_dict['aupr'] = mets['aupr']
+                                    if self.do_auroc and mets.get('macro_auc') is not None:
+                                        res_dict['auc'] = mets['macro_auc']
+                                    if self.do_aupr and mets.get('macro_aupr') is not None:
+                                        res_dict['aupr'] = mets['macro_aupr']
                                     final_results.append(res_dict)
                             p_egad.update(1)
 

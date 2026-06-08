@@ -456,7 +456,7 @@ class BioProject:
         Execute post-processing logic for this BioProject.
         Includes Deferred Import to avoid circular dependency.
         """
-        # <--- DEFERRED IMPORT: This prevents circular imports between entities.py and post_processing.py
+
         from .post_processing import run_postprocessing_bp
 
         return run_postprocessing_bp(self, cfg)
