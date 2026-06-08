@@ -4,13 +4,13 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 from datetime import datetime
-from .utils import log, log_err, generate_read_metrics_plot
+from .utils import log, generate_read_metrics_plot
 from .align import build_transcriptome_index
 from .qc import run_multiqc_global
 from .entities import Config, Dataset
 from .orchestrator import run_download_and_process
 from .post_processing import run_postprocessing as run__postprocessing
-from .seidr import run_seidr_single, run_seidr_aggregation
+from .seidr import run_seidr_single
 
 def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
     """
@@ -19,13 +19,9 @@ def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
 
     # 1. The Purge (rem-missing-bps)
     if cfg.rem_missing_bps and cfg.outdir.exists():
-        # We standardized on "SRA" in the Dataset class, so we check for that here.
         if getattr(dataset, "mode", "SRR") != "SRR":
             print("[WARNING] --rem-missing-bps ignored: Only applicable in SRA mode.")
         else:
-            # --- CRITICAL FIX ---
-            # Extract the ID strings from the BioProject objects.
-            # Comparing objects directly to folder strings caused the "delete everything" bug.
             raw_bps = getattr(dataset, "bioprojects", [])
             expected_bps = {str(bp.id) for bp in raw_bps if hasattr(bp, "id")}
 
@@ -40,7 +36,6 @@ def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
                     if folder.name in blacklist or folder.name.endswith("_mqc"):
                         continue
 
-                    # Now we compare String vs String
                     if folder.name not in expected_bps:
                         print(f"[DANGER] Deleting extraneous BioProject folder: {folder.name}")
                         if not cfg.dry_run:
@@ -51,15 +46,11 @@ def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
 
     # 2. Standard Directory Setup
     cfg.outdir.mkdir(parents=True, exist_ok=True)
-
-    # We explicitly create these to ensure they exist.
-    # We DO NOT delete 'shared' on force anymore to preserve cache/plots.
     cfg.shared.mkdir(parents=True, exist_ok=True)
     cfg.cache.mkdir(parents=True, exist_ok=True)
 
     # Initialize Log
     if not cfg.dry_run:
-        # Open in Append mode ('a') so we don't wipe history even on force
         mode = 'a'
         with open(cfg.log, mode, encoding="utf-8") as f:
             f.write(f"\n\n{'=' * 60}\n")
@@ -84,7 +75,6 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     temp_dir: Path = getattr(cfg, "temp_dir", shared / "tmp")
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Basic header
     log(f"Output directory: {outdir}", log_path)
     log(f"Mode: {getattr(data, 'mode', '-')}", log_path)
 
@@ -98,7 +88,6 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         bp_ids = [bp.id for bp in getattr(data, "bioprojects", [])]
         log(f"BioProjects ({bp_total}, done {bp_done}): {', '.join(sorted(bp_ids))}", log_path)
 
-    # Build / locate kallisto index
     if reference and reference.suffix.lower() != ".idx":
         transcripts_index = build_transcriptome_index(reference, shared, log_path)
     else:
@@ -107,7 +96,6 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     transcripts_index = Path(transcripts_index).resolve()
     log(f"Using index: {transcripts_index}", log_path)
 
-    # Inject index path into sample metadata
     if getattr(data, "mode", None) == "FASTQ":
         samples_iter = getattr(data, "samples", [])
     else:
@@ -116,7 +104,6 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     for s in samples_iter:
         s.metadata.setdefault("kallisto_index", str(transcripts_index))
 
-    # Log per-project plan
     if getattr(data, "mode", None) == "SRR":
         for bp in getattr(data, "bioprojects", []):
             log(f"[PLAN] BioProject {bp.id}: {len(bp.samples)} SRR(s) scheduled.", log_path)
@@ -124,13 +111,7 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         for s in getattr(data, "samples", []):
             log(f"[PLAN] FASTQ sample {s.id} -> {s.outdir}", log_path)
 
-    opts = cfg.get_tool_opts("seidr") if hasattr(cfg, "get_tool_opts") else {}
-    seidr_mode = opts.get("mode", opts.get("construction_mode", getattr(cfg, "seidr_construction_mode", "both")))
-    seidr_mode = str(seidr_mode).lower().strip()
-
-
-
-    # Run orchestrator (prefetch + processing) — uses cfg internally (incl. bootstraps)
+    # Run orchestrator
     run_download_and_process(
         dataset=data,
         cfg=cfg,
@@ -144,37 +125,25 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     if not cfg.no_global_postprocessing:
         try:
             log("Generating Global MultiQC report...", log_path)
-            # Pass 'dataset' to trigger global aggregation mode
             run_multiqc_global(outdir, shared, "multiqc_shared", log_path, modules=("kallisto", "fastp"))
             generate_read_metrics_plot(data,cfg.shared / "plots", cfg.log)
         except Exception as e:
-            log_err(cfg.error_warnings, log_path, f"Global MultiQC failed: {e}")
+            print(f"Global MultiQC failed: {e}")
     else:
         log("Skipping Global MultiQC (--no-global-postprocessing).", log_path)
 
 
-    # Post-processing (R-based: tximport + DESeq2/VST + plots/exports)
+    # Post-processing
     if getattr(cfg, "tx2gene", None) is not None:
-        # This will respect cfg.deseq2_vst_enabled and the plot flags.
-        # If DESeq2 is disabled, it will automatically fall back to tximport-only.
         run__postprocessing(data, cfg, skip_bp=True)
 
-    seidr_mode = getattr(cfg, "seidr_construction_mode", "single")
+    try:
+        run_seidr_single(cfg)
+    except Exception as e:
+        print(f"[Seidr] Single Network pipeline failed: {e}")
 
-    if seidr_mode in ("single", "both"):
-        try:
-            run_seidr_single(cfg)
-        except Exception as e:
-            log_err(cfg.error_warnings, log_path, f"[Seidr] Single Network pipeline failed: {e}")
-
-    if seidr_mode in ("aggregated", "both"):
-        log("[Seidr] Initiating final aggregation of batch networks...", log_path)
-        run_seidr_aggregation(cfg)
-
-        # End of pipeline
     log("Pipeline finished.", log_path)
 
-    # Warnings, if any
     if getattr(cfg, "error_warnings", None):
         log("\n\n=================== WARNINGS ===================\n", log_path)
         for m in cfg.error_warnings:

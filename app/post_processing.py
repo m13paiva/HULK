@@ -7,7 +7,7 @@ from typing import List, Any, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .entities import Config, Dataset
-from .utils import log, log_err
+from .utils import log
 
 R_SCRIPT_PATH = Path(__file__).with_name("post_processing.R")
 
@@ -162,94 +162,6 @@ def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) ->
         return None
 
 
-def run_postprocessing_batch(
-        batch: List[Any],
-        cfg: Config,
-        r_script: Path | None = None
-) -> Optional[Path]:
-    """
-    Run post-processing for a BATCH of BioProjects (Aggregated Mode).
-    Creates folder shared/seidr/aggregated/BP1_BP2_...
-    Generates genes.txt and expression.tsv there.
-    """
-    if not batch:
-        return None
-
-    # 1. Create Aggregated Folder Name
-    bp_ids = sorted([b.id for b in batch])
-    batch_name = "_".join(bp_ids)
-
-    # Output: shared/seidr/aggregated/<batch_name>
-    out_dir = cfg.shared / "seidr" / "aggregated" / batch_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log_path = out_dir / "batch.log"
-
-    # --- OPTIMIZATION: Single BP Shortcut ---
-    if len(batch) == 1:
-        bp = batch[0]
-        src_genes = bp.path / "plots" / "deseq2" / "genes.txt"
-        src_expr = bp.path / "plots" / "deseq2" / "expression.tsv"
-
-        if src_genes.exists() and src_expr.exists():
-            log(f"[Batch] Single-BP batch ({bp.id}) detected with existing data. Copying...", cfg.log)
-            try:
-                shutil.copy2(src_genes, out_dir / "genes.txt")
-                shutil.copy2(src_expr, out_dir / "expression.tsv")
-                return out_dir
-            except Exception as e:
-                log_err(cfg.error_warnings, cfg.log, f"[Batch] Failed to copy existing files for {bp.id}: {e}")
-        else:
-            log(f"[Batch] Single-BP batch ({bp.id}) detected, but source files missing. Re-running...", cfg.log)
-
-    # 2. Build Arguments
-    try:
-        args = _build_r_args_global(cfg, out_dir, mode="SRR")
-    except Exception as e:
-        log_err(cfg.error_warnings, cfg.log, f"[Batch] Failed to build args: {e}")
-        return None
-
-    # Set prefix to batch name
-    if "--prefix" in args:
-        idx = args.index("--prefix")
-        args[idx + 1] = "batch"
-
-    bp_arg_str = ",".join(bp_ids)
-    args.extend(["--bioproject", bp_arg_str])
-
-    # 3. Execution
-    script_path = r_script if r_script else R_SCRIPT_PATH
-    args[1] = str(script_path)
-
-    log(f"[Batch] Starting aggregated post-processing for {len(batch)} BPs in {out_dir.name}", cfg.log)
-
-    try:
-        with open(log_path, "w", encoding="utf-8") as fh:
-            fh.write(f"# Batch Aggregation Log\n# Batch: {batch_name}\n")
-            fh.write(f"# Command:\n{' '.join(args)}\n\n")
-            fh.flush()
-            subprocess.run(args, stdout=fh, stderr=fh, text=True, check=False)
-
-        # 4. Move output files to the root of the batch folder
-        src_genes = out_dir / "deseq2" / "genes.txt"
-        src_expr = out_dir / "deseq2" / "expression.tsv"
-
-        dst_genes = out_dir / "genes.txt"
-        dst_expr = out_dir / "expression.tsv"
-
-        if src_genes.exists() and src_expr.exists():
-            shutil.move(str(src_genes), str(dst_genes))
-            shutil.move(str(src_expr), str(dst_expr))
-            log(f"[Batch] Aggregation complete. Files ready in {out_dir}", cfg.log)
-            return out_dir
-        else:
-            log_err(cfg.error_warnings, cfg.log, f"[Batch] R script did not generate expected files in {out_dir}/deseq2")
-            return None
-
-    except Exception as e:
-        log_err(cfg.error_warnings, cfg.log, f"[Batch] Execution failed: {e}")
-        return None
-
-
 def run_postprocessing(
         dataset: Dataset,
         cfg: Config,
@@ -259,18 +171,17 @@ def run_postprocessing(
         skip_global: bool | None = None
 ) -> None:
     log_path = cfg.log
-    error_warnings: List[str] = cfg.error_warnings
 
     do_global = not (skip_global if skip_global is not None else cfg.no_global_postprocessing)
     do_bp = not (skip_bp if skip_bp is not None else cfg.no_bp_postprocessing)
 
     if cfg.tx2gene is None:
-        log_err(error_warnings, log_path, "[post-processing] tx2gene not provided; skipping.")
+        print("[post-processing] tx2gene not provided; skipping.")
         return
 
     script_path = Path(r_script) if r_script is not None else R_SCRIPT_PATH
     if not script_path.exists():
-        log_err(error_warnings, log_path, f"[post-processing] R script not found at {script_path}.")
+        print(f"[post-processing] R script not found at {script_path}.")
         return
 
     # ------------------------------------------------------------------
@@ -284,7 +195,7 @@ def run_postprocessing(
             r_mode = getattr(dataset, "mode", None)
             base_args = _build_r_args_global(cfg, out_dir, mode=r_mode)
         except Exception as e:
-            log_err(error_warnings, log_path, f"[post-processing] Failed to build command: {e}")
+            print(f"[post-processing] Failed to build command: {e}")
             return
 
         base_args[1] = str(script_path)
@@ -305,11 +216,10 @@ def run_postprocessing(
                     fh.flush()
                     res = subprocess.run(base_args, stdout=fh, stderr=fh, text=True, check=False)
                 if res.returncode != 0:
-                    log_err(error_warnings, log_path,
-                            f"[post-processing] Global Compute failed (code {res.returncode})")
+                    print(f"[post-processing] Global Compute failed (code {res.returncode})")
                     active_plots = []
             except Exception as e:
-                log_err(error_warnings, log_path, f"[post-processing] Compute execution failed: {e}")
+                print(f"[post-processing] Compute execution failed: {e}")
                 active_plots = []
         else:
             log("[post-processing] Phase 1: Skipped (Fast Mode).", log_path)
@@ -317,8 +227,7 @@ def run_postprocessing(
         # --- PHASE 2: PLOTTING ---
         if active_plots:
             SAFE_PLOT_WORKERS = 2
-            log(f"[post-processing] Phase 2: Generating {len(active_plots)} plot types (Concurrency: {SAFE_PLOT_WORKERS})...",
-                log_path)
+            log(f"[post-processing] Phase 2: Generating {len(active_plots)} plot types (Concurrency: {SAFE_PLOT_WORKERS})...", log_path)
 
             plot_base_args = [a for a in base_args if a not in ("--force-txi", "--dispersion")]
             plot_base_args.append("--plots-only")
@@ -342,10 +251,9 @@ def run_postprocessing(
                     try:
                         res = future.result()
                         if res.returncode != 0:
-                            log_err(error_warnings, log_path,
-                                    f"[post-processing] Plot {p_flag} failed (code {res.returncode})")
+                            print(f"[post-processing] Plot {p_flag} failed (code {res.returncode})")
                     except Exception as e:
-                        log_err(error_warnings, log_path, f"[post-processing] Plot {p_flag} execution error: {e}")
+                        print(f"[post-processing] Plot {p_flag} execution error: {e}")
 
             log("[post-processing] Global plotting finished.", log_path)
     else:
@@ -362,8 +270,7 @@ def run_postprocessing(
         return
 
     max_workers_bp = max(1, int(getattr(cfg, "max_threads", 4)))
-    log(f"[post-processing] Starting analysis for {len(dataset.bioprojects)} BioProjects (Concurrency: {max_workers_bp})...",
-        log_path)
+    log(f"[post-processing] Starting analysis for {len(dataset.bioprojects)} BioProjects (Concurrency: {max_workers_bp})...", log_path)
 
     with ThreadPoolExecutor(max_workers=max_workers_bp) as executor:
         future_to_bp = {}

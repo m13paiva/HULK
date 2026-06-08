@@ -1,6 +1,24 @@
 # **HULK** Changelog
 ---
 
+## [2.0.0]
+This release marks a major architectural expansion, shifting the pipeline's capabilities beyond standard quantification and into gene co-expression network (GCN) inference and evaluation. 
+
+### Added
+- **Seidr Network Inference (`hulk seidr`)**: 
+  - Integrated Seidr to build gene co-expression networks directly from DESeq2 VST outputs.
+  - Added the `hulk seidr` subcommand to configure default algorithms (e.g., PEARSON, SPEARMAN, PCOR, MI, CLR, ARACNE, GENIE3), backbone significance thresholds, and algorithm execution concurrency.
+  - The main pipeline now automatically attempts to run `run_seidr_single` after standard post-processing.
+- **EGAD Network Evaluation (`hulk evaluate`)**: 
+  - Added a new command and vocal R-wrapper to assess the biological validity of consensus networks.
+  - Computes Micro- and Macro-averaged AUROC and AUPR metrics using MapMan or BioMart GO annotations.
+  - Automatically generates detailed precision-recall, ROC curves, and boxplot distribution comparisons.
+- **Data Saturation Analysis (`hulk saturation`)**: 
+  - Added a command to assess network reconstruction quality across iterative subsamples of BioProjects.
+  - Automates batch generation, Seidr inference, and EGAD evaluation across stepped intervals to generate data saturation curves.
+- **Cleanup Flag (`--rem-missing-bps`)**: 
+  - Added a strict cleanup utility for SRA mode. When enabled, the pipeline scans the output directory and deletes any BioProject folders that are no longer present in the input RunInfo table.
+
 ## [1.3.0] - 2025-12-17
 This release focuses on stability at scale and fixing critical logic errors that affected large datasets and specific SRA formats. It also introduces parallelized plotting and targeted gene analysis.
 
@@ -120,9 +138,10 @@ In this patched version, `_detect_fastq_layout_` now recognizes a single FASTQ f
 - Initial public release of **HULK**.
 
 ---
-
+[2.0.0]: https://github.com/m13paiva/hulk/releases/tag/v2.0.0
 [1.3.0]: https://github.com/m13paiva/hulk/releases/tag/v1.3.0
 [1.2.0]: https://github.com/m13paiva/hulk/releases/tag/v1.2.0
 [1.1.1]: https://github.com/m13paiva/hulk/releases/tag/v1.1.1
 [1.1.0]: https://github.com/m13paiva/hulk/releases/tag/v1.1.0
 [1.0.0]: https://github.com/m13paiva/hulk/releases/tag/v1.0.0
+
