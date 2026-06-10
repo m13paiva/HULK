@@ -233,8 +233,7 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
     context_settings={"help_option_names": ["-h", "--help"], "max_content_width": WIDE_HELP},
 )
 @click.version_option(__version__, "-V", "--version", prog_name="hulk")
-@click.option("--smash", is_flag=True, hidden=True, is_eager=True, expose_value=False,
-              callback=lambda ctx, p, v: (smash(), ctx.exit()) if v and not ctx.resilient_parsing else None)
+
 @click.option(
     "-i",
     "--input",
@@ -268,7 +267,7 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
 @click.option("-n", "--dry-run", is_flag=True, help="Validate and plan without running.")
 @click.option("-g", "--gene-counts", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="tx2gene map for gene-level counts.")
-# --- NEW FLAGS ---
+
 @click.option("--no-bp-postprocessing", is_flag=True, help="Skip per-BioProject post-processing.")
 @click.option("--no-global-postprocessing", is_flag=True, help="Skip global (all samples) post-processing.")
 @click.option("--no-cache", is_flag=True, help="Disable SRA cache.")
@@ -281,6 +280,7 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
     default=None,
     help="Sequencing technology (Required for FASTQ mode).",
 )
+
 @click.option(
     "--target-genes",
     "target_genes_files",
@@ -340,7 +340,10 @@ def cli(
         no_global_postprocessing=no_global_postprocessing,
     )
 
-
+@cli.command("smash", hidden=True)
+def smash_cmd():
+    """Execute the smash function."""
+    smash()
 # ---------------------------- Summary printing ----------------------------
 def _print_trailing_newlines(n_bioprojects: int | None = 0) -> None:
     try:

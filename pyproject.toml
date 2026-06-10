@@ -15,14 +15,12 @@ dependencies = [
   "click>=8.1"
 ]
 
-# Entry point: installs the `hulk` command that calls app/cli.py:main
 [project.scripts]
 hulk = "app.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "."}
 
-# Ship the `app` package (which contains cli.py, core.py, utils.py, etc.)
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["app*"]
