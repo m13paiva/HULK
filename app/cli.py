@@ -342,7 +342,7 @@ def cli(
 
 @cli.command("smash", hidden=True)
 def smash_cmd():
-    """Execute the smash function."""
+    """Execute the smash function easter-egg."""
     smash()
 # ---------------------------- Summary printing ----------------------------
 def _print_trailing_newlines(n_bioprojects: int | None = 0) -> None:

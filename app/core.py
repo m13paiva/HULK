@@ -10,7 +10,7 @@ from .qc import run_multiqc_global
 from .entities import Config, Dataset
 from .orchestrator import run_download_and_process
 from .post_processing import run_postprocessing as run__postprocessing
-from .seidr import run_seidr_single
+from .seidr import run_seidr
 
 def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
     """
@@ -149,9 +149,9 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         run__postprocessing(data, cfg, skip_bp=True)
 
     try:
-        run_seidr_single(cfg)
+        run_seidr(cfg)
     except Exception as e:
-        print(f"[Seidr] Single Network pipeline failed: {e}")
+        print(f"[Seidr] Network pipeline failed: {e}")
 
     log("Pipeline finished.", log_path)
 

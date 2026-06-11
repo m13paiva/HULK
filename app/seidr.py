@@ -361,7 +361,7 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
         pass
 
 
-def run_seidr_single(cfg: Config, force: bool = False) -> None:
+def run_seidr(cfg: Config, force: bool = False) -> None:
     """
     Subroutine managing execution logic boundaries extracting environment variables natively.
     """
