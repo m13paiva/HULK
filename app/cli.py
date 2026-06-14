@@ -260,12 +260,12 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
     help="Output directory.",
 )
 @click.option("--min-threads", type=int, default=DEFAULT_MIN_THREADS, show_default=True, help="Threads per SRR.")
-@click.option("-t", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True, help="Total threads.")
+@click.option("-p", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True, help="Total threads.")
 @click.option("--verbosity/--no-verbosity", default=True, show_default=True, help="Live progress.")
 @click.option("-y", "--yes", is_flag=True, help="Skip prompts.")
 @click.option("-f", "--force", is_flag=True, help="Force re-run (overwrite processed data).")
 @click.option("-n", "--dry-run", is_flag=True, help="Validate and plan without running.")
-@click.option("-g,--gene-counts", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+@click.option("-t,--tx2gene", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="tx2gene map for gene-level counts.")
 @click.option("--no-bp-postprocessing", is_flag=True, help="Skip per-BioProject post-processing.")
 @click.option("--no-global-postprocessing", is_flag=True, help="Skip global (all samples) post-processing.")
@@ -294,7 +294,7 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
 )
 @click.option("-m", "--mapman", "mapman_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="MapMan annotation file for EGAD (Triggers evaluation).")
-@click.option("--go-file", "go_file_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+@click.option("-g","--go-file", "go_file_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="BioMart GO export file (TSV) for EGAD (Triggers evaluation).")
 @click.option("--metrics", type=click.Choice(['auroc', 'aupr', 'both'], case_sensitive=False),
               default='both', show_default=True, help="Which EGAD metrics to calculate.")

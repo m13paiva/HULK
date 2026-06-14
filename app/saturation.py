@@ -24,6 +24,7 @@ class BatchOrchestrator:
     Manages the overall execution state processing saturation loops and mapping batch subset intervals
     to dynamically evaluate network prediction performance bounds.
     """
+
     def __init__(self, dataset: "Dataset", config: "Config",
                  seed: Optional[int] = None,
                  workers: int = 4,
@@ -33,9 +34,7 @@ class BatchOrchestrator:
                  force: bool = False,
                  num_steps: int = 10,
                  metrics: str = "both"):
-        """
-        Initializes the dynamic evaluator resolving limits based on system capacities and configured scopes.
-        """
+
         self.dataset = dataset
         self.config = config
         self.seed = seed
@@ -67,7 +66,6 @@ class BatchOrchestrator:
         self.master_df = None
 
     def _get_master_df(self) -> pd.DataFrame:
-        """Retrieves and caches the master variance-stabilized data transformation output globally mapping samples."""
         if self.master_df is not None: return self.master_df
         try:
             df = pd.read_csv(self.vst_path, sep="\t", index_col=0, engine="pyarrow")
@@ -79,7 +77,6 @@ class BatchOrchestrator:
             return df
 
     def _write_seidr_files(self, df: pd.DataFrame, out_dir: Path):
-        """Builds temporary subset files specifically formatting raw values to align against native Seidr expectations."""
         df = df.fillna(0)
         g_file, e_file = out_dir / "genes.txt", out_dir / "expression.tsv"
         with open(g_file, "w") as f:
@@ -88,7 +85,6 @@ class BatchOrchestrator:
         return g_file, e_file
 
     def _count_samples_from_file(self, expr_file: Path) -> int:
-        """Determines the number of active observation metrics based exclusively on internal file lines."""
         if not expr_file.exists(): return 0
         try:
             with open(expr_file, 'rb') as f:
@@ -97,7 +93,6 @@ class BatchOrchestrator:
             return 0
 
     def _calculate_steps(self, total_bps: int) -> List[int]:
-        """Calculates discrete sub-grouping boundaries maximizing interval distribution ranges cleanly."""
         if total_bps <= self.num_steps: return list(range(1, total_bps + 1))
         base = total_bps // self.num_steps
         remainder = total_bps % self.num_steps
@@ -110,7 +105,6 @@ class BatchOrchestrator:
         return sorted(list(set(steps)))
 
     def _create_1x2_saturation_plot(self, source_data_list, samp_df, show_samples, title_prefix, out_file):
-        """Generates dynamic dual-axis charting tracking algorithmic subset expansion results."""
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
         ax1_twin = ax1.twinx() if show_samples else None
         ax2_twin = ax2.twinx() if show_samples else None
@@ -182,7 +176,6 @@ class BatchOrchestrator:
         plt.close(fig)
 
     def _generate_plots(self, results: List[dict]):
-        """Isolates the external plotting components linking output maps across final results definitions."""
         if not results:
             print("[Saturation] No results to plot.")
             return
@@ -236,7 +229,6 @@ class BatchOrchestrator:
             print(f"[Plot Error] {e}")
 
     def regenerate_plots_from_raw(self):
-        """Forces an isolated plot build cycle parsing available raw metrics dynamically bypassing execution phases."""
         raw_file = self.base_outdir / "saturation_results_raw.tsv"
         if not raw_file.exists():
             print(f"[Error] Cannot plot. Missing {raw_file}.")
@@ -249,10 +241,6 @@ class BatchOrchestrator:
             print(f"[Error] Failed to read {raw_file}: {e}")
 
     def run(self):
-        """
-        Coordinates full saturation tracking pipelines, linking internal definitions cleanly between
-        generation constraints and algorithmic evaluation blocks.
-        """
         state_file = self.base_outdir / "run_state.json"
 
         current_state = {
@@ -350,6 +338,8 @@ class BatchOrchestrator:
         global_genes, global_expr = self.deseq2_dir / "genes.txt", self.deseq2_dir / "expression.tsv"
         matrix = self._get_master_df()
 
+        step_pools = {n_bps: list(bp_meta) for n_bps in bp_steps}
+
         print(f"\n[Phase 1] Checking/Generating Batches...")
         with tqdm(total=len(work_definitions), desc="Batch Gen", unit="batch") as pbar:
             for n_bps, iter_num, s_name in work_definitions:
@@ -367,12 +357,21 @@ class BatchOrchestrator:
 
                 if not (iter_dir / ".batch.done").exists():
                     if n_bps < total_bps:
+
+                        if len(step_pools[n_bps]) < n_bps:
+                            step_pools[n_bps] = list(bp_meta)
+
                         target_samples = n_bps * avg_samples_per_bp
-                        current_selection = random.sample(bp_meta, n_bps)
+                        current_selection = random.sample(step_pools[n_bps], n_bps)
+
+                        step_pools[n_bps] = [x for x in step_pools[n_bps] if x not in current_selection]
+
                         current_n = sum(x['size'] for x in current_selection)
                         current_diff = abs(current_n - target_samples)
-                        remaining_pool = [x for x in bp_meta if x not in current_selection]
+
+                        remaining_pool = list(step_pools[n_bps])
                         improved, max_swaps, swaps = True, 50, 0
+
                         while improved and swaps < max_swaps:
                             improved = False
                             for i in range(len(current_selection)):
@@ -386,6 +385,8 @@ class BatchOrchestrator:
                                         improved, swaps = True, swaps + 1
                                         break
                                 if improved: break
+
+                        step_pools[n_bps] = list(remaining_pool)
 
                         selected_samples = []
                         for item in current_selection: selected_samples.extend(item['ids'])
@@ -457,9 +458,8 @@ class BatchOrchestrator:
                         f_map = {
                             executor.submit(
                                 run_egad_task, network_file=i["net"], mapman_file=self.mapman_file,
-                                go_file=self.go_file,
-                                out_file=i["out"], script_path=r_script, log_path=i["dir"] / "egad.log",
-                                curves_prefix=None,
+                                go_file=self.go_file, out_file=i["out"], script_path=r_script,
+                                log_path=i["dir"] / "egad.log", curves_prefix=None,
                                 do_auroc=self.do_auroc, do_aupr=self.do_aupr
                             ): i for i in egad_tasks
                         }
@@ -474,10 +474,10 @@ class BatchOrchestrator:
                                         'n_bps': it['n_bps'], 'iter': it['iter'],
                                         'n_samples': self._count_samples_from_file(it["expr"]), 'source': src
                                     }
-                                    if self.do_auroc and mets.get('macro_auc') is not None:
-                                        res_dict['auc'] = mets['macro_auc']
-                                    if self.do_aupr and mets.get('macro_aupr') is not None:
-                                        res_dict['aupr'] = mets['macro_aupr']
+                                    if self.do_auroc and mets.get('macro_auc') is not None: res_dict['auc'] = mets[
+                                        'macro_auc']
+                                    if self.do_aupr and mets.get('macro_aupr') is not None: res_dict['aupr'] = mets[
+                                        'macro_aupr']
                                     final_results.append(res_dict)
                             p_egad.update(1)
 
