@@ -229,6 +229,54 @@ def create_macro_boxplots(df, out_file, colors_dict):
     fig.savefig(out_file)
     plt.close(fig)
 
+def create_macro_violinplots(df, out_file, colors_dict):
+    """
+    Renders violin plot layouts mapping term distribution profiles based on macro values.
+    """
+    if df is None or df.empty: return
+    sources = [s for s in ["GO", "MapMan"] if s in df["Annotation_Source"].unique()]
+    if not sources: return
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    auc_data = [df[(df["Annotation_Source"] == s) & (df["AUC"].notnull())]["AUC"].values for s in sources]
+    aupr_data = [df[(df["Annotation_Source"] == s) & (df["AUPR"].notnull())]["AUPR"].values for s in sources]
+
+    # Matplotlib's violinplot crashes if fed empty arrays, so we must filter them
+    valid_auc_data = [d for d in auc_data if len(d) > 0]
+    valid_auc_sources = [s for s, d in zip(sources, auc_data) if len(d) > 0]
+
+    if valid_auc_data:
+        vplot1 = ax1.violinplot(valid_auc_data, showmeans=True, showmedians=False)
+        ax1.set_xticks(np.arange(1, len(valid_auc_sources) + 1))
+        ax1.set_xticklabels(valid_auc_sources)
+        for pc, src in zip(vplot1['bodies'], valid_auc_sources):
+            pc.set_facecolor(colors_dict.get(src, "grey"))
+            pc.set_alpha(0.8)
+            pc.set_edgecolor('black')
+        ax1.set_title("Macro-Average Distribution (AUROC)")
+        ax1.set_ylabel("Term AUROC")
+        ax1.grid(True, linestyle='--', alpha=0.6)
+
+    valid_aupr_data = [d for d in aupr_data if len(d) > 0]
+    valid_aupr_sources = [s for s, d in zip(sources, aupr_data) if len(d) > 0]
+
+    if valid_aupr_data:
+        vplot2 = ax2.violinplot(valid_aupr_data, showmeans=True, showmedians=False)
+        ax2.set_xticks(np.arange(1, len(valid_aupr_sources) + 1))
+        ax2.set_xticklabels(valid_aupr_sources)
+        for pc, src in zip(vplot2['bodies'], valid_aupr_sources):
+            pc.set_facecolor(colors_dict.get(src, "grey"))
+            pc.set_alpha(0.8)
+            pc.set_edgecolor('black')
+        ax2.set_title("Macro-Average Distribution (AUPR)")
+        ax2.set_ylabel("Term AUPR")
+        ax2.grid(True, linestyle='--', alpha=0.6)
+
+    fig.tight_layout()
+    fig.savefig(out_file)
+    plt.close(fig)
+
 
 def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_file_path: Optional[Path] = None,
                          metrics: str = "both", custom_network: Optional[Path] = None):
@@ -375,6 +423,7 @@ def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_f
                 plt.close(fig_bar)
 
                 create_macro_boxplots(full_df, egad_dir / "macro_boxplot_comparison.pdf", colors)
+                create_macro_violinplots(full_df, egad_dir / "macro_violin_comparison.pdf", colors)
 
             click.secho(f"[Plots] Saved strictly formatted PDF array to {egad_dir}", fg="blue")
 
