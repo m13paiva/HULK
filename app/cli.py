@@ -1156,11 +1156,6 @@ def evaluate(output_dir, mapman_path, go_file_path, metrics, custom_network):
         click.secho("[Error] Indecision is fatal. You must provide either --mapman or --go-file.", fg="red")
         return
 
-    if mapman_path and go_file_path:
-        click.secho(
-            "[Warning] Both MapMan and GO provided. The underlying R script will halt until dual-run logic is finalized.",
-            fg="yellow")
-
     try:
         cfg = Config(outdir=output_dir, plots_only_mode=True, mapman_file=mapman_path, go_file=go_file_path)
 

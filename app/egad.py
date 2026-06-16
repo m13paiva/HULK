@@ -96,11 +96,14 @@ def run_egad_task(
                     valid_group = group[group["Term"] != "None"]
                     if valid_group.empty: continue
                     results[source] = {
+                        "n_terms": len(valid_group),
                         "macro_auc": valid_group["AUC"].mean() if "AUC" in valid_group.columns else None,
                         "macro_aupr": valid_group["AUPR"].mean() if "AUPR" in valid_group.columns else None
                     }
             else:
+                valid_legacy = df[df["Term"] != "None"]
                 results["Legacy"] = {
+                    "n_terms": len(valid_legacy),
                     "macro_auc": df["AUC"].mean() if "AUC" in df.columns else None,
                     "macro_aupr": df["AUPR"].mean() if "AUPR" in df.columns else None
                 }
@@ -167,7 +170,7 @@ def create_1x2_plot(source_data_list, show_baseline, title_prefix, out_file):
                      label=f"{src} Micro (AUPR: {micro_aupr:.4f})")
 
     if roc_plotted:
-        ax1.set_title(f"{title_prefix} Micro-Averaged ROC")
+        ax1.set_title(f"Micro-Averaged ROC")
         ax1.set_xlabel("False Positive Rate")
         ax1.set_ylabel("True Positive Rate")
         ax1.legend(loc="lower right", fontsize='small')
@@ -176,7 +179,7 @@ def create_1x2_plot(source_data_list, show_baseline, title_prefix, out_file):
         ax1.text(0.5, 0.5, "ROC Data Unavailable", ha='center', va='center')
 
     if prc_plotted:
-        ax2.set_title(f"{title_prefix} Micro-Averaged PR")
+        ax2.set_title(f"Micro-Averaged PR")
         ax2.set_xlabel("Recall")
         ax2.set_ylabel("Precision")
         ax2.legend(loc="upper right", fontsize='small')
@@ -256,6 +259,7 @@ def create_macro_violinplots(df, out_file, colors_dict):
             pc.set_edgecolor('black')
         ax1.set_title("Macro-Average Distribution (AUROC)")
         ax1.set_ylabel("Term AUROC")
+        ax1.set_yticks(np.arange(0.0, 1.1, 0.1))
         ax1.grid(True, linestyle='--', alpha=0.6)
 
     valid_aupr_data = [d for d in aupr_data if len(d) > 0]
@@ -271,6 +275,7 @@ def create_macro_violinplots(df, out_file, colors_dict):
             pc.set_edgecolor('black')
         ax2.set_title("Macro-Average Distribution (AUPR)")
         ax2.set_ylabel("Term AUPR")
+        ax2.set_yticks(np.arange(0.0, 1.1, 0.1))
         ax2.grid(True, linestyle='--', alpha=0.6)
 
     fig.tight_layout()
@@ -343,8 +348,13 @@ def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_f
 
         for src, mets in results.items():
             res_str = []
-            if do_auroc and mets["macro_auc"] is not None: res_str.append(f"Macro AUROC: {mets['macro_auc']:.4f}")
-            if do_aupr and mets["macro_aupr"] is not None: res_str.append(f"Macro AUPR: {mets['macro_aupr']:.4f}")
+            if "n_terms" in mets:
+                res_str.append(f"Terms Evaluated: {mets['n_terms']}")
+            if do_auroc and mets.get("macro_auc") is not None:
+                res_str.append(f"Macro AUROC: {mets['macro_auc']:.4f}")
+            if do_aupr and mets.get("macro_aupr") is not None:
+                res_str.append(f"Macro AUPR: {mets['macro_aupr']:.4f}")
+
             click.secho(f"[Results - {src}] {' | '.join(res_str)}", fg="green")
 
             roc_file = Path(f"{curves_prefix}_{src}_roc.tsv")
@@ -377,9 +387,9 @@ def run_vocal_evaluation(cfg: "Config", mapman_path: Optional[Path] = None, go_f
 
             # Generate cross-comparison aggregates if viable
             if len(source_data_list) > 1:
-                create_1x2_plot(source_data_list, show_baseline=False, title_prefix="Combined",
+                create_1x2_plot(source_data_list, show_baseline=False,title_prefix="",
                                 out_file=egad_dir / "combined_no_baseline.pdf")
-                create_1x2_plot(source_data_list, show_baseline=True, title_prefix="Combined",
+                create_1x2_plot(source_data_list, show_baseline=True,title_prefix="",
                                 out_file=egad_dir / "combined_with_baseline.pdf")
 
                 fig_bar, ax_bar = plt.subplots(figsize=(8, 6))
