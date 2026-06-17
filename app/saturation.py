@@ -139,7 +139,7 @@ class BatchOrchestrator:
                               ecolor=color_samp, capsize=3, alpha=0.5)
             lines_ax1.extend(ls1)
             labels_ax1.append("Samples")
-            ax1_twin.set_ylabel('Total Samples', color=color_samp)
+            ax1_twin.set_ylabel('Number of Samples', color=color_samp)
             ax1_twin.tick_params(axis='y', labelcolor=color_samp)
 
             ls2 = ax2_twin.plot(samp_df["n_bps"], samp_df["n_samples_mean"], color=color_samp, linewidth=2,
@@ -148,13 +148,13 @@ class BatchOrchestrator:
                               ecolor=color_samp, capsize=3, alpha=0.5)
             lines_ax2.extend(ls2)
             labels_ax2.append("Samples")
-            ax2_twin.set_ylabel('Total Samples', color=color_samp)
+            ax2_twin.set_ylabel('Number of Samples', color=color_samp)
             ax2_twin.tick_params(axis='y', labelcolor=color_samp)
 
         if roc_plotted:
-            ax1.set_title(f"{title_prefix} Saturation (AUROC)")
+            ax1.set_title(f"AUROC Saturation")
             ax1.set_xlabel("Number of BioProjects")
-            ax1.set_ylabel("Mean AUROC")
+            ax1.set_ylabel("Macro-averaged AUROC")
             ax1.legend(lines_ax1, labels_ax1, loc="best", fontsize='small')
             ax1.grid(True, linestyle='--', alpha=0.6)
         else:
@@ -162,9 +162,9 @@ class BatchOrchestrator:
             if show_samples: ax1_twin.set_yticks([])
 
         if prc_plotted:
-            ax2.set_title(f"{title_prefix} Saturation (AUPR)")
+            ax2.set_title(f"AUPR Saturation")
             ax2.set_xlabel("Number of BioProjects")
-            ax2.set_ylabel("Mean AUPR")
+            ax2.set_ylabel("Macro-averaged AUPR")
             ax2.legend(lines_ax2, labels_ax2, loc="best", fontsize='small')
             ax2.grid(True, linestyle='--', alpha=0.6)
         else:
@@ -219,9 +219,9 @@ class BatchOrchestrator:
                                                  self.base_outdir / f"{src}_with_samples.pdf")
 
             if len(source_data_list) > 1:
-                self._create_1x2_saturation_plot(source_data_list, samp_agg, False, "Combined",
+                self._create_1x2_saturation_plot(source_data_list, samp_agg, False, "",
                                                  self.base_outdir / "combined_no_samples.pdf")
-                self._create_1x2_saturation_plot(source_data_list, samp_agg, True, "Combined",
+                self._create_1x2_saturation_plot(source_data_list, samp_agg, True, "",
                                                  self.base_outdir / "combined_with_samples.pdf")
 
             print(f"\n[Saturation] Plots updated in {self.base_outdir}")

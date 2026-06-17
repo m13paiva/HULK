@@ -215,7 +215,7 @@ def create_macro_boxplots(df, out_file, colors_dict):
         for patch, src in zip(bplot1['boxes'], sources):
             patch.set_facecolor(colors_dict.get(src, "grey"))
             patch.set_alpha(0.8)
-        ax1.set_title("Macro-Average Distribution (AUROC)")
+        ax1.set_title("Macro-Averaged AUROC Distribution")
         ax1.set_ylabel("Term AUROC")
         ax1.grid(True, linestyle='--', alpha=0.6)
 
@@ -224,7 +224,7 @@ def create_macro_boxplots(df, out_file, colors_dict):
         for patch, src in zip(bplot2['boxes'], sources):
             patch.set_facecolor(colors_dict.get(src, "grey"))
             patch.set_alpha(0.8)
-        ax2.set_title("Macro-Average Distribution (AUPR)")
+        ax2.set_title("Macro-Averaged AUPR Distribution")
         ax2.set_ylabel("Term AUPR")
         ax2.grid(True, linestyle='--', alpha=0.6)
 
@@ -257,7 +257,7 @@ def create_macro_violinplots(df, out_file, colors_dict):
             pc.set_facecolor(colors_dict.get(src, "grey"))
             pc.set_alpha(0.8)
             pc.set_edgecolor('black')
-        ax1.set_title("Macro-Average Distribution (AUROC)")
+        ax1.set_title("Macro-Averaged AUROC Distribution")
         ax1.set_ylabel("Term AUROC")
         ax1.set_yticks(np.arange(0.0, 1.1, 0.1))
         ax1.grid(True, linestyle='--', alpha=0.6)
@@ -273,7 +273,7 @@ def create_macro_violinplots(df, out_file, colors_dict):
             pc.set_facecolor(colors_dict.get(src, "grey"))
             pc.set_alpha(0.8)
             pc.set_edgecolor('black')
-        ax2.set_title("Macro-Average Distribution (AUPR)")
+        ax2.set_title("Macro-Averaged AUPR Distribution")
         ax2.set_ylabel("Term AUPR")
         ax2.set_yticks(np.arange(0.0, 1.1, 0.1))
         ax2.grid(True, linestyle='--', alpha=0.6)

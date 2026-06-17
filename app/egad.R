@@ -116,6 +116,9 @@ if (use_mapman) {
 
   annot_matrix_long <- final_annot_dt[, .(IDENTIFIER, NAME)]
   setnames(annot_matrix_long, c("IDENTIFIER", "TERM"))
+
+  # Deduplicate before assigning the binary flag
+  annot_matrix_long <- unique(annot_matrix_long)
   annot_matrix_long[, val := 1]
 
   annotations_list[["MapMan"]] <- Matrix::sparseMatrix(
@@ -182,8 +185,9 @@ for (anno_source in names(annotations_list)) {
 
   net_final_sparse <- net_sparse_init[common_genes, common_genes]
   annot_final_sparse <- annot_sparse_init[common_genes, ]
-
-  valid_terms <- colSums(annot_final_sparse) >= opt$min_genes
+  
+  #avoid too big terms (at least 5 negatives so AUC values dont exceed upper theoritcal bound)
+  valid_terms <- colSums(annot_final_sparse) >= opt$min_genes & colSums(annot_final_sparse) <= (nrow(annot_final_sparse) - 5)
   if (sum(valid_terms) < 2) next
 
   annot_final_sparse <- annot_final_sparse[, valid_terms, drop = FALSE]
