@@ -1,16 +1,19 @@
+# orchestrator.py
+
 from __future__ import annotations
 
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 from threading import Thread
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Dict, Any, Tuple
 
 from tqdm.auto import tqdm
 
-from .utils import log, log_err, pad_desc
+from .utils import log, pad_desc
 from .prefetcher import prefetch
 from .processor import process
 from .cache_manager import CacheGate
@@ -20,20 +23,28 @@ from .post_processing import run_postprocessing_bp
 
 def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
     """
-    Per-BioProject post-processing logic.
+    Executes specific post-processing validation logic isolating metrics calculations locally
+    per independent subset. Resolves dependency blocks.
+
+    Args:
+        bp (BioProject): State representation tracking a subset container.
+        cfg (Config): Running profile logic.
     """
     log_path = cfg.log
-    errors = cfg.error_warnings
 
-    # 1. MultiQC
+    if cfg.no_bp_postprocessing:
+        log(f"[{bp.id}] Skipping BioProject post-processing (MultiQC, R, Metrics) due to flag.", log_path)
+        return
+
+    # 1. MultiQC Initialization
     try:
         mqc_data = run_multiqc(bp, cfg, modules=("kallisto", "fastp"))
         if mqc_data is None:
             log(f"[{bp.id}] MultiQC returned no output", log_path)
     except Exception as e:
-        log_err(errors, log_path, f"[{bp.id}] MultiQC failed: {e}")
+        print(f"[{bp.id}] MultiQC failed: {e}")
 
-    # 2. R-based Post-processing
+    # 2. R-Script Matrix Calculation and Resolution Processing
     try:
         if getattr(cfg, "tx2gene", None) is not None:
             counts_path = run_postprocessing_bp(bp, cfg)
@@ -44,30 +55,52 @@ def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
         else:
             log(f"[{bp.id}] No tx2gene provided; skipping R steps.", log_path)
     except Exception as e:
-        log_err(errors, log_path, f"[{bp.id}] R-based BP post-processing failed: {e}")
+        print(f"[{bp.id}] R-based BP post-processing failed: {e}")
 
-    # 3. Read Metrics
+    # 3. Read Depth/Metric Calculation Module
     try:
         build_bp_metrics(bp, cfg, out_tsv=bp.path / "read_metrics.tsv")
         log(f"[{bp.id}] Read metrics table written.", log_path)
     except Exception as e:
-        log_err(errors, log_path, f"[{bp.id}] Failed to build read metrics: {e}")
+        print(f"[{bp.id}] Failed to build read metrics: {e}")
+
+    # Explicit marker creation guaranteeing persistence across interrupted runs
+    try:
+        marker = bp.path / ".postprocessing_done"
+        marker.touch()
+    except Exception as e:
+        print(f"[{bp.id}] Failed to create completion marker: {e}")
 
     log(f"[{bp.id}] === BioProject post-processing complete ===", log_path)
 
-def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: float = 0.5):
-    """Create one tqdm bar per BioProject and return a monitor thread."""
+
+def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: float = 0.5):
+    """
+    Allocates thread logic controlling CLI terminal bar outputs syncing standard events.
+
+    Args:
+        dataset (Dataset): Target group logic array.
+        cfg (Config): Execution context maps.
+        start_position (int): Tqdm offset rendering positioning relative to screen origins.
+        poll_secs (float): Time threshold validating check delays against CPU burn loops.
+
+    Returns:
+        tuple: (bp_bars, thread reference).
+    """
+    bioprojects = dataset.bioprojects
     bp_bars = {}
     last_done = {}
     pos = start_position
 
     terminal = {"done", "failed", "skipped"}
+    closed_bars = set()
 
-    # -------------------------------
-    # Create bars with initial offset
-    # -------------------------------
+    # Create bars with initial offset mapping resolving previously completed jobs
     for bp in bioprojects:
         total = len(bp.samples)
+        if total == 0:
+            closed_bars.add(bp.id)
+            continue
 
         bar = tqdm(
             total=total,
@@ -78,7 +111,6 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
             mininterval=0,
         )
 
-        # initial offset = already completed samples
         init = sum(
             1 for s in bp.samples
             if getattr(s, "status", None) in terminal
@@ -91,16 +123,19 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
         last_done[bp.id] = init
         pos += 1
 
-    # -------------------------------
-    # Monitor thread to update bars
-    # -------------------------------
     def _monitor():
-        # Track which BPs have already had postprocessing run in THIS pipeline run
+        """Isolates background thread logic probing array resolution dynamically."""
         already_postprocessed = set()
+        force_run = getattr(cfg, "force", False)
 
         while True:
-            all_finished = True
+            if len(closed_bars) == len(bp_bars):
+                break
+
             for bp in bioprojects:
+                if bp.id in closed_bars or bp.id not in bp_bars:
+                    continue
+
                 done_now = sum(
                     1 for s in bp.samples
                     if getattr(s, "status", None) in terminal
@@ -112,48 +147,54 @@ def _start_bp_progress(bioprojects, cfg, *, start_position: int = 2, poll_secs: 
                     bp_bars[bp.id].refresh()
                     last_done[bp.id] = done_now
 
-                # All samples terminal -> run postprocessing ONCE per run
-                if done_now == len(bp.samples) and bp.id not in already_postprocessed:
-                    # optional: keep status for humans
-                    bp.status = "done"
-                    try:
-                        _finalize_bioproject(bp, cfg)
+                if done_now >= len(bp.samples):
+                    if bp.id not in already_postprocessed:
+                        marker = bp.path / ".postprocessing_done"
 
-                    except Exception as e:
-                        log(f"[{bp.id}] Postprocessing failed: {e}", bp.log_path)
-                    finally:
-                        already_postprocessed.add(bp.id)
+                        if marker.exists() and not force_run:
+                            log(f"[{bp.id}] Found .postprocessing_done marker. Skipping BP post-processing.", cfg.log)
+                            bp.status = "done"
+                            already_postprocessed.add(bp.id)
+                        else:
+                            bp.status = "done"
+                            try:
+                                _finalize_bioproject(bp, cfg)
+                            except Exception as e:
+                                if hasattr(bp, 'log_path'):
+                                    log(f"[{bp.id}] Postprocessing failed: {e}", bp.log_path)
+                            finally:
+                                already_postprocessed.add(bp.id)
 
-                if done_now < len(bp.samples):
-                    all_finished = False
-
-            if all_finished:
-                break
+                    bp_bars[bp.id].close()
+                    closed_bars.add(bp.id)
 
             time.sleep(poll_secs)
 
-        # close at end
-        for bar in bp_bars.values():
-            bar.close()
+        for bid, bar in bp_bars.items():
+            if bid not in closed_bars:
+                bar.close()
 
     t = Thread(target=_monitor, daemon=True)
     t.start()
 
-
     return bp_bars, t
 
 
-
 def _cfg(cfg, name, default=None):
+    """Simple wrapper enforcing attribute safe resolution."""
     return getattr(cfg, name, default)
 
 
 def _clamp(v, lo, hi):
+    """Enforces mathematical boundary limits ensuring numbers stay within hard boundaries."""
     return max(lo, min(hi, v))
 
 
 @dataclass
 class ThreadPlan:
+    """
+    Data class structure representing mapped hardware allocation limits.
+    """
     bundle_concurrency: int
     bundle_threads: int
     dump_cap: Optional[int]
@@ -167,6 +208,15 @@ class ThreadPlan:
 
 
 def _plan_threads(cfg) -> ThreadPlan:
+    """
+    Dynamic hardware inspection method converting system potential to threaded sub-allocations.
+
+    Args:
+        cfg (Config): Runtime setup parameters limiting ceiling potential.
+
+    Returns:
+        ThreadPlan: Data object explicitly tracking thread allocation blocks.
+    """
     logical = os.cpu_count() or 8
     reserve_default = _clamp(math.floor(logical * 0.10), 1, min(4, max(1, logical - 1)))
     user_max = _cfg(cfg, "max_threads", _cfg(cfg, "threads", None))
@@ -183,8 +233,8 @@ def _plan_threads(cfg) -> ThreadPlan:
     forced_bt = _cfg(cfg, "bundle_threads", None)
     bt = max(1, int(forced_bt)) if forced_bt is not None else max(1, usable // bundles)
 
-    dump_cap     = _cfg(cfg, "dump_cap", 1)
-    fastp_cap    = _cfg(cfg, "fastp_cap", 8)
+    dump_cap = _cfg(cfg, "dump_cap", 1)
+    fastp_cap = _cfg(cfg, "fastp_cap", 8)
     kallisto_cap = _cfg(cfg, "kallisto_cap", 32)
 
     default_pf = _clamp(max(4, logical // 8), 2, 24)
@@ -203,6 +253,7 @@ def _plan_threads(cfg) -> ThreadPlan:
         usable_threads=usable,
     )
 
+
 def run_download_and_process(
         dataset: "Dataset",
         *,
@@ -213,21 +264,16 @@ def run_download_and_process(
         log_path: Path
 ):
     """
-    Orchestrate the two operational modes:
+    Primary parallel manager. Controls external fetching against physical processing pipelines.
 
-      CACHE MODE:
-        • Prefetch thread runs in parallel
-        • Processing daemon consumes cached .sra files
-
-      NO-CACHE MODE (--no-cache):
-        • No prefetch thread
-        • Processing daemon calls prefetch_one() internally per-SRR
-        • Still parallel across bundles
+    Args:
+        dataset (Dataset): Reference target mapping structure.
+        cfg (Config): Runtime setup constraints.
+        cache_dir (Path): Bounded storage layer resolving prefetch requests.
+        work_root (Path): Output structure location representing root boundaries.
+        temp_dir (Path): Volatile temporary path routing pipeline artifacts.
+        log_path (Path): Log structure location routing thread messages.
     """
-
-    # ----------------------------------------
-    # Decide cache mode using CacheGate
-    # ----------------------------------------
     gate = CacheGate(
         cache_dir,
         cfg.cache_high_gb * (1024 ** 3),
@@ -244,9 +290,6 @@ def run_download_and_process(
         log_path,
     )
 
-    # ----------------------------------------
-    # Thread planning
-    # ----------------------------------------
     plan = _plan_threads(cfg)
     msg_user = "auto" if plan.user_max_threads is None else f"{plan.user_max_threads} (user)"
 
@@ -262,18 +305,11 @@ def run_download_and_process(
         log_path,
     )
 
-    # ----------------------------------------
-    # BioProject progress bars
-    # ----------------------------------------
     if getattr(dataset, "bioprojects", None):
-        _bp_bars, t_bpmon = _start_bp_progress(dataset.bioprojects,cfg, start_position=2, poll_secs=0.5)
+        _bp_bars, t_bpmon = _start_bp_progress(dataset, cfg, start_position=2, poll_secs=0.5)
     else:
         _bp_bars, t_bpmon = {}, None
 
-    # ----------------------------------------
-    # Start PROCESSING daemon
-    # ----------------------------------------
-    # NOTE: processing daemon must receive cache mode
     t_proc = Thread(
         target=process,
         kwargs=dict(
@@ -292,9 +328,6 @@ def run_download_and_process(
     )
     t_proc.start()
 
-    # ----------------------------------------
-    # Start PREFETCH daemon (only in CACHE MODE)
-    # ----------------------------------------
     if cache_enabled and dataset.mode == "SRR":
         t_pref = Thread(
             target=prefetch,
@@ -305,7 +338,7 @@ def run_download_and_process(
                 max_workers=plan.prefetch_workers,
                 cache_high_gb=cfg.cache_high_gb,
                 cache_low_gb=cfg.cache_low_gb,
-                mode="cache",          # <<< NEW
+                mode="cache",
             ),
             daemon=True,
         )
@@ -313,9 +346,6 @@ def run_download_and_process(
     else:
         t_pref = None
 
-    # ----------------------------------------
-    # WAIT
-    # ----------------------------------------
     if t_pref:
         t_pref.join()
 
@@ -325,4 +355,3 @@ def run_download_and_process(
         t_bpmon.join()
 
     log("[orchestrator] all done", log_path)
-

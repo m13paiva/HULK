@@ -6,12 +6,19 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, Optional, List, Tuple
 
+
 _FASTQ_SUFFIXES = (".fastq", ".fq", ".fastq.gz", ".fq.gz", ".trim.fastq")
 
 
 def _is_fastq_path(p: Path) -> bool:
     """
-    Return True if p looks like a FASTQ/FASTQ.GZ file.
+    Evaluates if a given path conforms to known FASTQ or gzipped FASTQ extensions.
+
+    Args:
+        p (Path): The file path to evaluate.
+
+    Returns:
+        bool: True if the file exists and has a recognized extension, False otherwise.
     """
     if not p.is_file():
         return False
@@ -20,15 +27,11 @@ def _is_fastq_path(p: Path) -> bool:
 
 
 # ------------------------------- Config -------------------------------
-import os
-import json
-from pathlib import Path
-from typing import Optional, List, Dict, Any
-
 
 class Config:
     """
-    Central configuration object.
+    Centralized configuration state tracker. Holds parameters merged from
+    CLI inputs and persisted JSON environments.
     """
 
     CFG_ENV = "HULK_CONFIG"
@@ -47,34 +50,46 @@ class Config:
             dry_run: bool = False,
             tx2gene: Optional[Path] = None,
             keep_fastq: bool = False,
-            # NEW: sequencing technology (FASTQ mode)
             seq_tech: Optional[str] = None,
-            # Existing feature / tool config
+
+            # --- New Annotation Options ---
+            mapman_file: Optional[Path] = None,
+            go_file: Optional[Path] = None,
+
+            # Tool config
             trim_window_size: int = 4,
             trim_mean_quality: int = 20,
             align_method: str = "kallisto",
             kallisto_bootstrap: int = 100,
             tximport_mode: str = "raw_counts",
             tximport_ignore_tx_version: bool = False,
-            cache_gb: Optional[int] = None,  # -c/--cache (GiB)
-            no_cache: bool = False,  # --no-cache
+            cache_gb: Optional[int] = None,
+            no_cache: bool = False,
 
-            # NEW: Multiple target files & Rem Missing & DESeq2 sourced from JSON
+            # Analysis flow
             rem_missing_bps: bool = False,
             target_genes_files: Optional[List[Path]] = None,
 
-            # Plotting options (Flags passed from runtime CLI or loaded defaults)
+            # Plotting options
             plot_pca: bool = True,
             plot_heatmap: bool = True,
             plot_var_heatmap: bool = True,
-            plot_sample_cor: bool = True,  # NEW
-            plot_dispersion: bool = True,  # NEW
-            top_n_vars: int = 500,  # NEW
+            plot_sample_cor: bool = True,
+            plot_dispersion: bool = True,
+            top_n_vars: int = 500,
 
             plots_only_mode: bool = False,
             tximport_only_mode: bool = False,
             bioproject_filter: Optional[str] = None,
+
+            # Post-processing flags
+            no_bp_postprocessing: bool = False,
+            no_global_postprocessing: bool = False,
     ):
+        """
+        Initializes the configuration profile based on inputs, subsequently binding
+        directory hierarchies.
+        """
         # --------------------------- Runtime (CLI) ---------------------------
         self.input_path = Path(input_path).expanduser().resolve() if input_path is not None else None
         self.reference_path = Path(reference_path).expanduser().resolve() if reference_path is not None else None
@@ -87,19 +102,23 @@ class Config:
         self.tx2gene = Path(tx2gene).expanduser().resolve() if tx2gene else None
         self.keep_fastq = keep_fastq
         self.error_warnings: List[str] = []
-
-        # The danger flag
         self.rem_missing_bps = rem_missing_bps
-
-        # Sequencing tech (mostly relevant in FASTQ mode; passed from CLI)
         self.seq_tech: Optional[str] = seq_tech
+
+        self.mapman_file = Path(mapman_file).expanduser().resolve() if mapman_file else None
+        self.go_file = Path(go_file).expanduser().resolve() if go_file else None
+
+        # --------------------------- Directory setup ---------------------------
+        self.shared = (self.outdir / "shared").resolve()
+        self.cache = (self.shared / "cache").resolve()
+        self.log = (self.shared / "log.txt").resolve()
 
         # --------------------------- Persistent JSON ---------------------------
         self.cfg_path = self._resolve_cfg_path()
         self.persisted_cfg = self._load_json_cfg(self.cfg_path)
 
-        # --------------------------- Tool options (effective) ------------------
-        # trim
+        # --------------------------- Tool options ---------------------------
+        # Trim
         self.trim_window_size = int(trim_window_size)
         self.trim_mean_quality = int(trim_mean_quality)
         self.trim_opts: Dict[str, Any] = {
@@ -107,11 +126,11 @@ class Config:
             "mean_quality": self.trim_mean_quality,
         }
 
-        # align
+        # Align
         self.align_method = (align_method or "kallisto").lower()
         self.kallisto_bootstrap = int(kallisto_bootstrap)
 
-        # tximport
+        # Tximport
         self.tximport_mode = tximport_mode or "raw_counts"
         self.tximport_ignore_tx_version = bool(tximport_ignore_tx_version)
         self.tximport_opts: Dict[str, Any] = {
@@ -120,13 +139,9 @@ class Config:
         }
 
         # --------------------------- DESeq2 / Expression ---------------------
-        # Now loaded primarily from persisted config, unless overridden
         deseq2_cfg = self.persisted_cfg.get("deseq2", {})
-
         self.deseq2_vst_enabled: bool = bool(deseq2_cfg.get("enabled", True))
         self.deseq2_var_threshold: float = float(deseq2_cfg.get("var_threshold", 0.1))
-
-        # Matrix type is hardcoded to vst for now
         self.expr_use_matrix: str = "vst"
         self.drop_nonvarying_genes: bool = True
 
@@ -134,14 +149,18 @@ class Config:
         self.plot_pca: bool = bool(plot_pca)
         self.plot_heatmap: bool = bool(plot_heatmap)
         self.plot_var_heatmap: bool = bool(plot_var_heatmap)
-        self.plot_sample_cor: bool = bool(plot_sample_cor)  # NEW
-        self.plot_dispersion: bool = bool(plot_dispersion)  # NEW
-        self.top_n_vars: int = int(top_n_vars)  # NEW
+        self.plot_sample_cor: bool = bool(plot_sample_cor)
+        self.plot_dispersion: bool = bool(plot_dispersion)
+        self.top_n_vars: int = int(top_n_vars)
 
         self.plots_only_mode: bool = bool(plots_only_mode)
         self.tximport_only_mode: bool = bool(tximport_only_mode)
 
-        # Handle multiple target files
+        # Post-processing control
+        self.no_bp_postprocessing = no_bp_postprocessing
+        self.no_global_postprocessing = no_global_postprocessing
+
+        # Handle multiple target files (CLI overrides Persisted)
         self.target_genes_files: List[Path] = []
         if target_genes_files:
             for tf in target_genes_files:
@@ -149,44 +168,49 @@ class Config:
 
         self.bioproject_filter = bioproject_filter
 
-        # Bundle for the Seidr subcommand / expression-network step
-        self.expr_network_opts: Dict[str, Any] = {
-            "deseq2_vst_enabled": self.deseq2_vst_enabled,
-            "deseq2_var_threshold": self.deseq2_var_threshold,
-            "use_matrix": self.expr_use_matrix,
-            "drop_nonvarying": self.drop_nonvarying_genes,
-            "pca": self.plot_pca,
-            "heatmap": self.plot_heatmap,
-            "var_heatmap": self.plot_var_heatmap,
-            "sample_cor": self.plot_sample_cor,  # NEW
-            "dispersion": self.plot_dispersion,  # NEW
-            "top_n": self.top_n_vars,  # NEW
-            "plots_only": self.plots_only_mode,
-            "tximport_only": self.tximport_only_mode,
-            "target_genes_files": [str(x) for x in self.target_genes_files],
-            "bioproject": self.bioproject_filter,
-        }
+        # --------------------------- Seidr / Network ---------------------------
+        seidr_cfg = self.persisted_cfg.get("seidr", {})
 
-        # cache
-        self.cache_gb: Optional[int] = cache_gb  # may be None → auto
+        self.seidr_enabled = bool(seidr_cfg.get("enabled", True))
+        self.seidr_preset = seidr_cfg.get("preset", "BALANCED").upper()
+        self.seidr_algos = seidr_cfg.get("algorithms", [])
+        self.seidr_backbone = float(seidr_cfg.get("backbone", 1.28))
+        self.seidr_workers = int(seidr_cfg.get("workers", 2))
+        self.seidr_target_mode = seidr_cfg.get("target_mode", "targeted_only")
+
+        self.seidr_force = bool(seidr_cfg.get("force", False))
+
+        self.seidr_persisted_targets = [Path(t) for t in seidr_cfg.get("targets", [])]
+        self.seidr_targets = self.target_genes_files if self.target_genes_files else self.seidr_persisted_targets
+
+        # Cache
+        self.cache_gb: Optional[int] = cache_gb
         self.no_cache: bool = bool(no_cache)
 
-        # --------------------------- Directory setup ---------------------------
-        self.shared = (self.outdir / "shared").resolve()
-        self.cache = (self.shared / "cache").resolve()
-        self.log = (self.shared / "log.txt").resolve()
+        # --------------------------- EGAD / Evaluation ---------------------------
 
-    # ======================================================================
-    # Internal helpers
-    # ======================================================================
+        egad_cfg = self.persisted_cfg.get("egad", {})
+        self.egad_network_name = egad_cfg.get("network_name", "network_main_edges.tsv")
+        self.egad_output_name = egad_cfg.get("output_name", "egad_auroc.tsv")
+        self.egad_log_name = egad_cfg.get("log_name", "egad.log")
+
+        self.egad_opts: Dict[str, Any] = {
+            "network_file": self.shared / "seidr" / self.egad_network_name,
+            "out_file": self.shared / "seidr" / self.egad_output_name,
+            "log_path": self.shared / "seidr" / self.egad_log_name,
+            "mapman_file": self.mapman_file,
+            "go_file": self.go_file,
+        }
 
     def _resolve_cfg_path(self) -> Path:
+        """Determines the operative persistent config path resolving OS env variables."""
         env_path = os.environ.get(self.CFG_ENV)
         if env_path:
             return Path(env_path).expanduser().resolve()
         return Path.cwd() / self.CFG_DEFAULT_NAME
 
     def _load_json_cfg(self, path: Path) -> Dict[str, Any]:
+        """Safely hydrates state from stored JSON settings on disk."""
         if not path.exists():
             return {}
         try:
@@ -195,17 +219,20 @@ class Config:
         except Exception:
             return {}
 
-    # ======================================================================
-    # Convenience accessors
-    # ======================================================================
-
     @property
     def threads(self) -> int:
+        """Access method for thread ceilings."""
         return self.max_threads
 
     def get_tool_opts(self, tool: str) -> Dict[str, Any]:
         """
-        Effective tool options, preferring the resolved attributes.
+        Derives operational kwargs formatted for isolated subsystem calls.
+
+        Args:
+            tool (str): The specific target tool subsystem keyword.
+
+        Returns:
+            Dict[str, Any]: Resolved argument payloads.
         """
         if tool == "trim":
             return dict(self.trim_opts)
@@ -218,12 +245,29 @@ class Config:
                 "seq_tech": self.seq_tech,
             }
         if tool == "seidr":
-            # Options used by the Seidr subcommand / R pipeline
-            return dict(self.expr_network_opts)
+            return {
+                "enabled": self.seidr_enabled,
+                "preset": self.seidr_preset,
+                "algorithms": self.seidr_algos,
+                "backbone": self.seidr_backbone,
+                "workers": self.seidr_workers,
+                "target_mode": self.seidr_target_mode,
+                "force": self.seidr_force,
+                "targets": [str(t) for t in self.seidr_targets],
+                "genes_file": self.shared / "deseq2" / "genes.txt",
+                "expression_file": self.shared / "deseq2" / "expression.tsv",
+                "outdir": self.shared / "seidr",
+                "aggregate": "irp",
+                "no_full": False
+            }
+
+        if tool == "egad":
+            return dict(self.egad_opts)
         return self.persisted_cfg.get(tool, {})
 
     @property
     def cache_high_gb(self) -> int:
+        """Determines logic block ceiling for cache operations in gigabytes."""
         if self.no_cache:
             return 0
         if self.cache_gb is not None:
@@ -232,6 +276,7 @@ class Config:
 
     @property
     def cache_low_gb(self) -> int:
+        """Determines resume triggers based on configured cache logic constraints."""
         high = self.cache_high_gb
         if high <= 0:
             return 0
@@ -239,22 +284,27 @@ class Config:
 
     def __repr__(self) -> str:
         return f"<Config output={self.outdir} threads={self.max_threads}>"
-
 # ------------------------------- Sample -------------------------------
 
 class Sample:
+    """
+    Representation class for an individual atomic execution unit representing a single sequencing run.
+    """
     def __init__(
             self,
             sample_id: str,
-            sample_type: str,  # "SRR" or "FASTQ"
+            sample_type: str,
             fastq_paths: Optional[List[Path]] = None,
             metadata: Optional[Dict[str, Any]] = None,
             bioproject: Optional["BioProject"] = None,
             outdir: Optional[Path] = None,
-            status: str = "pending",  # "pending" | "ready" | "processing" | "done" | "failed" | "prefetched"
+            status: str = "pending",
             cache_dir: Optional[Path] = None,
             no_cache: bool = False,
     ):
+        """
+        Scaffolds sample tracking records including dynamic path bindings for outputs and logs.
+        """
         self.id = str(sample_id)
         self.type = sample_type.upper()
         if self.type not in {"SRR", "FASTQ"}:
@@ -262,9 +312,6 @@ class Sample:
 
         self.bioproject = bioproject
 
-        # -------------------------
-        # Decide per-sample outdir
-        # -------------------------
         if self.type == "SRR":
             if bioproject is None:
                 raise ValueError("SRR sample requires a BioProject.")
@@ -275,11 +322,10 @@ class Sample:
             self.outdir = outdir / self.id
 
         self.outdir.mkdir(parents=True, exist_ok=True)
-
-        # per-sample log
         self.log_path = self.outdir / f"{self.id}_log.txt"
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+
         if not self.log_path.exists():
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(self.log_path, "w") as f:
                 f.write(f"# Log for Sample {self.id}\n")
 
@@ -287,26 +333,17 @@ class Sample:
         self.metadata: Dict[str, Any] = dict(metadata or {})
         self.status = status
 
-        # dynamically set during prefetch / detection
         self.sra_path: Optional[Path] = None
 
-        # ------------------------------------------------------
-        # Auto-detect state from disk (done / prefetched)
-        # ------------------------------------------------------
         if self.type == "SRR":
-            # 1) Fully done? (abundance.tsv present)
             if self.is_done():
-                # is_done() already sets status="done"
                 return
 
-            # 2) Already-prefetched SRA?
             candidates: List[Path] = []
 
-            # cache mode: shared cache/SRR.sra
             if not no_cache and cache_dir is not None:
                 candidates.append(cache_dir / f"{self.id}.sra")
 
-            # no-cache or legacy: <BP>/<SRR>/<SRR>.sra
             candidates.append(self.outdir / f"{self.id}.sra")
 
             for sra_file in candidates:
@@ -317,16 +354,18 @@ class Sample:
                             self.status = "prefetched"
                         break
                 except OSError:
-                    # If stat() fails, just ignore and try others
                     continue
 
     def is_srr(self) -> bool:
+        """Determines if the sample unit relies on public databases."""
         return self.type == "SRR"
 
     def is_fastq(self) -> bool:
+        """Determines if the sample operates on raw localized unarchived files."""
         return self.type == "FASTQ"
 
     def is_done(self) -> bool:
+        """Probes the filesystem confirming final output components exist representing completion."""
         ok = (self.outdir / "abundance.tsv").exists()
         if ok:
             self.status = "done"
@@ -340,6 +379,9 @@ class Sample:
 # ------------------------------ BioProject ----------------------------
 
 class BioProject:
+    """
+    Representation class for aggregating multiple isolated sample records linked via parent experiment hierarchy.
+    """
     def __init__(
             self,
             bioproject_id: str,
@@ -356,11 +398,9 @@ class BioProject:
         self.status: str = "pending"
         self.samples: List["Sample"] = []
 
-        # cache settings (for Sample autodetect)
         self.cache_dir = cache_dir
         self.no_cache = no_cache
 
-        # per-BioProject log
         self.log_path = self.path / f"{self.id}_log.txt"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.log_path, "w") as f:
@@ -373,6 +413,7 @@ class BioProject:
             metadata: Optional[Dict[str, Any]] = None,
             status: str = "pending",
     ) -> "Sample":
+        """Generates and registers a child sample object mapped to this project."""
         s = Sample(
             sample_id=srr_id,
             sample_type="SRR",
@@ -397,6 +438,7 @@ class BioProject:
         return sum(1 for s in self.samples if s.status not in {"done", "failed"})
 
     def update_status(self) -> None:
+        """Reconciles parent project progression state via constituent child evaluations."""
         rem = self.remaining()
         if rem == 0:
             self.status = "done"
@@ -408,13 +450,21 @@ class BioProject:
     def get_sample_ids(self):
         return [sample.id for sample in self.samples]
 
+    def run_post_processing(self, cfg: Config):
+        """
+        Executes internal script wrappers operating against localized group aggregation boundaries.
+        Deferred import resolves potential circular loading chains.
+        """
+        from .post_processing import run_postprocessing_bp
+
+        return run_postprocessing_bp(self, cfg)
+
 
 # ------------------------------- Dataset ------------------------------
 
 class Dataset:
     """
-    Single-mode collection of samples for a run.
-    mode: "SRR" (grouped by BioProject) or "FASTQ" (local fastqs)
+    Singleton collection containing global mappings indexing overall run targets.
     """
 
     def __init__(self, config: "Config", mode: str):
@@ -425,7 +475,6 @@ class Dataset:
         self.path = config.outdir
         self.path.mkdir(parents=True, exist_ok=True)
 
-        # Root for per-sample outputs in FASTQ mode
         self.fastq_root = self.path / "samples"
         if self.mode == "FASTQ":
             self.fastq_root.mkdir(parents=True, exist_ok=True)
@@ -436,14 +485,15 @@ class Dataset:
     def __len__(self):
         return len(self.samples)
 
-    # SRR helpers
     def _find_bioproject(self, bioproject_id: str) -> Optional[BioProject]:
+        """Resolves target BioProject reference from initialized store mapping."""
         for bp in self.bioprojects:
             if getattr(bp, "id", None) == bioproject_id:
                 return bp
         return None
 
     def get_or_create_bioproject(self, bioproject_id: str) -> BioProject:
+        """Retrieves or scaffolds a primary target BioProject dependency."""
         bp = self._find_bioproject(bioproject_id)
         cache_dir = getattr(self.config, "cache", None)
         no_cache = bool(getattr(self.config, "no_cache", False))
@@ -465,12 +515,12 @@ class Dataset:
             metadata: Optional[Dict[str, Any]] = None,
             status: str = "pending",
     ) -> Sample:
+        """Integrates external targets derived via public archives."""
         bp = self.get_or_create_bioproject(bioproject_id)
         s = bp.add_srr(srr_id, metadata=metadata, status=status)
         self.samples.append(s)
         return s
 
-    # FASTQ helpers
     def add_fastq(
             self,
             sample_id: str,
@@ -480,15 +530,7 @@ class Dataset:
             metadata: Optional[Dict[str, Any]] = None,
             status: str = "pending",
     ) -> Sample:
-        """
-        FASTQ helpers.
-
-        In FASTQ mode we let Sample create its own directory as:
-            <parent_outdir>/<sample_id>/
-
-        So here we just pass the *parent* (typically <outdir>/samples).
-        """
-        # Parent directory under which samples live
+        """Integrates raw sequence source inputs bypassing standard SRA architecture chains."""
         if outdir is None:
             parent_outdir = self.fastq_root
         else:
@@ -508,6 +550,7 @@ class Dataset:
         return s
 
     def update_status(self):
+        """Forces global reevaluation of component records mapping target resolutions."""
         if self.mode == "FASTQ":
             for s in self.samples:
                 if s.is_done():
@@ -524,6 +567,7 @@ class Dataset:
                 bp.update_status()
 
     def to_do_pairs(self) -> List[Tuple["BioProject", "Sample"]]:
+        """Translates current unresolved structures into process priority pairings."""
         if self.mode != "SRR":
             return []
         for bp in self.bioprojects:
@@ -540,21 +584,23 @@ class Dataset:
         return pairs
 
     def to_do(self) -> List["Sample"]:
+        """Calculates exact uncompleted workload sample queueing."""
         if self.mode == "SRR":
             return [s for (_bp, s) in self.to_do_pairs()]
         return [s for s in self.samples if s.status not in {"done", "failed"}]
 
     def bp_done(self):
+        """Returns completed project arrays."""
         return [bp for bp in self.bioprojects if bp.status == "done"]
 
     def done(self):
+        """Returns completed sample arrays."""
         return [s for s in self.samples if s.status == "done"]
 
     @classmethod
     def from_dataframe(cls, df, cfg: "Config") -> "Dataset":
         """
-        Build a SRR-mode dataset from a metadata dataframe with
-        columns 'Run', 'BioProject', and optionally 'Model'.
+        Builds a generic SRR dataset map by scanning standard dataframe layouts.
         """
         ds = cls(config=cfg, mode="SRR")
         for _, row in df.iterrows():
@@ -567,19 +613,7 @@ class Dataset:
     @classmethod
     def from_fastq_dir(cls, directory: Path, cfg: "Config") -> "Dataset":
         """
-        Build a FASTQ-mode dataset from a directory structured as:
-
-            <root>/
-              sampleA/
-                sampleA_R1.fastq.gz
-                sampleA_R2.fastq.gz
-              sampleB/
-                sampleB.trim.fastq    # single-end also OK
-              emptyFolder/
-                # no FASTQs → skipped with a [WARNING]
-
-        Each immediate subdirectory of <root> is treated as one potential sample.
-        Subdirectories without FASTQs are skipped with a warning.
+        Generates local fastq-driven datasets utilizing folder structures skipping archives.
         """
         directory = Path(directory).expanduser().resolve()
         if not directory.is_dir():
@@ -600,7 +634,6 @@ class Dataset:
                 if _is_fastq_path(p)
             )
             if not fastqs:
-                # Just warn and continue; this BioProject folder may contain other stuff
                 print(f"[WARNING] No FASTQ files found in sample directory: {sample_dir}")
                 continue
 
@@ -608,7 +641,6 @@ class Dataset:
             ds.add_fastq(sample_id=sample_id, fastq_paths=fastqs)
 
         if not ds.samples:
-            # None of the subdirs had FASTQs → hard error
             raise ValueError(
                 f"No FASTQ files found in any subdirectory of: {directory}"
             )
@@ -618,15 +650,13 @@ class Dataset:
     @classmethod
     def reconstruct_from_output(cls, cfg: Config) -> 'Dataset':
         """
-        Scans the output directory defined in Config to reconstruct a Dataset object
-        based on finished processing results (presence of abundance.tsv).
+        Restores logical dataset states strictly derived via disk artifacts in case of partial runs.
         """
         if not cfg.outdir.exists():
             raise FileNotFoundError(f"Output directory not found: {cfg.outdir}")
 
         all_files = cfg.outdir.rglob("abundance.tsv")
 
-        # Exclude unwanted directories
         blacklist_markers = {"multiqc", "mqc", "shared", "cache", "logs", "slurm_logs"}
         found_files = []
         for f in all_files:
@@ -636,11 +666,8 @@ class Dataset:
         if not found_files:
             raise FileNotFoundError(f"No valid processed samples (abundance.tsv) found in {cfg.outdir}")
 
-        # Determine mode
         detected_mode = "SRR"
         for f in found_files:
-            # Check structure for FASTQ mode: .../fastq_samples/<sample_id>/abundance.tsv
-            # f.parent = sample_id, f.parent.parent = "fastq_samples"
             if f.parent.parent.name == "fastq_samples":
                 detected_mode = "FASTQ"
                 break
@@ -654,12 +681,8 @@ class Dataset:
             bp_id = bp_dir.name
 
             if detected_mode == "FASTQ":
-                # For FASTQ mode, we rely on add_fastq
-                # Pass 'fastq_paths=[]' because we are post-processing,
-                # we don't need the original fastqs to run DESeq2.
                 ds.add_fastq(sample_id=s_id, fastq_paths=[], outdir=bp_dir, status="done")
             else:
-                # For SRR mode, use add_srr to auto-wire the BioProject
                 ds.add_srr(bioproject_id=bp_id, srr_id=s_id, status="done")
 
         return ds

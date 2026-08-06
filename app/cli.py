@@ -12,10 +12,12 @@ import click
 import pandas as pd
 from click.core import ParameterSource
 
+from .saturation import BatchOrchestrator
+from .seidr import PRESETS, ALGO_MAP
 from .core import pipeline
 from .entities import Config, Dataset
 from .post_processing import run_postprocessing
-from .utils import transcriptome_suffixes, smash, scan_fastqs
+from .utils import transcriptome_suffixes, smash, generate_read_metrics_plot
 from .logo import LOGO
 from . import __version__
 
@@ -35,13 +37,14 @@ LOGO_PAD = 20
 HELP_BODY = (
     "\n\n"
     "==================================================================================================================================================\n"
-    "HULK is a H(igh-volume b)ulk RNA-seq data preprocessing pipeline for NCBI SRA accessions and user-provided FASTQ files.\n"
+    "                      HULK: High-Volume Bulk RNA-seq pipeline for Gene Regulatory Network (GRN) construction and analysis.\n"
     "\n"
-    "SRA mode (recommended for public data): given an input table (.csv/.tsv/.txt) with columns 'Run', 'BioProject', and 'Model'.\n"
+    "                      SRA mode: processes NCBI SRA accessions (requires 'Run', 'BioProject', 'Model' columns).\n"
+    "                      FASTQ mode: processes local FASTQ subdirectories.\n"
     "\n"
-    "FASTQ mode (local FASTQ folders): -i/--input points to a directory where each sample is a subfolder.\n"
-    "\n"
-    "Configuration subcommands: 'trim', 'align', 'tximport', 'deseq2', and 'plot' control persistence settings.\n"
+    "                      Subcommands:\n"
+    "                      - Configure: 'trim', 'align', 'tximport', 'plot', 'seidr'.\n"
+    "                      - Execute: 'evaluate' (EGAD metrics), 'saturation' (stability analysis), 'report' (regenerate outputs).\n"
     "==================================================================================================================================================\n"
 )
 
@@ -49,10 +52,17 @@ HELP_BODY = (
 # ---------------------------- Persisted config I/O ----------------------------
 
 def _cfg_path(_: Path | None = None) -> Path:
+    """Returns the persistent file path used for system configuration."""
     return CFG_FIXED_PATH
 
 
 def _cfg_load(_: Path | None = None) -> Dict[str, Any]:
+    """
+    Loads and parses the persisted JSON configuration file.
+
+    Returns:
+        Dict[str, Any]: Parsed configuration dictionary. Returns an empty dict if the file is missing or corrupt.
+    """
     p = _cfg_path(None)
     if not p.exists():
         return {}
@@ -64,6 +74,15 @@ def _cfg_load(_: Path | None = None) -> Dict[str, Any]:
 
 
 def _cfg_save(cfg: dict[str, Any], _: Path | None = None) -> Path:
+    """
+    Writes the provided configuration dictionary to the persistent JSON file.
+
+    Args:
+        cfg (dict): The configuration dictionary to save.
+
+    Returns:
+        Path: The path to the updated configuration file.
+    """
     p = _cfg_path(None)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
@@ -75,6 +94,16 @@ def _cfg_save(cfg: dict[str, Any], _: Path | None = None) -> Path:
 
 
 def _cfg_update(section: str, payload: dict[str, Any], _: Path | None = None) -> Path:
+    """
+    Updates a specific subsystem section within the global configuration file.
+
+    Args:
+        section (str): The configuration section to modify.
+        payload (dict): The specific settings to apply.
+
+    Returns:
+        Path: The path to the updated configuration file.
+    """
     cfg = _cfg_load(None)
     sect = cfg.get(section, {})
     for k, v in payload.items():
@@ -85,6 +114,15 @@ def _cfg_update(section: str, payload: dict[str, Any], _: Path | None = None) ->
 
 
 def _cfg_reset(section: str, _: Path | None = None) -> Path:
+    """
+    Purges a specific subsystem section from the global configuration file.
+
+    Args:
+        section (str): The configuration section to reset.
+
+    Returns:
+        Path: The path to the updated configuration file.
+    """
     cfg = _cfg_load(None)
     if section in cfg:
         del cfg[section]
@@ -93,17 +131,21 @@ def _cfg_reset(section: str, _: Path | None = None) -> Path:
 
 # ---------------------------- Help formatting ----------------------------
 def _pad_block(text: str, n: int) -> str:
+    """Applies block indentation to a multiline string block."""
     lines = text.rstrip("\n").splitlines()
     return "\n".join((" " * n) + line for line in lines)
 
 
 class SpacedFormatterMixin:
+    """Mixin class to strictly format Click help menus with wide column alignment."""
+
     def _fmt_rows_with_spacing(
             self,
             formatter: click.HelpFormatter,
             title: str,
             rows: list[tuple[str, str | None]],
     ) -> None:
+        """Renders aligned command descriptions."""
         rows = [r for r in rows if r]
         if not rows:
             return
@@ -130,6 +172,8 @@ class SpacedFormatterMixin:
 
 
 class HulkGroup(SpacedFormatterMixin, click.Group):
+    """Custom command group mapping that utilizes the SpacedFormatterMixin for formatting."""
+
     def make_context(self, info_name, args, parent=None, **extra):
         ctx = super().make_context(info_name, args, parent=parent, **extra)
         ctx.max_content_width = WIDE_HELP
@@ -162,6 +206,8 @@ class HulkGroup(SpacedFormatterMixin, click.Group):
 
 
 class HulkCommand(SpacedFormatterMixin, click.Command):
+    """Custom standard command utilizing SpacedFormatterMixin styling."""
+
     def make_context(self, info_name, args, parent=None, **extra):
         ctx = super().make_context(info_name, args, parent=parent, **extra)
         ctx.max_content_width = WIDE_HELP
@@ -188,8 +234,6 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
     context_settings={"help_option_names": ["-h", "--help"], "max_content_width": WIDE_HELP},
 )
 @click.version_option(__version__, "-V", "--version", prog_name="hulk")
-@click.option("--smash", is_flag=True, hidden=True, is_eager=True, expose_value=False,
-              callback=lambda ctx, p, v: (smash(), ctx.exit()) if v and not ctx.resilient_parsing else None)
 @click.option(
     "-i",
     "--input",
@@ -216,13 +260,15 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
     help="Output directory.",
 )
 @click.option("--min-threads", type=int, default=DEFAULT_MIN_THREADS, show_default=True, help="Threads per SRR.")
-@click.option("-t", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True, help="Total threads.")
+@click.option("-p", "--max-threads", type=int, default=DEFAULT_MAX_THREADS, show_default=True, help="Total threads.")
 @click.option("--verbosity/--no-verbosity", default=True, show_default=True, help="Live progress.")
 @click.option("-y", "--yes", is_flag=True, help="Skip prompts.")
 @click.option("-f", "--force", is_flag=True, help="Force re-run (overwrite processed data).")
 @click.option("-n", "--dry-run", is_flag=True, help="Validate and plan without running.")
-@click.option("-g", "--gene-counts", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+@click.option("-t,--tx2gene", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="tx2gene map for gene-level counts.")
+@click.option("--no-bp-postprocessing", is_flag=True, help="Skip per-BioProject post-processing.")
+@click.option("--no-global-postprocessing", is_flag=True, help="Skip global (all samples) post-processing.")
 @click.option("--no-cache", is_flag=True, help="Disable SRA cache.")
 @click.option("-c", "--cache", "cache_gb", type=int, default=None, help="Max SRA cache size (GiB).")
 @click.option("--keep-fastq", is_flag=True, help="Keep trimmed FASTQs.")
@@ -246,6 +292,20 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
     default=False,
     help="DANGER: Remove output folders for BioProjects NOT present in the input table.",
 )
+@click.option("-m", "--mapman", "mapman_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="MapMan annotation file for EGAD (Triggers evaluation).")
+@click.option("-g","--go-file", "go_file_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="BioMart GO export file (TSV) for EGAD (Triggers evaluation).")
+@click.option("--metrics", type=click.Choice(['auroc', 'aupr', 'both'], case_sensitive=False),
+              default='both', show_default=True, help="Which EGAD metrics to calculate.")
+@click.option("--saturation", "run_saturation", is_flag=True, help="Run data saturation analysis.")
+@click.option("--iterations", type=int, default=3, show_default=True, help="Subsampling iterations for saturation.")
+@click.option("--steps", type=int, default=10, show_default=True, help="BioProject steps for saturation.")
+@click.option("--seidr-preset", "sat_seidr_preset", type=click.Choice(list(PRESETS.keys()), case_sensitive=False),
+              default="FAST", show_default=True, help="Seidr preset for saturation.")
+@click.option("--seed", type=int, default=None, help="Random seed for saturation.")
+@click.option("-w", "--workers", "sat_workers", type=int, default=4, show_default=True, help="Workers for saturation.")
+@click.option("--plot-only", is_flag=True, help="Skip processing and only regenerate plots.")
 @click.pass_context
 def cli(
         ctx: click.Context,
@@ -265,7 +325,20 @@ def cli(
         seq_tech: str | None,
         target_genes_files: Tuple[Path],
         rem_missing_bps: bool,
+        no_bp_postprocessing: bool,
+        no_global_postprocessing: bool,
+        mapman_path: Path | None,
+        go_file_path: Path | None,
+        metrics: str,
+        run_saturation: bool,
+        iterations: int,
+        steps: int,
+        sat_seidr_preset: str,
+        seed: int | None,
+        sat_workers: int,
+        plot_only: bool,
 ):
+    """Primary pipeline interface block. Evaluates subcommand state or drops into main execution."""
     if ctx.invoked_subcommand is not None:
         return
     _run_pipeline(
@@ -285,7 +358,25 @@ def cli(
         seq_tech=seq_tech,
         target_genes_files=list(target_genes_files) if target_genes_files else None,
         rem_missing_bps=rem_missing_bps,
+        no_bp_postprocessing=no_bp_postprocessing,
+        no_global_postprocessing=no_global_postprocessing,
+        mapman_path=mapman_path,
+        go_file_path=go_file_path,
+        metrics=metrics,
+        run_saturation=run_saturation,
+        iterations=iterations,
+        steps=steps,
+        sat_seidr_preset=sat_seidr_preset,
+        seed=seed,
+        sat_workers=sat_workers,
+        plot_only=plot_only,
     )
+
+
+@cli.command("smash", hidden=True)
+def smash_cmd():
+    """Execute the smash function easter-egg."""
+    smash()
 
 
 # ---------------------------- Summary printing ----------------------------
@@ -293,7 +384,7 @@ def _print_trailing_newlines(n_bioprojects: int | None = 0) -> None:
     try:
         n = n_bioprojects or 0
         pad_lines = max(4, n + 2)
-        click.echo("\n" * pad_lines, nl=False)
+        print("\n" * pad_lines, end="")
     except Exception:
         pass
 
@@ -310,16 +401,16 @@ def _warn(s): return click.style(f"!!! {s} !!!", fg="red", bold=True)
 
 
 def _print_config_summary(dataset: Dataset, cfg: Config) -> None:
-    """Print complete summary of Config and Dataset options."""
+    """Outputs a pre-flight execution summary validating loaded arguments."""
 
     # --- Danger Zone First ---
     if cfg.force or cfg.rem_missing_bps:
-        click.echo("\n" + click.style(">>> DANGER ZONE <<<", fg="red", bold=True, blink=True))
+        print("\n" + click.style(">>> DANGER ZONE <<<", fg="red", bold=True, blink=True))
         if cfg.force:
-            click.echo(_warn(f"FORCE ENABLED: Will overwrite existing data in: {cfg.outdir}"))
+            print(_warn(f"FORCE ENABLED: Will overwrite existing data in: {cfg.outdir}"))
         if cfg.rem_missing_bps:
-            click.echo(_warn(f"REM-MISSING-BPS ENABLED: Will DELETE any folder in output not in input table!"))
-        click.echo("-" * 40)
+            print(_warn(f"REM-MISSING-BPS ENABLED: Will DELETE any folder in output not in input table!"))
+        print("-" * 40)
 
     print("\n============ Run Summary ============")
 
@@ -378,6 +469,10 @@ def _print_config_summary(dataset: Dataset, cfg: Config) -> None:
     print(f"Plots:                PCA={cfg.plot_pca}, HM={cfg.plot_heatmap}, VarHM={cfg.plot_var_heatmap}")
     print(f"Adv. Plots:           SampleCor={cfg.plot_sample_cor}, Disp={cfg.plot_dispersion}, TopN={cfg.top_n_vars}")
 
+    # --- Seidr ---
+    seidr_status = "ENABLED" if getattr(cfg, "seidr_enabled", False) else "DISABLED"
+    print(f"Seidr (Network):      {seidr_status}")
+
     print("=====================================\n")
 
 
@@ -399,31 +494,38 @@ def _run_pipeline(
         seq_tech: str | None,
         target_genes_files: List[Path] | None,
         rem_missing_bps: bool,
+        no_bp_postprocessing: bool,
+        no_global_postprocessing: bool,
+        mapman_path: Path | None = None,
+        go_file_path: Path | None = None,
+        metrics: str = 'both',
+        run_saturation: bool = False,
+        iterations: int = 3,
+        steps: int = 10,
+        sat_seidr_preset: str = "FAST",
+        seed: int | None = None,
+        sat_workers: int = 4,
+        plot_only: bool = False,
 ) -> None:
+    """Executes the core logic sequence, assembling configs, building datasets, and initiating tasks."""
     if input_path is None or reference_path is None:
         raise click.UsageError("Missing required options: -i/--input and -r/--reference. See 'hulk -h'.")
 
-    # Load persisted sections from ~/.hulk.json (or fixed path)
+    # Load persisted sections from fixed settings file.
     persisted = _cfg_load(None)
     trim_cfg = persisted.get("trim", {}) or {}
     align_cfg = persisted.get("align", {}) or {}
     txi_cfg = persisted.get("tximport", {}) or {}
     plot_cfg = persisted.get("plot", {}) or {}
 
-    # ---- Trim defaults ----
     ws = trim_cfg.get("window_size", 4)
     mq = trim_cfg.get("mean_quality", 20)
-
-    # ---- Align defaults ----
     align_method = (align_cfg.get("method") or "kallisto").lower()
     kallisto_bootstrap = int(align_cfg.get("bootstrap", 100))
 
-    # ---- tximport defaults ----
     txi_mode = txi_cfg.get("mode") or "raw_counts"
     txi_ignore = bool(txi_cfg.get("ignore_tx_version", False))
 
-    # ---- Plot defaults ----
-    # Default to TRUE for globals if not found in JSON
     global_pca = bool(plot_cfg.get("global_pca", True))
     global_heatmap = bool(plot_cfg.get("global_heatmap", True))
     global_var_heatmap = bool(plot_cfg.get("global_var_heatmap", True))
@@ -437,7 +539,6 @@ def _run_pipeline(
     plot_heatmap = global_heatmap or bp_heatmap
     plot_var_heatmap = global_var_heatmap
 
-    # Build Config
     cfg = Config(
         input_path=input_path,
         reference_path=reference_path,
@@ -449,45 +550,38 @@ def _run_pipeline(
         dry_run=dry_run,
         tx2gene=tx2gene_path,
         keep_fastq=keep_fastq,
-
         no_cache=no_cache,
         cache_gb=cache_gb,
-
         trim_window_size=ws,
         trim_mean_quality=mq,
         align_method=align_method,
         kallisto_bootstrap=kallisto_bootstrap,
         tximport_mode=txi_mode,
         tximport_ignore_tx_version=txi_ignore,
-
         plot_pca=plot_pca,
         plot_heatmap=plot_heatmap,
         plot_var_heatmap=plot_var_heatmap,
-
-        # New Params
         plot_sample_cor=sample_cor,
         plot_dispersion=dispersion,
         top_n_vars=top_n,
-
         seq_tech=seq_tech,
         target_genes_files=target_genes_files,
         rem_missing_bps=rem_missing_bps,
+        no_bp_postprocessing=no_bp_postprocessing,
+        no_global_postprocessing=no_global_postprocessing,
     )
 
-    # Validate reference
     trans_suff = transcriptome_suffixes(reference_path)
     if trans_suff not in TRANSCRIPTOME_FORMATS:
         raise click.UsageError(
             f"Transcriptome file must be one of: {', '.join(sorted(TRANSCRIPTOME_FORMATS))} (got: {reference_path.name})"
         )
 
-    # Dataset Loading
+    # Dataset evaluation logic based on input mode types.
     df = None
     if input_path.is_dir():
-        # FASTQ mode
         dataset = Dataset.from_fastq_dir(input_path, cfg)
     else:
-        # SRA mode
         suf = input_path.suffix.lower()
         if suf not in INPUT_FORMATS:
             raise click.UsageError(f"Input file must be one of: {', '.join(sorted(INPUT_FORMATS))}")
@@ -507,7 +601,6 @@ def _run_pipeline(
         df = df[list(REQUIRED_INPUT_COLS)]
         dataset = Dataset.from_dataframe(df, cfg)
 
-    # tx2gene validation
     if tx2gene_path is not None:
         try:
             tx2gene_df = pd.read_csv(tx2gene_path, sep=None, engine="python")
@@ -516,7 +609,6 @@ def _run_pipeline(
         except Exception as e:
             raise click.ClickException(str(e))
 
-    # FASTQ mode technology check
     if getattr(dataset, "mode", None) == "FASTQ":
         from .align import list_known_seq_techs, _MODEL_PARAMS
         known_techs = list_known_seq_techs()
@@ -527,7 +619,7 @@ def _run_pipeline(
             raise click.UsageError(f"Unknown seq-tech '{seq_tech}'. Known: {', '.join(known_techs)}")
 
     # ------------------------------------------------------------------
-    # DANGEROUS LOGIC: rem-missing-bps
+    # Destructive operations handling. Be careful.
     # ------------------------------------------------------------------
     if rem_missing_bps:
         if getattr(dataset, "mode", None) != "SRA":
@@ -553,14 +645,12 @@ def _run_pipeline(
             else:
                 click.secho("[INFO] Output directory does not exist, nothing to clean.", fg="blue")
 
-    # Print summary (Cleanly passing both objects to the view function)
     _print_config_summary(dataset, cfg)
 
     if dry_run:
         click.secho("✅ Dry run complete. No tools executed.\n", fg="green")
         sys.exit(0)
 
-    # Extra warning for the reckless
     if (force or rem_missing_bps) and not yes:
         click.secho("WARNING: You have selected DESTRUCTIVE options (Force and/or Rem-Missing).", fg="red", blink=True,
                     bold=True)
@@ -570,175 +660,355 @@ def _run_pipeline(
 
     pipeline(dataset, cfg)
 
+    # -------- Downstream Extracurricular Activity Injection --------
+
+    if mapman_path or go_file_path:
+        click.secho("\n[Hulk] Automatically triggering Network Evaluation...", fg="magenta", bold=True)
+        from .egad import run_vocal_evaluation
+        eval_cfg = Config(outdir=output_dir, plots_only_mode=True, mapman_file=mapman_path, go_file=go_file_path)
+        try:
+            run_vocal_evaluation(
+                eval_cfg,
+                mapman_path=mapman_path,
+                go_file_path=go_file_path,
+                metrics=metrics.lower(),
+                custom_network=None
+            )
+        except Exception as e:
+            click.secho(f"[Error] Evaluation failed: {e}", fg="red")
+
+    if run_saturation:
+        click.secho("\n[Hulk] Automatically triggering Saturation Analysis...", fg="cyan", bold=True)
+        try:
+            sat_cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only, mapman_file=mapman_path,
+                             go_file=go_file_path)
+            sat_cfg.seidr_preset = sat_seidr_preset.upper()
+            sat_dataset = Dataset.reconstruct_from_output(sat_cfg)
+
+            orch = BatchOrchestrator(
+                sat_dataset, sat_cfg,
+                seed=seed,
+                workers=sat_workers,
+                max_threads=max_threads,
+                mapman_file=mapman_path,
+                go_file=go_file_path,
+                force=force,
+                num_steps=steps,
+                metrics=metrics.lower()
+            )
+            orch.iterations = iterations
+
+            if plot_only:
+
+                raw_file = orch.base_outdir / "saturation_results_raw.tsv"
+                if not raw_file.exists():
+                    click.secho(f"[Error] Cannot plot. Missing {raw_file}. Did you even run it completely once?",
+                                fg="red")
+                else:
+                    results_dicts = pd.read_csv(raw_file, sep="\t").to_dict('records')
+                    orch._generate_plots(results_dicts)
+            else:
+                orch.run()
+        except Exception as e:
+            click.secho(f"\n[Error] Saturation analysis failed: {e}", fg="red")
+
     if getattr(dataset, "mode", None) == "FASTQ":
         _print_trailing_newlines(0)
     else:
         _print_trailing_newlines(len(getattr(dataset, "bioprojects", None)))
     sys.exit(0)
 
-@click.group(cls=HulkCommand, help="Run the HULK pipeline with explicit options.")
-def run_cmd(**kwargs):
-    pass
-
 
 @cli.command("trim", cls=HulkCommand, help="Configure fastp trimming defaults.")
-@click.option("-ws", "--window-size", type=int, default=None, help="fastp sliding window size.")
-@click.option("-mq", "--mean-quality", type=int, default=None, help="fastp mean quality threshold.")
+@click.option("-ws", "--window-size", type=int, default=None, show_default="4",
+              help="fastp sliding window size.")
+@click.option("-mq", "--mean-quality", type=int, default=None, show_default="20",
+              help="fastp mean quality threshold.")
 @click.option("--reset-defaults", is_flag=True, help="Reset trim options.")
 def trim(window_size: int | None, mean_quality: int | None, reset_defaults: bool):
+    """Saves fastp parameter defaults to persistent configuration storage."""
     if reset_defaults:
         p = _cfg_reset("trim")
         click.secho(f"Reset trim settings to defaults at {p}", fg="green")
         return
-    if window_size is None and mean_quality is None:
-        click.echo("Try: hulk trim -h")
-        return
-    p = _cfg_update("trim", {"window_size": window_size, "mean_quality": mean_quality})
+
+    current_cfg = _cfg_load()
+    trim_cfg = current_cfg.get("trim", {})
+
+    if window_size is not None: trim_cfg["window_size"] = window_size
+    if mean_quality is not None: trim_cfg["mean_quality"] = mean_quality
+
+    p = _cfg_update("trim", trim_cfg)
     click.secho(f"Saved trim settings to {p}", fg="green")
+
+    print("\nCurrent Trim Configuration:")
+    print(f"  Window Size:  {trim_cfg.get('window_size', 4)}")
+    print(f"  Mean Quality: {trim_cfg.get('mean_quality', 20)}")
 
 
 @cli.command("tximport", cls=HulkCommand, help="Configure tximport aggregation.")
 @click.option("-m", "--mode", type=click.Choice(["raw_counts", "length_scaled_tpm", "scaled_tpm", "dtu_scaled_tpm"],
-                                                case_sensitive=False), default=None)
-@click.option("--ignore-tx-version", "ignore_tx_version", is_flag=True, default=False)
+                                                case_sensitive=False),
+              default=None, show_default="raw_counts")
+@click.option("--ignore-tx-version/--keep-tx-version", "ignore_tx_version", default=None, show_default="False",
+              help="Ignore transcript version (e.g. ENST.1 -> ENST).")
 @click.option("--reset-defaults", is_flag=True)
-def tximport(mode: str | None, ignore_tx_version: bool, reset_defaults: bool):
+def tximport(mode: str | None, ignore_tx_version: bool | None, reset_defaults: bool):
+    """Saves tximport parameter defaults to persistent configuration storage."""
     if reset_defaults:
         p = _cfg_reset("tximport")
         click.secho(f"Reset tximport settings at {p}", fg="green")
         return
-    ctx = click.get_current_context()
-    flag_provided = (ctx.get_parameter_source("ignore_tx_version") == ParameterSource.COMMANDLINE)
-    if mode is None and not flag_provided:
-        click.echo("Try: hulk tximport -h")
-        return
-    payload = {}
-    if mode is not None: payload["mode"] = mode
-    if flag_provided: payload["ignore_tx_version"] = ignore_tx_version
-    p = _cfg_update("tximport", payload)
+
+    current_cfg = _cfg_load()
+    txi_cfg = current_cfg.get("tximport", {})
+
+    if mode is not None: txi_cfg["mode"] = mode
+    if ignore_tx_version is not None: txi_cfg["ignore_tx_version"] = ignore_tx_version
+
+    p = _cfg_update("tximport", txi_cfg)
     click.secho(f"Saved tximport settings to {p}", fg="green")
+
+    print("\nCurrent tximport Configuration:")
+    print(f"  Mode:           {txi_cfg.get('mode', 'raw_counts')}")
+    print(f"  Ignore Tx Ver:  {txi_cfg.get('ignore_tx_version', False)}")
 
 
 @cli.command("align", cls=HulkCommand, help="Configure alignment/quantification.")
-@click.option("--method", type=click.Choice(["kallisto"], case_sensitive=False), default="kallisto", show_default=True)
-@click.option("-b", "--bootstrap", type=int, default=100, show_default=True)
+@click.option("--method", type=click.Choice(["kallisto"], case_sensitive=False),
+              default=None, show_default="kallisto")
+@click.option("-b", "--bootstrap", type=int, default=None, show_default="100")
 @click.option("--reset-defaults", is_flag=True)
-def align(method: str, bootstrap: int, reset_defaults: bool):
+def align(method: str | None, bootstrap: int | None, reset_defaults: bool):
+    """Saves pseudo-alignment defaults to persistent configuration storage."""
     if reset_defaults:
         p = _cfg_reset("align")
         click.secho(f"Reset align settings at {p}", fg="green")
         return
-    payload = {"method": method.lower(), "bootstrap": int(bootstrap)}
-    p = _cfg_update("align", payload)
+
+    current_cfg = _cfg_load()
+    align_cfg = current_cfg.get("align", {})
+
+    if method is not None: align_cfg["method"] = method.lower()
+    if bootstrap is not None: align_cfg["bootstrap"] = int(bootstrap)
+
+    p = _cfg_update("align", align_cfg)
     click.secho(f"Saved align settings to {p}", fg="green")
+
+    print("\nCurrent Alignment Configuration:")
+    print(f"  Method:     {align_cfg.get('method', 'kallisto')}")
+    print(f"  Bootstraps: {align_cfg.get('bootstrap', 100)}")
 
 
 @cli.command("deseq2", cls=HulkCommand, help="Configure DESeq2 and variance filtering options.")
-@click.option("--enable/--disable", "enabled", default=None, help="Enable or disable DESeq2/VST steps entirely.")
-@click.option("--var-threshold", type=float, default=None,
-              help="Low variance threshold (default 0.1). Genes below this var are excluded.")
+@click.option("--enable/--disable", "enabled", default=None, show_default="True",
+              help="Enable or disable DESeq2/VST steps entirely.")
+@click.option("--var-threshold", type=float, default=None, show_default="0.1",
+              help="Low variance threshold. Genes below this var are excluded.")
 @click.option("--reset-defaults", is_flag=True, help="Reset DESeq2 options to defaults.")
 def deseq2(enabled: bool | None, var_threshold: float | None, reset_defaults: bool):
+    """Saves variance-stabilizing transformation defaults to persistent configuration storage."""
     if reset_defaults:
         p = _cfg_reset("deseq2")
         click.secho(f"Reset DESeq2 settings to defaults at {p}", fg="green")
         return
 
-    if enabled is None and var_threshold is None:
-        click.echo("Try: hulk deseq2 -h (to see options)")
-        return
+    current_cfg = _cfg_load()
+    deseq_cfg = current_cfg.get("deseq2", {})
 
-    payload: Dict[str, Any] = {}
-    if enabled is not None:
-        payload["enabled"] = enabled
-    if var_threshold is not None:
-        payload["var_threshold"] = var_threshold
+    if enabled is not None: deseq_cfg["enabled"] = enabled
+    if var_threshold is not None: deseq_cfg["var_threshold"] = var_threshold
 
-    p = _cfg_update("deseq2", payload)
+    p = _cfg_update("deseq2", deseq_cfg)
     click.secho(f"Saved DESeq2 settings to {p}", fg="green")
+
+    print("\nCurrent DESeq2 Configuration:")
+    print(f"  Enabled:        {deseq_cfg.get('enabled', True)}")
+    print(f"  Var Threshold:  {deseq_cfg.get('var_threshold', 0.1)}")
 
 
 @cli.command("plot", cls=HulkCommand, help="Configure plotting behaviour.")
-@click.option("--global-pca", type=bool, default=True)
-@click.option("--global-heatmap", type=bool, default=True)
-@click.option("--global-var-heatmap", type=bool, default=True)
-@click.option("--bp-pca", type=bool, default=False)
-@click.option("--bp-heatmap", type=bool, default=False)
-@click.option("--sample-cor", type=bool, default=False, help="Plot sample-sample correlation heatmap.")
-@click.option("--dispersion", type=bool, default=False, help="Plot DESeq2 dispersion estimates.")
-@click.option("--top-n", type=int, default=500, help="Number of top variable genes.")
+@click.option("--global-pca", type=bool, default=None, show_default="True")
+@click.option("--global-heatmap", type=bool, default=None, show_default="True")
+@click.option("--global-var-heatmap", type=bool, default=None, show_default="True")
+@click.option("--bp-pca", type=bool, default=None, show_default="False")
+@click.option("--bp-heatmap", type=bool, default=None, show_default="False")
+@click.option("--sample-cor", type=bool, default=None, show_default="True",
+              help="Plot sample-sample correlation heatmap.")
+@click.option("--dispersion", type=bool, default=None, show_default="True",
+              help="Plot DESeq2 dispersion estimates.")
+@click.option("--top-n", type=int, default=None, show_default="500",
+              help="Number of top variable genes.")
 @click.option("--reset-defaults", is_flag=True)
 def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sample_cor, dispersion, top_n,
          reset_defaults):
+    """Saves visualization and plotting configurations to persistent storage."""
     if reset_defaults:
         p = _cfg_reset("plot")
         click.secho(f"Reset plot settings at {p}", fg="green")
         return
-    if all(x is None for x in
-           [global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sample_cor, dispersion, top_n]):
-        click.echo("Try: hulk plot -h")
-        return
-    payload = {}
-    if global_pca is not None: payload["global_pca"] = bool(global_pca)
-    if global_heatmap is not None: payload["global_heatmap"] = bool(global_heatmap)
-    if global_var_heatmap is not None: payload["global_var_heatmap"] = bool(global_var_heatmap)
-    if bp_pca is not None: payload["bp_pca"] = bool(bp_pca)
-    if bp_heatmap is not None: payload["bp_heatmap"] = bool(bp_heatmap)
-    if sample_cor is not None: payload["sample_cor"] = bool(sample_cor)
-    if dispersion is not None: payload["dispersion"] = bool(dispersion)
-    if top_n is not None: payload["top_n"] = int(top_n)
 
-    p = _cfg_update("plot", payload)
+    current_cfg = _cfg_load()
+    plot_cfg = current_cfg.get("plot", {})
+
+    if global_pca is not None: plot_cfg["global_pca"] = bool(global_pca)
+    if global_heatmap is not None: plot_cfg["global_heatmap"] = bool(global_heatmap)
+    if global_var_heatmap is not None: plot_cfg["global_var_heatmap"] = bool(global_var_heatmap)
+    if bp_pca is not None: plot_cfg["bp_pca"] = bool(bp_pca)
+    if bp_heatmap is not None: plot_cfg["bp_heatmap"] = bool(bp_heatmap)
+    if sample_cor is not None: plot_cfg["sample_cor"] = bool(sample_cor)
+    if dispersion is not None: plot_cfg["dispersion"] = bool(dispersion)
+    if top_n is not None: plot_cfg["top_n"] = int(top_n)
+
+    p = _cfg_update("plot", plot_cfg)
     click.secho(f"Saved plot settings to {p}", fg="green")
 
-@cli.command("report", cls=HulkCommand, help="Regenerate (or generate snapshots while hulk is running) plots and matrices using saved settings.")
+    print("\nCurrent Plot Configuration:")
+    print(f"  Global PCA:     {plot_cfg.get('global_pca', True)}")
+    print(f"  Global Heatmap: {plot_cfg.get('global_heatmap', True)}")
+    print(f"  Global Var HM:  {plot_cfg.get('global_var_heatmap', True)}")
+    print(f"  Sample Cor:     {plot_cfg.get('sample_cor', True)}")
+    print(f"  Dispersion:     {plot_cfg.get('dispersion', True)}")
+    print(f"  Top N Genes:    {plot_cfg.get('top_n', 500)}")
+    print(f"  BP PCA:         {plot_cfg.get('bp_pca', False)}")
+    print(f"  BP Heatmap:     {plot_cfg.get('bp_heatmap', False)}")
+
+
+@cli.command("seidr", cls=HulkCommand, help="Configure Seidr gene network inference settings (persisted).")
+@click.option("--enable/--disable", "enabled", default=None, show_default="True",
+              help="Enable or disable Seidr analysis in the pipeline.")
+@click.option("--preset", type=click.Choice(list(PRESETS.keys()), case_sensitive=False),
+              default=None, show_default="BALANCED",
+              help="Algorithm preset configuration.")
+@click.option("--algo", "algorithms", type=click.Choice(list(ALGO_MAP.keys()), case_sensitive=False),
+              multiple=True, help="Manually select specific algorithms (overrides preset).")
+@click.option("-b", "--backbone", type=float, default=None, show_default="1.28",
+              help="Backbone significance threshold (Fdr).")
+@click.option("-w", "--workers", type=int, default=None, show_default="2",
+              help="Number of algorithms to run in parallel.")
+@click.option("-t", "--target", "targets", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              multiple=True,
+              help="Target gene file(s) (persisted default). Pipeline falls back to main --target-genes if this is empty.")
+@click.option("--target-mode", type=click.Choice(["both", "main_only", "targeted_only"]),
+              default=None, show_default="targeted_only",
+              help="Execution scope for targeted analysis.")
+@click.option("-f", "--force/--no-force", "force_setting", default=None,
+              help="Persist a 'Force' preference. If True, Seidr always ignores cache.")
+@click.option("--reset-defaults", is_flag=True, help="Reset Seidr options to defaults.")
+def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, force_setting, reset_defaults):
+    """
+    Configure defaults for the Seidr inference step.
+    Use this to set up how networks are built when running 'hulk ...'.
+    """
+    if reset_defaults:
+        p = _cfg_reset("seidr")
+        click.secho(f"Reset Seidr options to defaults at {p}", fg="green")
+        return
+
+    current_cfg = _cfg_load()
+    seidr_cfg = current_cfg.get("seidr", {})
+
+    if enabled is not None:
+        seidr_cfg["enabled"] = enabled
+        click.secho(f"Seidr analysis {'ENABLED' if enabled else 'DISABLED'}.", fg="green" if enabled else "yellow")
+
+    if preset:
+        seidr_cfg["preset"] = preset.upper()
+        if "algorithms" in seidr_cfg: del seidr_cfg["algorithms"]
+
+    if algorithms:
+        seidr_cfg["algorithms"] = [a.upper() for a in algorithms]
+        if "preset" in seidr_cfg: del seidr_cfg["preset"]
+
+    if backbone is not None: seidr_cfg["backbone"] = backbone
+    if workers is not None: seidr_cfg["workers"] = workers
+    if target_mode: seidr_cfg["target_mode"] = target_mode
+
+    if force_setting is not None:
+        seidr_cfg["force"] = force_setting
+
+    if targets:
+        seidr_cfg["targets"] = [str(t.resolve()) for t in targets]
+
+    p = _cfg_update("seidr", seidr_cfg)
+    click.secho(f"Seidr settings saved to {p}", fg="green")
+
+    print("\nCurrent Seidr Configuration:")
+    print(f"  Enabled:      {seidr_cfg.get('enabled', True)}")
+    print(f"  Force Mode:  {seidr_cfg.get('force', False)}")
+    if "algorithms" in seidr_cfg:
+        print(f"  Algorithms:  {', '.join(seidr_cfg['algorithms'])}")
+    else:
+        print(f"  Preset:      {seidr_cfg.get('preset', 'BALANCED')}")
+    print(f"  Backbone:    {seidr_cfg.get('backbone', 1.28)}")
+    print(f"  Parallel:    {seidr_cfg.get('workers', 2)} workers")
+    saved_targets = seidr_cfg.get("targets", [])
+    if saved_targets:
+        print(f"  Default Targets: {len(saved_targets)} files")
+
+
+@cli.command("report", cls=HulkCommand,
+             help="Regenerate (or generate snapshots while hulk is running) plots and matrices using saved settings.")
 @click.option("-o", "--output", "output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
               default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
-@click.option("-g", "--gene-counts", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+@click.option("--gene-counts", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="tx2gene map (required).")
 @click.option("--target-genes", "target_genes_files", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               multiple=True, help="Target gene list(s) for targeted heatmaps/matrices.")
 @click.option("--no-bp-postprocessing", is_flag=True, help="Skip per-BioProject analysis (only run Global).")
+@click.option("--no-global-postprocessing", is_flag=True, help="Skip Global analysis (only run BioProjects).")
 @click.option("--fast", is_flag=True, help="Skip DESeq2 recalculation (Fast Mode).")
-def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, fast):
+@click.option("-f", "--force", is_flag=True, help="Force full recalculation (overwrites existing matrices).")
+def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, no_global_postprocessing, fast, force):
     """
-    Scans output directory and runs post-processing using settings defined in 'hulk plot'.
+    Standalone command to process downstream analysis reports utilizing already completed pipeline components.
     """
     click.secho("\n[Report] Scanning output directory...", fg="yellow")
 
-    # 1. LOAD PERSISTED SETTINGS (The Source of Truth)
     persisted = _cfg_load()
     plot_cfg = persisted.get("plot", {})
+    deseq_cfg = persisted.get("deseq2", {})
+    txi_cfg = persisted.get("tximport", {})
+    expr_cfg = persisted.get("expression", {})
 
-    # Load defaults from JSON, fallback to False if missing
-    # This forces the user to use 'hulk plot' to set these up.
+    if force:
+        plots_only = False
+    else:
+        plots_only = fast
+
     cfg = Config(
         outdir=output_dir,
         tx2gene=tx2gene_path,
         target_genes_files=list(target_genes_files) if target_genes_files else None,
-        plots_only_mode=fast,
-
-        # Load directly from persistence
-        plot_pca=plot_cfg.get("global_pca", True),  # Default True if never set
+        plots_only_mode=plots_only,
+        no_bp_postprocessing=no_bp_postprocessing,
+        no_global_postprocessing=no_global_postprocessing,
+        plot_pca=plot_cfg.get("global_pca", True),
         plot_heatmap=plot_cfg.get("global_heatmap", True),
         plot_var_heatmap=plot_cfg.get("global_var_heatmap", True),
         plot_sample_cor=plot_cfg.get("sample_cor", True),
         plot_dispersion=plot_cfg.get("dispersion", True),
-        top_n_vars=plot_cfg.get("top_n", 500)
+        top_n_vars=plot_cfg.get("top_n", 500),
+        tximport_mode=txi_cfg.get("mode", "length_scaled_tpm"),
+        tximport_ignore_tx_version=txi_cfg.get("ignore_tx_version", False),
+        tximport_only_mode=txi_cfg.get("tximport_only", False)
     )
 
-    # Fallback for tx2gene lookup
+    cfg.deseq2_var_threshold = float(deseq_cfg.get("var_threshold", 0.1))
+    cfg.deseq2_vst_enabled = bool(deseq_cfg.get("vst", True))
+    cfg.expr_use_matrix = expr_cfg.get("use_matrix", "vst")
+    cfg.drop_nonvarying_genes = bool(expr_cfg.get("drop_nonvarying", True))
+
     if not cfg.tx2gene:
         saved_tx = persisted.get("general", {}).get("tx2gene")
         if saved_tx:
             cfg.tx2gene = Path(saved_tx).resolve()
 
     if not cfg.tx2gene:
-        click.secho("Error: tx2gene path is missing. Provide it with -g/--gene-counts.", fg="red")
+        click.secho("Error: tx2gene path is missing. Provide it with --gene-counts.", fg="red")
         return
 
     try:
-        # 3. Reconstruct Dataset
         dataset = Dataset.reconstruct_from_output(cfg)
 
         click.secho(f"[Report] Found {len(dataset)} samples across {len(dataset.bioprojects)} BioProjects.", fg="green")
@@ -750,16 +1020,26 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, f
 
         if no_bp_postprocessing:
             click.secho("[Report] Skipping per-BioProject analysis (--no-bp-postprocessing).", fg="cyan")
+        if no_global_postprocessing:
+            click.secho("[Report] Skipping Global analysis (--no-global-postprocessing).", fg="cyan")
 
-        if fast:
+        if force:
+            click.secho("[Report] FORCE ENABLED: Recalculating everything (overwriting old files)...", fg="magenta",
+                        bold=True)
+        elif plots_only:
             click.secho("[Report] Fast mode: Using existing VST matrix (plots only).", fg="yellow")
         else:
             click.secho("[Report] Recalculating expression matrices (this may take a moment)...", fg="magenta")
 
-        # 4. Run Post-Processing
-        run_postprocessing(dataset, cfg, skip_bp=no_bp_postprocessing)
+        generate_read_metrics_plot(dataset, cfg.shared / "plots", cfg.log)
+        run_postprocessing(
+            dataset,
+            cfg,
+            skip_bp=no_bp_postprocessing,
+            skip_global=no_global_postprocessing
+        )
 
-        click.secho("\n[Report] Done. Check output/shared/plots for results.", fg="green")
+        click.secho("\n[Report] Done. Check output/shared/plots.", fg="green")
 
     except FileNotFoundError as e:
         click.secho(f"[Error] {e}", fg="red")
@@ -767,7 +1047,132 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, f
         click.secho(f"[Error] Unexpected failure: {e}", fg="red")
 
 
+@cli.command("saturation", cls=HulkCommand,
+             help="Run data saturation analysis: Subsampling -> Seidr -> EGAD (AUROC/AUPR).")
+@click.option("-o", "--output", "output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
+              default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
+@click.option("-i", "--iterations", type=int, default=3, show_default=True,
+              help="Number of random subsampling iterations per step.")
+@click.option("-s", "--steps", type=int, default=10, show_default=True,
+              help="Number of BioProject steps in the saturation curve.")
+@click.option("--seidr-preset", type=click.Choice(list(PRESETS.keys()), case_sensitive=False),
+              default="FAST", show_default=True,
+              help="Seidr consensus algorithm preset.")
+@click.option("--seed", type=int, default=None, help="Random seed for reproducibility.")
+@click.option("-w", "--workers", type=int, default=4, show_default=True,
+              help="Number of concurrent jobs.")
+@click.option("-t", "--threads", type=int, default=None,
+              help="Total max threads allowed (overrides config).")
+@click.option("-f", "--force", is_flag=True, help="Force re-calculation of batches/networks.")
+@click.option("-m", "--mapman", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="MapMan annotation file for EGAD.")
+@click.option("-g", "--go-file", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="BioMart GO export file (TSV) for EGAD.")
+@click.option("--metrics", type=click.Choice(['auroc', 'aupr', 'both'], case_sensitive=False),
+              default='both', show_default=True, help="Which EGAD metrics to calculate.")
+@click.option("--plot-only", is_flag=True, help="Skip processing and only regenerate plots from existing raw results.")
+def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threads, force, mapman, go_file, metrics,
+               plot_only):
+    """
+    Executes a comprehensive data saturation check to infer correlation reliability as network subsets expand.
+    """
+    click.secho("\n[Saturation] Initializing Data Saturation Analysis...", fg="cyan", bold=True)
+    click.secho(
+        f"[Saturation] Seidr: {seidr_preset} | Steps: {steps} | Iters: {iterations} | Force: {force} | Plot Only: {plot_only} | Metrics: {metrics.upper()}",
+        fg="cyan")
+
+    if seed: click.secho(f"[Saturation] Seed: {seed}", fg="magenta")
+
+    try:
+        cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only, mapman_file=mapman, go_file=go_file)
+        cfg.seidr_preset = seidr_preset.upper()
+
+        dataset = Dataset.reconstruct_from_output(cfg)
+        click.secho(f"[Saturation] Loaded {len(dataset)} samples from {output_dir}", fg="green")
+
+    except Exception as e:
+        click.secho(f"[Error] Failed to load dataset: {e}", fg="red")
+        return
+
+    try:
+        orch = BatchOrchestrator(
+            dataset, cfg,
+            seed=seed,
+            workers=workers,
+            max_threads=threads,
+            mapman_file=mapman,
+            go_file=go_file,
+            force=force,
+            num_steps=steps,
+            metrics=metrics.lower()
+        )
+        orch.iterations = iterations
+
+        if plot_only:
+
+            raw_file = orch.base_outdir / "saturation_results_raw.tsv"
+
+            if not raw_file.exists():
+                click.secho(f"[Error] Cannot plot. Missing {raw_file}. Did you even run it completely once?", fg="red")
+                return
+
+            click.secho(f"[Saturation] Plot-only mode active. Reading {raw_file}...", fg="yellow")
+            results_dicts = pd.read_csv(raw_file, sep="\t").to_dict('records')
+            orch._generate_plots(results_dicts)
+            click.secho("\n[Saturation] Plotting complete.", fg="green")
+            return
+
+        orch.run()
+
+        click.secho("\n[Saturation] Analysis complete.", fg="green")
+
+    except KeyboardInterrupt:
+        click.secho("\n[Saturation] Interrupted by user.", fg="yellow")
+    except Exception as e:
+        click.secho(f"\n[Error] Saturation analysis failed: {e}", fg="red")
+
+
+@cli.command("evaluate", cls=HulkCommand,
+             help="Run EGAD evaluation on the main consensus network.")
+@click.option("-o", "--output", "output_dir", type=click.Path(exists=True, file_okay=False, path_type=Path),
+              default=DEFAULT_OUTDIR, show_default=True, help="Output directory to scan.")
+@click.option("-m", "--mapman", "mapman_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="MapMan annotation file for EGAD.")
+@click.option("-g", "--go-file", "go_file_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="BioMart GO export file (TSV) for EGAD.")
+@click.option("--metrics", type=click.Choice(['auroc', 'aupr', 'both'], case_sensitive=False),
+              default='both', show_default=True, help="Which EGAD metrics to calculate.")
+@click.option("-n", "--network", "custom_network", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              default=None, help="Optional custom edges .tsv table (Source, Target, weight).")
+def evaluate(output_dir, mapman_path, go_file_path, metrics, custom_network):
+    """
+    Wraps the secondary R-based EGAD execution module to evaluate generated consensus files based on external annotations.
+    """
+    from .egad import run_vocal_evaluation
+
+    click.secho("\n[Hulk] Network Evaluation", fg="magenta", bold=True)
+
+    if not mapman_path and not go_file_path:
+        click.secho("[Error] Indecision is fatal. You must provide either --mapman or --go-file.", fg="red")
+        return
+
+    try:
+        cfg = Config(outdir=output_dir, plots_only_mode=True, mapman_file=mapman_path, go_file=go_file_path)
+
+        run_vocal_evaluation(
+            cfg,
+            mapman_path=mapman_path,
+            go_file_path=go_file_path,
+            metrics=metrics.lower(),
+            custom_network=custom_network
+        )
+
+    except Exception as e:
+        click.secho(f"[Error] Evaluation failed: {e}", fg="red")
+
+
 def main():
+    """Application entry point overriding standard terminal rendering bounds."""
     os.environ.setdefault("COLUMNS", str(WIDE_HELP))
     cli(standalone_mode=True)
 

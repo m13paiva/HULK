@@ -1,0 +1,20 @@
+BINCODE	NAME	IDENTIFIER	DESCRIPTION	TYPE
+'1'	'Photosynthesis'	''	''	
+'1.1'	'Photosynthesis.photophosphorylation'	''	''	
+'1.1.1'	'Photosynthesis.photophosphorylation.photosystem II'	''	''	
+'1.1.1.1'	'Photosynthesis.photophosphorylation.photosystem II.LHC-II complex'	''	''	
+'1.1.1.1.1'	'Photosynthesis.photophosphorylation.photosystem II.LHC-II complex.component *(LHCb1/2/3)'	'os01g0600900'	'mercator4v7.0: component *(LHCb1/2/3) of LHC-II complex & original description: none'	T
+'1.1.1.1.1'	'Photosynthesis.photophosphorylation.photosystem II.LHC-II complex.component *(LHCb1/2/3)'	'os01g0720500'	'mercator4v7.0: component *(LHCb1/2/3) of LHC-II complex & original description: none'	T
+'1.1.1.1.1'	'Photosynthesis.photophosphorylation.photosystem II.LHC-II complex.component *(LHCb1/2/3)'	'os03g0592500'	'mercator4v7.0: component *(LHCb1/2/3) of LHC-II complex & original description: none'	T
+'1.1.1.1.1'	'Photosynthesis.photophosphorylation.photosystem II.LHC-II complex.component *(LHCb1/2/3)'	'os07g0562700'	'mercator4v7.0: component *(LHCb1/2/3) of LHC-II complex & original description: none'	T
+'1.1.1.1.1'	'Photosynthesis.photophosphorylation.photosystem II.LHC-II complex.component *(LHCb1/2/3)'	'os09g0346500'	'mercator4v7.0: component *(LHCb1/2/3) of LHC-II complex & original description: none'	T
+'1.1.1.1.2'	'Photosynthesis.photophosphorylation.photosystem II.LHC-II complex.component *(LHCb4)'	'os07g0558400'	'mercator4v7.0: component *(LHCb4) of LHC-II complex & original description: none'	T
+'1.1.1.1.3'	'Photosynthesis.photophosphorylation.photosystem II.LHC-II complex.component *(LHCb5)'	'os11g0242800'	'mercator4v7.0: component *(LHCb5) of LHC-II complex & original description: none'	T
+'1.1.1.1.4'	'Photosynthesis.photophosphorylation.photosystem II.LHC-II complex.component *(LHCb6)'	'os04g0457000'	'mercator4v7.0: component *(LHCb6) of LHC-II complex & original description: none'	T
+'1.1.1.1.5'	'Photosynthesis.photophosphorylation.photosystem II.LHC-II complex.component *(LHCb7)'	'os09g0296800'	'mercator4v7.0: component *(LHCb7) of LHC-II complex & original description: none'	T
+'1.1.1.1.6'	'Photosynthesis.photophosphorylation.photosystem II.LHC-II complex.component *(LHCb9)'	''	''	
+'1.1.1.2'	'Photosynthesis.photophosphorylation.photosystem II.PS-II complex'	''	''	
+'1.1.1.2.1'	'Photosynthesis.photophosphorylation.photosystem II.PS-II complex.reaction center complex'	''	''	
+'1.1.1.2.1.1'	'Photosynthesis.photophosphorylation.photosystem II.PS-II complex.reaction center complex.component *(D1/PsbA)'	''	''	
+'1.1.1.2.1.2'	'Photosynthesis.photophosphorylation.photosystem II.PS-II complex.reaction center complex.component *(D2/PsbD)'	''	''	
+'1.1.1.2.1.3'	'Photosynthesis.photophosphorylation.photosystem II.PS-II complex.reaction center complex.component *(CP47/PsbB)'	''	''	

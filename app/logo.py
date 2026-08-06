@@ -1,3 +1,6 @@
+"""
+Contains strictly aesthetic ASCII interface banners representing the standard console loading view.
+"""
 LOGO="""
                     ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠹⣿⣶⣶⣶⣶⣤⣤⣤⣤⣄⣀⣀⣀⠀⢤⣄⣀⠀                                                      
         ⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⣠⣤⣤⣤⣶⣶⣶⣶⣶⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣦⣄⣀⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀

@@ -1,108 +1,80 @@
+# core.py
 from __future__ import annotations
 
-
 import shutil
-import click
 from pathlib import Path
 from datetime import datetime
-from .utils import log
+from .utils import log, generate_read_metrics_plot
 from .align import build_transcriptome_index
 from .qc import run_multiqc_global
 from .entities import Config, Dataset
 from .orchestrator import run_download_and_process
 from .post_processing import run_postprocessing as run__postprocessing
-
+from .seidr import run_seidr
 
 def prepare_runtime_environment(cfg: Config, dataset: Dataset) -> None:
     """
-    Sets up the output directory structure and log files.
+    Prepares the file system layout, clears hazardous directories safely,
+    and initializes primary global logging interfaces.
 
-    If 'rem-missing-bps' is enabled, this function performs a targeted
-    purge of BioProject folders in the output directory that do not match
-    the current input dataset.
+    Args:
+        cfg (Config): System configuration state object.
+        dataset (Dataset): Validated dataset tracking the expected BioProject domains.
     """
-
-    # ------------------------------------------------------------------
-    # 1. The Purge (rem-missing-bps)
-    # ------------------------------------------------------------------
-    # We do this BEFORE creating new directories to ensure a clean slate,
-    # but only if the output dir actually exists.
+    # 1. Structural cleanup procedure for extraneous paths
     if cfg.rem_missing_bps and cfg.outdir.exists():
-
-        # SRA Mode check: FASTQ mode usually doesn't output BioProject folders like this.
-        if getattr(dataset, "mode", "SRA") != "SRA":
-            log("[WARNING] --rem-missing-bps ignored: Only applicable in SRA mode.", None)
+        if getattr(dataset, "mode", "SRR") != "SRR":
+            print("[WARNING] --rem-missing-bps ignored: Only applicable in SRA mode.")
         else:
-            expected_bps = set(getattr(dataset, "bioprojects", []))
+            raw_bps = getattr(dataset, "bioprojects", [])
+            expected_bps = {str(bp.id) for bp in raw_bps if hasattr(bp, "id")}
 
-            # SAFETY CHECK: If the input table is empty, do NOT wipe the folder.
             if not expected_bps:
-                click.secho(
-                    "\n[SAFETY ABORT] Input table contains no BioProjects. "
-                    "Skipping --rem-missing-bps to prevent total deletion of output directory.",
-                    fg="red", bold=True
-                )
+                print("\n[SAFETY ABORT] Input table empty. Skipping cleanup.")
             else:
-                click.secho(f"\n[CLEANUP] Scanning {cfg.outdir} for extraneous BioProjects...", fg="yellow")
-
-                # Folders we NEVER delete automatically
+                print(f"\n[CLEANUP] Scanning {cfg.outdir}...")
                 blacklist = {"shared", "fastq_samples", "logs", "slurm_logs", "multiqc_data"}
-
-                # List existing directories
                 existing_items = [p for p in cfg.outdir.iterdir() if p.is_dir()]
 
                 for folder in existing_items:
-                    # Skip blacklisted or MultiQC folders
                     if folder.name in blacklist or folder.name.endswith("_mqc"):
                         continue
 
                     if folder.name not in expected_bps:
-                        msg = f"[DANGER] Deleting extraneous BioProject folder: {folder.name}"
-                        click.secho(msg, fg="red", bold=True)
-
+                        print(f"[DANGER] Deleting extraneous BioProject folder: {folder.name}")
                         if not cfg.dry_run:
                             try:
                                 shutil.rmtree(folder)
                             except Exception as ex:
-                                click.secho(f"Failed to remove {folder}: {ex}", fg="red")
+                                print(f"Failed to remove {folder}: {ex}")
 
-    # ------------------------------------------------------------------
-    # 2. Standard Directory Setup (Moved from Config)
-    # ------------------------------------------------------------------
-
-    # Create Root Output
+    # 2. Base Output Structural Layout
     cfg.outdir.mkdir(parents=True, exist_ok=True)
-
-    # Clean/Create Shared Directory
-    if cfg.shared.exists() and cfg.force:
-        # If forcing, we might want to clear shared logs/cache,
-        # though usually we just want to overwrite.
-        # Kept strict cleaning as per your previous code:
-        try:
-            shutil.rmtree(cfg.shared)
-        except Exception as e:
-            click.secho(f"Warning: Could not clear shared dir: {e}", fg="yellow")
-
     cfg.shared.mkdir(parents=True, exist_ok=True)
-
-    # Clean/Create Cache Directory
-    if cfg.cache.exists() and cfg.force:
-        try:
-            shutil.rmtree(cfg.cache)
-        except Exception:
-            pass
     cfg.cache.mkdir(parents=True, exist_ok=True)
 
-    # Initialize Log
-    # We do this last to ensure the 'shared' dir exists
+    # 3. Log System Initialization
     if not cfg.dry_run:
-        with open(cfg.log, "w", encoding="utf-8") as f:
-            f.write(f"\n===== HULK start {datetime.now().isoformat()} =====\n")
+        mode = 'a'
+        with open(cfg.log, mode, encoding="utf-8") as f:
+            f.write(f"\n\n{'=' * 60}\n")
+            f.write(f"===== HULK start {datetime.now().isoformat()} =====\n")
+            if cfg.force:
+                f.write("!! Run mode: FORCE (Overwriting sample data) !!\n")
             if cfg.rem_missing_bps:
-                f.write("!! WARNING: Run started with --rem-missing-bps (Destructive Mode) !!\n")
+                f.write("!! Run mode: REM_MISSING_BPS (Destructive Cleanup) !!\n")
+            f.write(f"{'=' * 60}\n")
+
 
 def pipeline(data: "Dataset", cfg: "Config") -> None:
+    """
+    Executes the central processing sequence of the application, managing orchestrator bounds
+    and firing global aggregation endpoints post execution.
 
+    Args:
+        data (Dataset): Context dataset loaded into memory.
+        cfg (Config): Running configuration variables.
+    """
     prepare_runtime_environment(cfg,data)
     data.update_status()
     outdir: Path = cfg.outdir
@@ -110,12 +82,10 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     cache_dir: Path = cfg.cache
     log_path: Path = cfg.log
     reference: Path = cfg.reference_path
-    tximport_opts = getattr(cfg, "tximport_opts", {})
 
     temp_dir: Path = getattr(cfg, "temp_dir", shared / "tmp")
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Basic header
     log(f"Output directory: {outdir}", log_path)
     log(f"Mode: {getattr(data, 'mode', '-')}", log_path)
 
@@ -129,7 +99,7 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         bp_ids = [bp.id for bp in getattr(data, "bioprojects", [])]
         log(f"BioProjects ({bp_total}, done {bp_done}): {', '.join(sorted(bp_ids))}", log_path)
 
-    # Build / locate kallisto index
+    # Execute reference indexing if source is standard FASTA
     if reference and reference.suffix.lower() != ".idx":
         transcripts_index = build_transcriptome_index(reference, shared, log_path)
     else:
@@ -138,7 +108,6 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     transcripts_index = Path(transcripts_index).resolve()
     log(f"Using index: {transcripts_index}", log_path)
 
-    # Inject index path into sample metadata
     if getattr(data, "mode", None) == "FASTQ":
         samples_iter = getattr(data, "samples", [])
     else:
@@ -147,7 +116,6 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     for s in samples_iter:
         s.metadata.setdefault("kallisto_index", str(transcripts_index))
 
-    # Log per-project plan
     if getattr(data, "mode", None) == "SRR":
         for bp in getattr(data, "bioprojects", []):
             log(f"[PLAN] BioProject {bp.id}: {len(bp.samples)} SRR(s) scheduled.", log_path)
@@ -155,7 +123,7 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         for s in getattr(data, "samples", []):
             log(f"[PLAN] FASTQ sample {s.id} -> {s.outdir}", log_path)
 
-    # Run orchestrator (prefetch + processing) — uses cfg internally (incl. bootstraps)
+    # Delegate sequence to parallel processing manager
     run_download_and_process(
         dataset=data,
         cfg=cfg,
@@ -165,16 +133,28 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         log_path=log_path,
     )
 
-    # Global MultiQC
-    run_multiqc_global(outdir, shared, "multiqc_shared", log_path, modules=("kallisto", "fastp"))
+    # Finalize MultiQC summarization
+    if not cfg.no_global_postprocessing:
+        try:
+            log("Generating Global MultiQC report...", log_path)
+            run_multiqc_global(outdir, shared, "multiqc_shared", log_path, modules=("kallisto", "fastp"))
+            generate_read_metrics_plot(data,cfg.shared / "plots", cfg.log)
+        except Exception as e:
+            print(f"Global MultiQC failed: {e}")
+    else:
+        log("Skipping Global MultiQC (--no-global-postprocessing).", log_path)
 
-    # Post-processing (R-based: tximport + DESeq2/VST + plots/exports)
+    # Invoke R dependency chains
     if getattr(cfg, "tx2gene", None) is not None:
-        # This will respect cfg.deseq2_vst_enabled and the plot flags.
-        # If DESeq2 is disabled, it will automatically fall back to tximport-only.
         run__postprocessing(data, cfg, skip_bp=True)
 
-    # Warnings, if any
+    try:
+        run_seidr(cfg)
+    except Exception as e:
+        print(f"[Seidr] Network pipeline failed: {e}")
+
+    log("Pipeline finished.", log_path)
+
     if getattr(cfg, "error_warnings", None):
         log("\n\n=================== WARNINGS ===================\n", log_path)
         for m in cfg.error_warnings:

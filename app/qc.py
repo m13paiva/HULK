@@ -10,18 +10,17 @@ from typing import List, Optional, TYPE_CHECKING
 
 import pandas as pd
 
-from .utils import log, log_err, run_cmd
+from .utils import log, run_cmd
 
 if TYPE_CHECKING:
     from .entities import Config, BioProject, Sample, Dataset
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _safe_link_or_copy(src: Path, dst: Path, log_path: Path) -> None:
-    """Hard-link if possible; fall back to symlink/copy. Always logs action."""
+    """
+    Attempts to structurally hard-link internal file resources to bypass duplication memory drains,
+    cascading to symmetric copies natively handling standard OS exceptions cleanly.
+    """
     try:
         if dst.exists() or dst.is_symlink():
             dst.unlink()
@@ -44,30 +43,23 @@ def _safe_link_or_copy(src: Path, dst: Path, log_path: Path) -> None:
             )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MultiQC preparation (sanitized inputs so sample IDs are clean)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def prepare_mqc_inputs_for_bp(
     bp: "BioProject",
     cfg: "Config",
 ) -> Optional[Path]:
     """
-    Create <bp.path>/_mqc_inputs/<RUN> with:
-      - run_info.json
-      - abundance.tsv (and abundance.h5 if present)
-      - <RUN>.fastp.json
-      - kallisto log: per-sample log at Sample.log_path
+    Generates a localized parsing structure directory required to bypass standard MultiQC identifier
+    truncation failures. Isolates and links target operational artifact metrics explicitly.
 
-    Returns the path, or None if nothing was prepared.
+    Args:
+        bp (BioProject): Associated parent structure object holding raw records.
+        cfg (Config): Running profile rules parameter sets.
 
-    Uses only the objects:
-      • bp.path, bp.samples
-      • s.outdir, s.id, s.log_path
+    Returns:
+        Optional[Path]: Temporary link root directory path handling target dependencies or None on hard failure.
     """
     bioproject_dir = bp.path.resolve()
     log_path = bp.log_path
-    error_warnings = cfg.error_warnings
 
     tmp_root = bioproject_dir / "_mqc_inputs"
 
@@ -78,15 +70,12 @@ def prepare_mqc_inputs_for_bp(
     n_fastp = 0
     n_kallisto = 0
 
-    # Each Sample in this BioProject is one SRR run
     for s in sorted(bp.samples, key=lambda x: x.id):
         run_id = s.id
         run_dir = s.outdir
         dst = tmp_root / run_id
         dst.mkdir(parents=True, exist_ok=True)
 
-        # ------------------ fastp json ------------------
-        # Prefer <RUN>.fastp.json; otherwise first *.fastp.json
         fjson = run_dir / "fastp.json"
         if not fjson.exists():
             hits = list(run_dir.glob("*fastp.json"))
@@ -96,55 +85,35 @@ def prepare_mqc_inputs_for_bp(
             _safe_link_or_copy(fjson, dst / str(f"{run_id}.{fjson.name}"), log_path)
             n_fastp += 1
         else:
-            log_err(
-                error_warnings,
-                log_path,
-                f"[{run_id}] Missing fastp JSON; fastp totals may be absent in MultiQC",
-            )
+            print(f"[{run_id}] Missing fastp JSON; fastp totals may be absent in MultiQC")
 
-        # ------------------ kallisto artifacts ------------------
         have_k = False
 
-        # run_info.json
         runinfo = run_dir / "run_info.json"
         if runinfo.exists():
             _safe_link_or_copy(runinfo, dst / "run_info.json", log_path)
             have_k = True
 
-        # abundance.{tsv,h5}
         for name in ("abundance.tsv", "abundance.h5"):
             src = run_dir / name
             if src.exists():
                 _safe_link_or_copy(src, dst / name, log_path)
                 have_k = True
 
-        # kallisto log: **only** the per-sample log
-        klog_path = s.log_path  # <run_dir>/<run_id>_log.txt
+        klog_path = s.log_path
         if klog_path.exists():
             _safe_link_or_copy(klog_path, dst / klog_path.name, log_path)
             have_k = True
         else:
-            log_err(
-                error_warnings,
-                log_path,
-                f"[{run_id}] Missing per-sample kallisto log: {klog_path.name}",
-            )
+            print(f"[{run_id}] Missing per-sample kallisto log: {klog_path.name}")
 
         if have_k:
             n_kallisto += 1
         else:
-            log_err(
-                error_warnings,
-                log_path,
-                f"[{run_id}] Missing kallisto run_info.json and abundance file",
-            )
+            print(f"[{run_id}] Missing kallisto run_info.json and abundance file")
 
     if (n_fastp + n_kallisto) == 0:
-        log_err(
-            error_warnings,
-            log_path,
-            f"[MultiQC sanitize] No inputs prepared in {bioproject_dir}",
-        )
+        print(f"[MultiQC sanitize] No inputs prepared in {bioproject_dir}")
         shutil.rmtree(tmp_root, ignore_errors=True)
         return None
 
@@ -156,24 +125,24 @@ def prepare_mqc_inputs_for_bp(
     return tmp_root
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MultiQC-derived read metrics (strict with fallback)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def build_bp_metrics(
     bp: "BioProject",
     cfg: "Config",
     out_tsv: Optional[Path] = None,
 ) -> pd.DataFrame:
     """
-    Build a per-SRR table for this BioProject:
-        Sample, total_reads, high_quality_reads, pseudoaligned_reads
+    Extracts and normalizes discrete alignment matrix components across all runs generated under
+    a specified bioproject block, emitting structured TSV files.
 
-    Behaviour matches the original function; only the interface changed to
-    use BioProject + Config instead of raw paths.
+    Args:
+        bp (BioProject): BioProject scope parameter.
+        cfg (Config): Configuration logic variables.
+        out_tsv (Optional[Path], optional): Forced explicit output location override.
+
+    Returns:
+        pd.DataFrame: Merged pandas dataframe representation tracking read totals mapped effectively.
     """
     log_path = bp.log_path
-    error_warnings = cfg.error_warnings
 
     def _log(msg: str) -> None:
         try:
@@ -183,7 +152,7 @@ def build_bp_metrics(
 
     def _log_err(msg: str) -> None:
         try:
-            log_err(error_warnings, log_path, msg)
+            print(msg)
         except Exception:
             pass
 
@@ -204,7 +173,6 @@ def build_bp_metrics(
     mqc_dir = bioproject_dir / f"multiqc_{bp_id}_data"
     fastp_path = mqc_dir / "multiqc_fastp.txt"
 
-    # ---------- FASTP ----------
     if not fastp_path.exists():
         _log_err(f"[{bp_id}] Missing MultiQC fastp file: {fastp_path}")
         return pd.DataFrame(
@@ -213,21 +181,14 @@ def build_bp_metrics(
 
     try:
         fastp = pd.read_csv(fastp_path, sep="\t", comment="#")
-        # First column is the MultiQC sample id
         fastp = fastp.rename(columns={fastp.columns[0]: "Sample"})
         if "summary" not in fastp.columns:
             raise ValueError("'summary' column missing in MultiQC fastp table")
 
-        # Keep only rows that actually have fastp payload (avoid stray *_1 lines)
         fastp = fastp[fastp["summary"].notna()].copy()
-
-        # Normalize names to SRR########
         fastp["Sample"] = fastp["Sample"].astype(str).map(_srr)
-
-        # Deduplicate after normalization
         fastp = fastp.drop_duplicates(subset=["Sample"], keep="first")
 
-        # Extract totals from the 'summary' dict (stringified JSON or Python dict)
         def _parse_summary(cell):
             if isinstance(cell, dict):
                 d = cell
@@ -252,9 +213,7 @@ def build_bp_metrics(
             columns=["Sample", "total_reads", "high_quality_reads", "pseudoaligned_reads"]
         )
 
-    # ---------- KALLISTO from run_info.json ONLY ----------
     def _harvest_runinfo(root: Path) -> List[tuple[str, int, int]]:
-        # returns (Sample, n_pseudoaligned, n_processed)
         rows: List[tuple[str, int, int]] = []
         if not root.exists():
             return rows
@@ -276,8 +235,8 @@ def build_bp_metrics(
         return rows
 
     rows: List[tuple[str, int, int]] = []
-    rows += _harvest_runinfo(bioproject_dir / "_mqc_inputs")  # sanitized inputs
-    rows += _harvest_runinfo(bioproject_dir)                  # raw SRR dirs (fallback)
+    rows += _harvest_runinfo(bioproject_dir / "_mqc_inputs")
+    rows += _harvest_runinfo(bioproject_dir)
 
     if rows:
         k_df = pd.DataFrame(rows, columns=["Sample", "pseudoaligned_reads", "_n_processed"])
@@ -286,7 +245,6 @@ def build_bp_metrics(
     else:
         k_df = pd.DataFrame(columns=["Sample", "pseudoaligned_reads", "_n_processed"])
 
-    # ---------- MERGE ----------
     try:
         out = (
             pd.merge(f_sel, k_df, on="Sample", how="left")
@@ -299,20 +257,17 @@ def build_bp_metrics(
             columns=["Sample", "total_reads", "high_quality_reads", "pseudoaligned_reads"]
         )
 
-    # ---------- ADJUST COUNTS TO FRAGMENTS WHEN DEFINITELY PAIRED ----------
     try:
         tr = out["total_reads"].astype("Int64")
         hq = out["high_quality_reads"].astype("Int64")
         np_ = out["_n_processed"].astype("Int64")
 
-        # Vectorized paired/single detection – same logic as before
         paired_mask = (
             hq.notna()
             & np_.notna()
             & (abs(hq - (2 * np_)) <= (0.05 * (2 * np_.astype("float")))).fillna(False)
         )
 
-        # Halve fastp counts only for confidently paired rows
         idx = paired_mask[paired_mask].index
         if len(idx) > 0:
             out.loc[idx, "total_reads"] = (
@@ -324,16 +279,13 @@ def build_bp_metrics(
     except Exception as e:
         _log_err(f"[{bp_id}] Failed while adjusting paired-end counts: {e}")
 
-    # Drop helper (kallisto processed) before writing
     if "_n_processed" in out.columns:
         out = out.drop(columns=["_n_processed"])
 
-    # Ensure dtypes are Int64
     for col in ("total_reads", "high_quality_reads", "pseudoaligned_reads"):
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
 
-    # ---------- WRITE ----------
     if out_tsv is None:
         out_tsv = bioproject_dir / "read_metrics.tsv"
     try:
@@ -346,31 +298,29 @@ def build_bp_metrics(
     return out
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-BioProject MultiQC (sanitized, using _mqc_inputs)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def run_multiqc(
     bp: "BioProject",
     cfg: "Config",
     modules=("kallisto", "fastp"),
 ) -> Optional[Path]:
     """
-    Per-BioProject MultiQC runner.
+    Subprocess hook generating a structural MultiQC evaluation sequence resolving localized targets.
 
-    This is the old `run_multiqc_sanitized_bp`, but now driven by objects:
-      • `bp` (BioProject with samples)
-      • `cfg` (Config with log + error_warnings)
+    Args:
+        bp (BioProject): Target boundary specification block.
+        cfg (Config): Running parameters logic rules.
+        modules (tuple, optional): Required parsing subsets defining the QC array string. Defaults to ("kallisto", "fastp").
+
+    Returns:
+        Optional[Path]: Reference location pointing to finalized output matrix tables if successful.
     """
     log_path = bp.log_path
-    error_warnings = cfg.error_warnings
 
     bioproject_dir = bp.path.resolve()
     inputs_root = prepare_mqc_inputs_for_bp(bp, cfg)
     if inputs_root is None:
         return None
 
-    # Pick SRR dirs that contain run_info.json and abundance.tsv
     sra_dirs = []
     missing_msgs = []
     for d in sorted(p for p in inputs_root.iterdir() if p.is_dir()):
@@ -387,9 +337,7 @@ def run_multiqc(
             missing_msgs.append(f"{d.name}: missing {', '.join(reasons)}")
 
     if not sra_dirs:
-        log_err(
-            error_warnings,
-            log_path,
+        print(
             "[MultiQC sanitize] No complete SRR dirs under "
             f"{inputs_root}.\n"
             + ("\n".join(missing_msgs) if missing_msgs else ""),
@@ -404,7 +352,7 @@ def run_multiqc(
     report_name = f"multiqc_{bioproject_dir.name}"
     cmd = [
         "multiqc",
-        *map(str, sra_dirs),          # pass directories, not individual files
+        *map(str, sra_dirs),
         "-o",
         str(bioproject_dir),
         "-n",
@@ -415,25 +363,20 @@ def run_multiqc(
         "--ignore",
         "*/multiqc_*",
         "--ignore",
-        "*.h5",                       # stop kallisto module from touching HDF5
+        "*.h5",
         "-v",
     ]
     for m in modules:
         cmd += ["-m", m]
 
-    # Run from _mqc_inputs (not strictly required, but keeps paths short)
     run_cmd(cmd, cwd=inputs_root, log_path=log_path)
 
     out = bioproject_dir / f"{report_name}_data"
     if not out.exists():
-        log_err(error_warnings, log_path, f"[MultiQC] Expected data dir not found: {out}")
+        print(f"[MultiQC] Expected data dir not found: {out}")
         return None
     return out
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Global / generic MultiQC runner (for shared/global report)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def run_multiqc_global(
     in_dir: Path,
@@ -443,10 +386,14 @@ def run_multiqc_global(
     modules=("kallisto", "fastp"),
 ) -> None:
     """
-    Generic MultiQC runner for global/shared reports.
+    Subprocess hook generating a structural MultiQC evaluation sequence resolving top-level targets.
 
-    This keeps the old API so the top-level pipeline can still call it
-    path-based for the global MultiQC.
+    Args:
+        in_dir (Path): Origin reference pointing to the top level root folder parsing execution parameters.
+        out_dir (Path): Output directory array variable specifying export mapping.
+        report_name (str): Label defining resulting export matrices explicitly.
+        log_path (Path): Logging routing structure tracking output.
+        modules (tuple, optional): Required parsing subsets defining the QC array string. Defaults to ("kallisto", "fastp").
     """
     in_dir = Path(in_dir).resolve()
     out_dir = Path(out_dir)

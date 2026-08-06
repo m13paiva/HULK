@@ -1,0 +1,20 @@
+Gene stable ID	GO term accession	GO term name	GO domain
+Os02g0788600			
+Os06g0238000	GO:0016567	protein ubiquitination	biological_process
+Os06g0238000	GO:0004842	ubiquitin-protein transferase activity	molecular_function
+Os08g0549900			
+Os05g0163700	GO:0016491	oxidoreductase activity	molecular_function
+Os05g0163700	GO:0050660	flavin adenine dinucleotide binding	molecular_function
+Os05g0163700	GO:0005777	peroxisome	cellular_component
+Os05g0163700	GO:0006635	fatty acid beta-oxidation	biological_process
+Os05g0163700	GO:0003995	acyl-CoA dehydrogenase activity	molecular_function
+Os03g0602600	GO:0016301	kinase activity	molecular_function
+Os03g0602600	GO:0009658	chloroplast organization	biological_process
+Os03g0602600	GO:0042793	plastid transcription	biological_process
+Os03g0602600	GO:0042644		
+Os03g0602600	GO:0009662		
+Os02g0737200			
+Os11g0131100			
+Os02g0779000			
+Os05g0386000			
+Os05g0386000			

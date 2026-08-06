@@ -1,17 +1,27 @@
 from __future__ import annotations
 import subprocess
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Any, Optional, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .entities import Config, Dataset
-from .utils import log, log_err
+from .utils import log
 
 R_SCRIPT_PATH = Path(__file__).with_name("post_processing.R")
 
 
 def _map_counts_from_abundance(mode: str | None) -> str:
+    """
+    Maps the specified quantification mode to its corresponding tximport parameter string.
+
+    Args:
+        mode (str | None): The quantification mode (e.g., 'length_scaled_tpm').
+
+    Returns:
+        str: The mapped string recognized by the tximport R package. Defaults to "no".
+    """
     if mode == "length_scaled_tpm":
         return "lengthScaledTPM"
     elif mode == "scaled_tpm":
@@ -23,7 +33,18 @@ def _map_counts_from_abundance(mode: str | None) -> str:
 
 def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) -> List[str]:
     """
-    Build BASE argument list for a *global* run.
+    Constructs the base argument list for a global execution of the post-processing R script.
+
+    Args:
+        cfg (Config): The configuration object containing runtime parameters.
+        out_dir (Path): The designated output directory for the global run.
+        mode (str | None): The operational mode (e.g., "SRR" or "FASTQ").
+
+    Raises:
+        ValueError: If the `tx2gene` mapping file is missing from the configuration.
+
+    Returns:
+        List[str]: A list of command-line arguments formatted for subprocess execution.
     """
     if cfg.tx2gene is None:
         raise ValueError("tx2gene is required for post-processing but cfg.tx2gene is None.")
@@ -69,13 +90,10 @@ def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) ->
     if (not deseq2_enabled) or txi_only_mode:
         args.append("--tximport-only")
 
-    # --- CRITICAL FIX ---
-    # Dispersion plot MUST be generated during Phase 1 (Compute) because it needs the DESeq2 object.
-    # It cannot be generated in Phase 2 (Plots Only) which only uses the VST matrix.
     if getattr(cfg, "plot_dispersion", False):
         args.append("--dispersion")
 
-    # Always force update in global mode (Phase 1).
+    # Enforce forced re-computation of tximport structures in global aggregation context.
     args.append("--force-txi")
 
     return args
@@ -83,7 +101,16 @@ def _build_r_args_global(cfg: Config, out_dir: Path, mode: str | None = None) ->
 
 def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[str], bool]:
     """
-    Build argument list for a *per-BioProject* run.
+    Constructs the argument list for a per-BioProject execution of the post-processing R script.
+
+    Args:
+        bp_id (str): The specific BioProject identifier.
+        cfg (Config): The configuration object containing runtime parameters.
+        out_dir (Path): The designated output directory for the isolated run.
+
+    Returns:
+        tuple[List[str], bool]: A tuple containing the argument list and a boolean flag
+        indicating whether the execution is operating in tximport-only mode.
     """
     counts_from_abundance = _map_counts_from_abundance(getattr(cfg, "tximport_mode", None))
     args: List[str] = [
@@ -129,7 +156,6 @@ def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[s
         args.append("--tximport-only")
         return args, True
 
-    # Re-add plot flags for BP
     if deseq2_enabled:
         if getattr(cfg, "plot_pca", False): args.append("--pca")
         if getattr(cfg, "plot_heatmap", False): args.append("--heatmap")
@@ -140,8 +166,22 @@ def _build_r_args_for_bp(bp_id: str, cfg: Config, out_dir: Path) -> tuple[List[s
     return args, False
 
 
-def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) -> None:
-    log_path = bp.log_path
+def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) -> Path | None:
+    """
+    Executes post-processing logic for a single, isolated BioProject block.
+
+    Args:
+        bp (Any): A BioProject instance or generic namespace mapping.
+        cfg (Config): Runtime configuration.
+        r_script (Path | None): Explicit override path to the R script.
+
+    Returns:
+        Path | None: The path to the generated plots directory if successful, otherwise None.
+    """
+    log_path = cfg.log
+    if hasattr(bp, 'log_path'):
+        log_path = bp.log_path
+
     out_dir = bp.path / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -152,127 +192,147 @@ def run_postprocessing_bp(bp: Any, cfg: Config, r_script: Path | None = None) ->
             fh.write(f"\n[post-processing] {bp.id} command:\n  {' '.join(args)}\n\n")
             fh.flush()
             subprocess.run(args, stdout=fh, stderr=fh, text=True, check=False)
+        return out_dir
     except Exception:
-        pass
+        return None
 
 
-def run_postprocessing(dataset: Dataset, cfg: Config, *, r_script: Path | None = None, skip_bp: bool = False) -> None:
+def run_postprocessing(
+        dataset: Dataset,
+        cfg: Config,
+        *,
+        r_script: Path | None = None,
+        skip_bp: bool | None = None,
+        skip_global: bool | None = None
+) -> None:
+    """
+    Manages the overarching execution schedule for all post-processing analytics,
+    distinguishing between global summaries and distinct BioProject reports.
+
+    Args:
+        dataset (Dataset): Loaded dataset tracking the execution context.
+        cfg (Config): Configuration profile tracking active analytics flags.
+        r_script (Path | None): Override script location.
+        skip_bp (bool | None): Override boolean blocking per-project computations.
+        skip_global (bool | None): Override boolean blocking global computations.
+    """
     log_path = cfg.log
-    error_warnings: List[str] = cfg.error_warnings
+
+    do_global = not (skip_global if skip_global is not None else cfg.no_global_postprocessing)
+    do_bp = not (skip_bp if skip_bp is not None else cfg.no_bp_postprocessing)
 
     if cfg.tx2gene is None:
-        log_err(error_warnings, log_path, "[post-processing] tx2gene not provided; skipping.")
+        print("[post-processing] tx2gene not provided; skipping.")
         return
 
     script_path = Path(r_script) if r_script is not None else R_SCRIPT_PATH
     if not script_path.exists():
-        log_err(error_warnings, log_path, f"[post-processing] R script not found at {script_path}.")
+        print(f"[post-processing] R script not found at {script_path}.")
         return
 
-    # ------------------------------------------------------------------
-    # 1. Global Analysis
-    # ------------------------------------------------------------------
-    out_dir = cfg.shared
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # ─────────────────────────────────────────────────────────────────────────────
+    # 1. Global Analysis Phase
+    # ─────────────────────────────────────────────────────────────────────────────
+    if do_global:
+        out_dir = cfg.shared
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        r_mode = getattr(dataset, "mode", None)
-        base_args = _build_r_args_global(cfg, out_dir, mode=r_mode)
-    except Exception as e:
-        log_err(error_warnings, log_path, f"[post-processing] Failed to build command: {e}")
-        return
-
-    base_args[1] = str(script_path)
-
-    # Determine Active Plots for Phase 2
-    active_plots = []
-    if getattr(cfg, "plot_pca", False): active_plots.append("--pca")
-    if getattr(cfg, "plot_heatmap", False): active_plots.append("--heatmap")
-    if getattr(cfg, "plot_var_heatmap", False): active_plots.append("--var-heatmap")
-    if getattr(cfg, "plot_sample_cor", False): active_plots.append("--sample-cor")
-
-    # NOTE: Dispersion is handled in Phase 1 (Compute), so we do NOT add it here.
-
-    # --- PHASE 1: COMPUTATION (Single Threaded, High RAM) ---
-    skip_compute = getattr(cfg, "plots_only_mode", False)
-
-    if not skip_compute:
-        log("[post-processing] Phase 1: Calculating Expression Matrices (Global)...", log_path)
         try:
-            with open(log_path, "a", encoding="utf-8") as fh:
-                fh.write(f"\n[post-processing] Global Compute Command:\n  {' '.join(base_args)}\n\n")
-                fh.flush()
-                res = subprocess.run(base_args, stdout=fh, stderr=fh, text=True, check=False)
-            if res.returncode != 0:
-                log_err(error_warnings, log_path, f"[post-processing] Global Compute failed (code {res.returncode})")
-                return
+            r_mode = getattr(dataset, "mode", None)
+            base_args = _build_r_args_global(cfg, out_dir, mode=r_mode)
         except Exception as e:
-            log_err(error_warnings, log_path, f"[post-processing] Compute execution failed: {e}")
+            print(f"[post-processing] Failed to build command: {e}")
             return
+
+        base_args[1] = str(script_path)
+
+        active_plots = []
+        if getattr(cfg, "plot_pca", False): active_plots.append("--pca")
+        if getattr(cfg, "plot_heatmap", False): active_plots.append("--heatmap")
+        if getattr(cfg, "plot_var_heatmap", False): active_plots.append("--var-heatmap")
+        if getattr(cfg, "plot_sample_cor", False): active_plots.append("--sample-cor")
+
+        skip_compute = getattr(cfg, "plots_only_mode", False)
+
+        if not skip_compute:
+            log("[post-processing] Phase 1: Calculating Expression Matrices (Global)...", log_path)
+            try:
+                with open(log_path, "a", encoding="utf-8") as fh:
+                    fh.write(f"\n[post-processing] Global Compute Command:\n  {' '.join(base_args)}\n\n")
+                    fh.flush()
+                    res = subprocess.run(base_args, stdout=fh, stderr=fh, text=True, check=False)
+                if res.returncode != 0:
+                    print(f"[post-processing] Global Compute failed (code {res.returncode})")
+                    active_plots = []
+            except Exception as e:
+                print(f"[post-processing] Compute execution failed: {e}")
+                active_plots = []
+        else:
+            log("[post-processing] Phase 1: Skipped (Fast Mode).", log_path)
+
+        # --- Plot Generation ---
+        if active_plots:
+            SAFE_PLOT_WORKERS = 2
+            log(f"[post-processing] Phase 2: Generating {len(active_plots)} plot types (Concurrency: {SAFE_PLOT_WORKERS})...", log_path)
+
+            plot_base_args = [a for a in base_args if a not in ("--force-txi", "--dispersion")]
+            plot_base_args.append("--plots-only")
+
+            with ThreadPoolExecutor(max_workers=SAFE_PLOT_WORKERS) as executor:
+                future_to_plot = {}
+                for plot_flag in active_plots:
+                    cmd = plot_base_args + [plot_flag]
+
+                    def run_plot_job(c, name):
+                        with open(log_path, "a", encoding="utf-8") as fh:
+                            fh.write(f"\n[post-processing] Starting Plot: {name}\n")
+                            fh.flush()
+                            return subprocess.run(c, stdout=fh, stderr=fh, text=True, check=False)
+
+                    f = executor.submit(run_plot_job, cmd, plot_flag)
+                    future_to_plot[f] = plot_flag
+
+                for future in as_completed(future_to_plot):
+                    p_flag = future_to_plot[future]
+                    try:
+                        res = future.result()
+                        if res.returncode != 0:
+                            print(f"[post-processing] Plot {p_flag} failed (code {res.returncode})")
+                    except Exception as e:
+                        print(f"[post-processing] Plot {p_flag} execution error: {e}")
+
+            log("[post-processing] Global plotting finished.", log_path)
     else:
-        log("[post-processing] Phase 1: Skipped (Fast Mode).", log_path)
+        log("[post-processing] Skipping Global Analysis (--no-global-postprocessing).", log_path)
 
-    # --- PHASE 2: PLOTTING (Throttled Concurrency) ---
-    if active_plots:
-        SAFE_PLOT_WORKERS = 2
-        log(f"[post-processing] Phase 2: Generating {len(active_plots)} plot types (Concurrency: {SAFE_PLOT_WORKERS})...",
-            log_path)
-
-        # Remove --force-txi (we want to load cache), remove --dispersion (it's done), Add --plots-only
-        plot_base_args = [a for a in base_args if a not in ("--force-txi", "--dispersion")]
-        plot_base_args.append("--plots-only")
-
-        with ThreadPoolExecutor(max_workers=SAFE_PLOT_WORKERS) as executor:
-            future_to_plot = {}
-            for plot_flag in active_plots:
-                cmd = plot_base_args + [plot_flag]
-
-                def run_plot_job(c, name):
-                    with open(log_path, "a", encoding="utf-8") as fh:
-                        fh.write(f"\n[post-processing] Starting Plot: {name}\n")
-                        fh.flush()
-                        return subprocess.run(c, stdout=fh, stderr=fh, text=True, check=False)
-
-                f = executor.submit(run_plot_job, cmd, plot_flag)
-                future_to_plot[f] = plot_flag
-
-            for future in as_completed(future_to_plot):
-                p_flag = future_to_plot[future]
-                try:
-                    res = future.result()
-                    if res.returncode != 0:
-                        log_err(error_warnings, log_path,
-                                f"[post-processing] Plot {p_flag} failed (code {res.returncode})")
-                except Exception as e:
-                    log_err(error_warnings, log_path, f"[post-processing] Plot {p_flag} execution error: {e}")
-
-        log("[post-processing] Global plotting finished.", log_path)
-
-    # ------------------------------------------------------------------
-    # 3. Per-BioProject Run (Fully Concurrent)
-    # ------------------------------------------------------------------
-    if skip_bp:
-        log("[post-processing] Skipping per-BioProject analysis.", log_path)
+    # ─────────────────────────────────────────────────────────────────────────────
+    # 2. Per-BioProject Phase
+    # ─────────────────────────────────────────────────────────────────────────────
+    if not do_bp:
+        log("[post-processing] Skipping per-BioProject analysis (--no-bp-postprocessing).", log_path)
         return
 
     if not dataset.bioprojects:
         return
 
-    max_workers_bp = max(1, int(cfg.max_threads))
-    log(f"[post-processing] Starting analysis for {len(dataset.bioprojects)} BioProjects (Concurrency: {max_workers_bp})...",
-        log_path)
+    max_workers_bp = max(1, int(getattr(cfg, "max_threads", 4)))
+    log(f"[post-processing] Starting analysis for {len(dataset.bioprojects)} BioProjects (Concurrency: {max_workers_bp})...", log_path)
 
     with ThreadPoolExecutor(max_workers=max_workers_bp) as executor:
         future_to_bp = {}
-        for bp_id in dataset.bioprojects:
+        for bp_item in dataset.bioprojects:
+            bp_id_str = str(bp_item)
+            if hasattr(bp_item, "id"):
+                bp_id_str = bp_item.id
+
             bp_obj = SimpleNamespace(
-                id=bp_id,
-                path=cfg.outdir / bp_id,
-                log_path=cfg.outdir / bp_id / "log.txt"
+                id=bp_id_str,
+                path=cfg.outdir / bp_id_str,
+                log_path=cfg.outdir / bp_id_str / "log.txt"
             )
             bp_obj.path.mkdir(parents=True, exist_ok=True)
             f = executor.submit(run_postprocessing_bp, bp_obj, cfg, r_script=script_path)
-            future_to_bp[f] = bp_id
+            future_to_bp[f] = bp_id_str
 
         for future in as_completed(future_to_bp):
             try:
