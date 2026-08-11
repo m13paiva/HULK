@@ -211,7 +211,9 @@ def create_macro_boxplots(df, out_file, colors_dict):
     aupr_data = [df[(df["Annotation_Source"] == s) & (df["AUPR"].notnull())]["AUPR"].values for s in sources]
 
     if any(len(d) > 0 for d in auc_data):
-        bplot1 = ax1.boxplot(auc_data, labels=sources, patch_artist=True)
+        bplot1 = ax1.boxplot(auc_data, patch_artist=True)
+        ax1.set_xticks(np.arange(1, len(sources) + 1))
+        ax1.set_xticklabels(sources)
         for patch, src in zip(bplot1['boxes'], sources):
             patch.set_facecolor(colors_dict.get(src, "grey"))
             patch.set_alpha(0.8)
@@ -220,7 +222,9 @@ def create_macro_boxplots(df, out_file, colors_dict):
         ax1.grid(True, linestyle='--', alpha=0.6)
 
     if any(len(d) > 0 for d in aupr_data):
-        bplot2 = ax2.boxplot(aupr_data, labels=sources, patch_artist=True)
+        bplot2 = ax2.boxplot(aupr_data, patch_artist=True)
+        ax2.set_xticks(np.arange(1, len(sources) + 1))
+        ax2.set_xticklabels(sources)
         for patch, src in zip(bplot2['boxes'], sources):
             patch.set_facecolor(colors_dict.get(src, "grey"))
             patch.set_alpha(0.8)
