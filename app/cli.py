@@ -17,7 +17,7 @@ from .seidr import PRESETS, ALGO_MAP
 from .core import pipeline
 from .entities import Config, Dataset
 from .post_processing import run_postprocessing
-from .utils import transcriptome_suffixes, smash, generate_read_metrics_plot
+from .utils import transcriptome_suffixes, smash, generate_read_metrics_plot, setup_interrupt_handlers, kill_all_active_processes
 from .logo import LOGO
 from . import __version__
 
@@ -1184,8 +1184,14 @@ def evaluate(output_dir, mapman_path, go_file_path, metrics, custom_network):
 
 def main():
     """Application entry point overriding standard terminal rendering bounds."""
+    setup_interrupt_handlers()
     os.environ.setdefault("COLUMNS", str(WIDE_HELP))
-    cli(standalone_mode=True)
+    try:
+        cli(standalone_mode=True)
+    except KeyboardInterrupt:
+        click.secho("\n[HULK] Ctrl+C received. Terminating all tasks...", fg="yellow")
+        kill_all_active_processes()
+        os._exit(130)
 
 
 if __name__ == "__main__":

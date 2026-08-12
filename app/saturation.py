@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 
 from .seidr import run_seidr_batch
 from .egad import run_egad_task, get_egad_script_path
+from .utils import setup_interrupt_handlers, kill_all_active_processes
 
 if TYPE_CHECKING:
     from .entities import Dataset, Config
@@ -324,6 +325,7 @@ class BatchOrchestrator:
                     print(f"[Warn] Cannot plot target saturation for {target_name}. Missing {t_raw}.")
 
     def run(self):
+        setup_interrupt_handlers()
         state_file = self.base_outdir / "run_state.json"
         target_specs = self._get_unique_target_names(self.target_genes_files) if self.target_genes_files else []
 
@@ -491,10 +493,24 @@ class BatchOrchestrator:
             threads = max(1, self.total_thread_budget // self.workers)
             preset = getattr(self.config, "seidr_preset", "FAST")
             with tqdm(total=len(seidr_queue), initial=len(seidr_queue) - len(seidr_tasks), desc="Seidr Inf") as p_inf:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
-                    f_map = {executor.submit(run_seidr_batch, self.config, i[0], i[1], i[2], preset, threads): i for i
-                             in seidr_tasks}
-                    for f in concurrent.futures.as_completed(f_map): p_inf.update(1)
+                # Group tasks by step (n_bps) so lower steps complete sequentially
+                step_groups = {}
+                for task in seidr_tasks:
+                    # task format: (g_path, e_path, iter_dir, s_name, iter_num)
+                    step_key = task[3]  # s_name (e.g. step1, step2)
+                    step_groups.setdefault(step_key, []).append(task)
+
+                for step_name in sorted(step_groups.keys(), key=lambda x: int(x.replace('step', '')) if x.replace('step', '').isdigit() else x):
+                    group = step_groups[step_name]
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                        f_map = {executor.submit(run_seidr_batch, self.config, i[0], i[1], i[2], preset, threads): i for i in group}
+                        for f in concurrent.futures.as_completed(f_map):
+                            it = f_map[f]
+                            try:
+                                f.result()
+                            except Exception as e:
+                                print(f"[Warn] Seidr failed for {it[3]} iter {it[4]}: {e}")
+                            p_inf.update(1)
 
         final_results = []
         if self.mapman_file or self.go_file:
@@ -516,10 +532,8 @@ class BatchOrchestrator:
                                         'n_samples': self._count_samples_from_file(item["expr"]),
                                         'source': src
                                     }
-                                    if self.do_auroc and "AUC" in valid_group.columns: res_dict['auc'] = valid_group[
-                                        "AUC"].mean()
-                                    if self.do_aupr and "AUPR" in valid_group.columns: res_dict['aupr'] = valid_group[
-                                        "AUPR"].mean()
+                                    if self.do_auroc and "AUC" in valid_group.columns: res_dict['auc'] = valid_group["AUC"].mean()
+                                    if self.do_aupr and "AUPR" in valid_group.columns: res_dict['aupr'] = valid_group["AUPR"].mean()
                                     final_results.append(res_dict)
                             else:
                                 res_dict = {
@@ -528,8 +542,7 @@ class BatchOrchestrator:
                                     'source': "Legacy"
                                 }
                                 if self.do_auroc and "AUC" in df_check.columns: res_dict['auc'] = df_check["AUC"].mean()
-                                if self.do_aupr and "AUPR" in df_check.columns: res_dict['aupr'] = df_check[
-                                    "AUPR"].mean()
+                                if self.do_aupr and "AUPR" in df_check.columns: res_dict['aupr'] = df_check["AUPR"].mean()
                                 final_results.append(res_dict)
                     except Exception as e:
                         print(f"[Warn] Failed reading {item['out']}: {e}")
@@ -537,36 +550,50 @@ class BatchOrchestrator:
                     if (item["dir"] / ".seidr.done").exists():
                         egad_tasks.append(item)
 
+            if final_results:
+                self._generate_plots(final_results, outdir=self.base_outdir)
+
             if egad_tasks:
                 with tqdm(total=len(egad_queue), initial=len(egad_queue) - len(egad_tasks), desc="EGAD Eval") as p_egad:
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
-                        f_map = {
-                            executor.submit(
-                                run_egad_task, network_file=i["net"], mapman_file=self.mapman_file,
-                                go_file=self.go_file, out_file=i["out"], script_path=r_script,
-                                log_path=i["dir"] / "egad.log", curves_prefix=None,
-                                do_auroc=self.do_auroc, do_aupr=self.do_aupr
-                            ): i for i in egad_tasks
-                        }
+                    # Group tasks by n_bps to process steps sequentially and save incrementally
+                    step_egad_groups = {}
+                    for item in egad_tasks:
+                        step_egad_groups.setdefault(item["n_bps"], []).append(item)
 
-                        for f in concurrent.futures.as_completed(f_map):
-                            it = f_map[f]
-                            results_dict = f.result()
-                            if results_dict:
-                                (it["dir"] / ".egad.done").touch()
-                                for src, mets in results_dict.items():
-                                    res_dict = {
-                                        'n_bps': it['n_bps'], 'iter': it['iter'],
-                                        'n_samples': self._count_samples_from_file(it["expr"]), 'source': src
-                                    }
-                                    if self.do_auroc and mets.get('macro_auc') is not None: res_dict['auc'] = mets[
-                                        'macro_auc']
-                                    if self.do_aupr and mets.get('macro_aupr') is not None: res_dict['aupr'] = mets[
-                                        'macro_aupr']
-                                    final_results.append(res_dict)
-                            p_egad.update(1)
+                    for n_bps in sorted(step_egad_groups.keys()):
+                        group = step_egad_groups[n_bps]
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                            f_map = {
+                                executor.submit(
+                                    run_egad_task, network_file=i["net"], mapman_file=self.mapman_file,
+                                    go_file=self.go_file, out_file=i["out"], script_path=r_script,
+                                    log_path=i["dir"] / "egad.log", curves_prefix=None,
+                                    do_auroc=self.do_auroc, do_aupr=self.do_aupr
+                                ): i for i in group
+                            }
 
-            self._generate_plots(final_results, outdir=self.base_outdir)
+                            for f in concurrent.futures.as_completed(f_map):
+                                it = f_map[f]
+                                try:
+                                    results_dict = f.result()
+                                    if results_dict:
+                                        (it["dir"] / ".egad.done").touch()
+                                        for src, mets in results_dict.items():
+                                            res_dict = {
+                                                'n_bps': it['n_bps'], 'iter': it['iter'],
+                                                'n_samples': self._count_samples_from_file(it["expr"]), 'source': src
+                                            }
+                                            if self.do_auroc and mets.get('macro_auc') is not None: res_dict['auc'] = mets['macro_auc']
+                                            if self.do_aupr and mets.get('macro_aupr') is not None: res_dict['aupr'] = mets['macro_aupr']
+                                            final_results.append(res_dict)
+                                except Exception as e:
+                                    print(f"[Warn] EGAD task failed for n_bps {it['n_bps']} iter {it['iter']}: {e}")
+                                p_egad.update(1)
+
+                        # Save progress incrementally after each step
+                        if final_results:
+                            self._generate_plots(final_results, outdir=self.base_outdir)
+
             (self.base_outdir / ".saturation.done").touch()
 
         # Phase 4: Target Genes Sub-Workflows
@@ -645,35 +672,50 @@ class BatchOrchestrator:
                             if filtered_net.exists():
                                 target_egad_queue.append(item)
 
+                    if target_results:
+                        self._generate_plots(target_results, outdir=target_outdir)
+
                     if target_egad_queue:
                         with tqdm(total=len(work_definitions), initial=len(work_definitions) - len(target_egad_queue),
                                   desc=f"EGAD [{target_name}]") as p_egad:
-                            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
-                                f_map = {
-                                    executor.submit(
-                                        run_egad_task, network_file=i["net"], mapman_file=self.mapman_file,
-                                        go_file=self.go_file, out_file=i["out"], script_path=r_script,
-                                        log_path=i["dir"] / "egad.log", curves_prefix=None,
-                                        do_auroc=self.do_auroc, do_aupr=self.do_aupr
-                                    ): i for i in target_egad_queue
-                                }
+                            step_target_groups = {}
+                            for item in target_egad_queue:
+                                step_target_groups.setdefault(item["n_bps"], []).append(item)
 
-                                for f in concurrent.futures.as_completed(f_map):
-                                    it = f_map[f]
-                                    results_dict = f.result()
-                                    if results_dict:
-                                        (it["dir"] / ".egad.done").touch()
-                                        for src, mets in results_dict.items():
-                                            res_dict = {
-                                                'n_bps': it['n_bps'], 'iter': it['iter'],
-                                                'n_samples': self._count_samples_from_file(it["expr"]), 'source': src
-                                            }
-                                            if self.do_auroc and mets.get('macro_auc') is not None:
-                                                res_dict['auc'] = mets['macro_auc']
-                                            if self.do_aupr and mets.get('macro_aupr') is not None:
-                                                res_dict['aupr'] = mets['macro_aupr']
-                                            target_results.append(res_dict)
-                                    p_egad.update(1)
+                            for n_bps in sorted(step_target_groups.keys()):
+                                group = step_target_groups[n_bps]
+                                with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                                    f_map = {
+                                        executor.submit(
+                                            run_egad_task, network_file=i["net"], mapman_file=self.mapman_file,
+                                            go_file=self.go_file, out_file=i["out"], script_path=r_script,
+                                            log_path=i["dir"] / "egad.log", curves_prefix=None,
+                                            do_auroc=self.do_auroc, do_aupr=self.do_aupr
+                                        ): i for i in group
+                                    }
 
-                    self._generate_plots(target_results, outdir=target_outdir)
+                                    for f in concurrent.futures.as_completed(f_map):
+                                        it = f_map[f]
+                                        try:
+                                            results_dict = f.result()
+                                            if results_dict:
+                                                (it["dir"] / ".egad.done").touch()
+                                                for src, mets in results_dict.items():
+                                                    res_dict = {
+                                                        'n_bps': it['n_bps'], 'iter': it['iter'],
+                                                        'n_samples': self._count_samples_from_file(it["expr"]), 'source': src
+                                                    }
+                                                    if self.do_auroc and mets.get('macro_auc') is not None:
+                                                        res_dict['auc'] = mets['macro_auc']
+                                                    if self.do_aupr and mets.get('macro_aupr') is not None:
+                                                        res_dict['aupr'] = mets['macro_aupr']
+                                                    target_results.append(res_dict)
+                                        except Exception as e:
+                                            print(f"[Warn] Target EGAD task failed for [{target_name}] n_bps {it['n_bps']} iter {it['iter']}: {e}")
+                                        p_egad.update(1)
+
+                                # Save progress incrementally after each step for target
+                                if target_results:
+                                    self._generate_plots(target_results, outdir=target_outdir)
+
                     (target_outdir / ".saturation.done").touch()

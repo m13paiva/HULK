@@ -94,7 +94,7 @@ def _run_direct_quiet(cmd: List[str], cwd: Path, log_path: Path):
         f.flush()
 
         try:
-            subprocess.run(
+            run_managed_subprocess(
                 cmd,
                 cwd=str(cwd),
                 stdout=f,
@@ -182,17 +182,18 @@ def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path
     cmd = [seidr, "view", "--column-headers", str(bb_sf)]
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, env=ENV_OVERRIDES, check=True)
+        proc = run_managed_subprocess(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV_OVERRIDES, check=True)
+        res_stdout = proc.stdout or ""
     except subprocess.CalledProcessError as e:
-        print(f"[Seidr ERROR] Export failed: {e.stderr}", file=sys.stderr)
+        print(f"[Seidr ERROR] Export failed: {e}", file=sys.stderr)
         return
 
-    if not res.stdout.strip():
+    if not res_stdout.strip():
         print(f"[Warn] No edges found in {bb_sf}.")
         return
 
     try:
-        df = pd.read_csv(io.StringIO(res.stdout), sep="\t", engine="python")
+        df = pd.read_csv(io.StringIO(res_stdout), sep="\t", engine="python")
     except Exception as e:
         print(f"[Error] Failed to parse Seidr table: {e}")
         return

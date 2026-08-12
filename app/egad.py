@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple, TYPE_CHECKING, Dict, Any
+from .utils import run_managed_subprocess
 
 if TYPE_CHECKING:
     from .entities import Config
@@ -73,15 +74,15 @@ def run_egad_task(
         log.write(f"\n{'=' * 40}\n[EXEC] {' '.join(cmd)}\n")
 
     try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True
+        proc = run_managed_subprocess(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
         )
         with open(log_path, "a") as log:
-            log.write(result.stderr)
+            if proc.stderr: log.write(proc.stderr)
             log.write("[SUCCESS]\n")
     except subprocess.CalledProcessError as e:
         with open(log_path, "a") as log:
-            log.write(f"[ERROR] Output:\n{e.stderr}\n")
+            if hasattr(e, 'stderr') and e.stderr: log.write(f"[ERROR] Output:\n{e.stderr}\n")
             log.write(f"[FAILED] Exit Code: {e.returncode}\n")
         return {}
 
