@@ -33,7 +33,8 @@ class BatchOrchestrator:
                  go_file: Optional[Path] = None,
                  force: bool = False,
                  num_steps: int = 10,
-                 metrics: str = "both"):
+                 metrics: str = "both",
+                 target_genes_files: Optional[List[Path]] = None):
 
         self.dataset = dataset
         self.config = config
@@ -43,6 +44,11 @@ class BatchOrchestrator:
         self.go_file = go_file
         self.force = force
         self.num_steps = num_steps
+
+        if target_genes_files is not None:
+            self.target_genes_files = target_genes_files
+        else:
+            self.target_genes_files = getattr(self.config, "target_genes_files", []) or []
 
         self.do_auroc = metrics.lower() in ["both", "auroc"]
         self.do_aupr = metrics.lower() in ["both", "aupr"]
@@ -103,6 +109,65 @@ class BatchOrchestrator:
             current += inc
             steps.append(current)
         return sorted(list(set(steps)))
+
+    def _read_target_genes(self, target_file: Path) -> set:
+        if not target_file.exists():
+            return set()
+        genes = set()
+        with open(target_file, "r") as f:
+            for line in f:
+                line_str = line.strip()
+                if line_str and not line_str.startswith("#"):
+                    genes.add(line_str)
+        return genes
+
+    def _filter_network(self, orig_net_path: Path, target_genes: set, filtered_net_path: Path) -> bool:
+        if not orig_net_path.exists():
+            return False
+        try:
+            df = pd.read_csv(orig_net_path, sep="\t")
+            if df.empty or "Source" not in df.columns or "Target" not in df.columns:
+                filtered_net_path.parent.mkdir(parents=True, exist_ok=True)
+                df.to_csv(filtered_net_path, sep="\t", index=False)
+                return True
+
+            df["Source"] = df["Source"].astype(str)
+            df["Target"] = df["Target"].astype(str)
+
+            targets_set = set(target_genes)
+
+            source_in_targets = df["Source"].isin(targets_set)
+            target_in_targets = df["Target"].isin(targets_set)
+
+            neighbors = set(df.loc[source_in_targets, "Target"]).union(
+                set(df.loc[target_in_targets, "Source"])
+            ) - targets_set
+
+            remaining_genes = targets_set.union(neighbors)
+
+            filtered_df = df[df["Source"].isin(remaining_genes) & df["Target"].isin(remaining_genes)].copy()
+
+            filtered_net_path.parent.mkdir(parents=True, exist_ok=True)
+            filtered_df.to_csv(filtered_net_path, sep="\t", index=False)
+            return True
+        except Exception as e:
+            print(f"[Error] Failed to filter network {orig_net_path} with target genes: {e}")
+            return False
+
+    def _get_unique_target_names(self, target_files: List[Path]) -> List[tuple[Path, str]]:
+        unique_names = []
+        seen = {}
+        for tf in target_files:
+            tf_path = Path(tf).expanduser().resolve()
+            base = tf_path.stem
+            if base in seen:
+                seen[base] += 1
+                name = f"{base}_{seen[base]}"
+            else:
+                seen[base] = 0
+                name = base
+            unique_names.append((tf_path, name))
+        return unique_names
 
     def _create_1x2_saturation_plot(self, source_data_list, samp_df, show_samples, title_prefix, out_file):
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
@@ -175,13 +240,16 @@ class BatchOrchestrator:
         fig.savefig(out_file)
         plt.close(fig)
 
-    def _generate_plots(self, results: List[dict]):
+    def _generate_plots(self, results: List[dict], outdir: Optional[Path] = None):
+        if outdir is None:
+            outdir = self.base_outdir
+
         if not results:
             print("[Saturation] No results to plot.")
             return
 
         df = pd.DataFrame(results)
-        df.to_csv(self.base_outdir / "saturation_results_raw.tsv", sep="\t", index=False)
+        df.to_csv(outdir / "saturation_results_raw.tsv", sep="\t", index=False)
 
         samp_agg = df[["n_bps", "iter", "n_samples"]].drop_duplicates().groupby("n_bps").agg(
             n_samples_mean=("n_samples", "mean"),
@@ -202,7 +270,7 @@ class BatchOrchestrator:
         metric_agg.columns = ['_'.join(col).strip('_') for col in metric_agg.columns.values]
 
         summary_df = pd.merge(metric_agg, samp_agg, on="n_bps", how="left")
-        summary_df.to_csv(self.base_outdir / "saturation_results_summary.tsv", sep="\t", index=False)
+        summary_df.to_csv(outdir / "saturation_results_summary.tsv", sep="\t", index=False)
 
         colors = {"MapMan": "firebrick", "GO": "darkorange", "Legacy": "purple"}
         sources = metric_agg["source"].unique()
@@ -214,34 +282,50 @@ class BatchOrchestrator:
             for data in source_data_list:
                 src = data['src']
                 self._create_1x2_saturation_plot([data], samp_agg, False, src,
-                                                 self.base_outdir / f"{src}_no_samples.pdf")
+                                                 outdir / f"{src}_no_samples.pdf")
                 self._create_1x2_saturation_plot([data], samp_agg, True, src,
-                                                 self.base_outdir / f"{src}_with_samples.pdf")
+                                                 outdir / f"{src}_with_samples.pdf")
 
             if len(source_data_list) > 1:
                 self._create_1x2_saturation_plot(source_data_list, samp_agg, False, "",
-                                                 self.base_outdir / "combined_no_samples.pdf")
+                                                 outdir / "combined_no_samples.pdf")
                 self._create_1x2_saturation_plot(source_data_list, samp_agg, True, "",
-                                                 self.base_outdir / "combined_with_samples.pdf")
+                                                 outdir / "combined_with_samples.pdf")
 
-            print(f"\n[Saturation] Plots updated in {self.base_outdir}")
+            print(f"\n[Saturation] Plots updated in {outdir}")
         except Exception as e:
             print(f"[Plot Error] {e}")
 
     def regenerate_plots_from_raw(self):
         raw_file = self.base_outdir / "saturation_results_raw.tsv"
-        if not raw_file.exists():
-            print(f"[Error] Cannot plot. Missing {raw_file}.")
-            return
-        try:
-            print(f"[Saturation] Plot-only mode active. Reading {raw_file}...")
-            df = pd.read_csv(raw_file, sep="\t")
-            self._generate_plots(df.to_dict('records'))
-        except Exception as e:
-            print(f"[Error] Failed to read {raw_file}: {e}")
+        if raw_file.exists():
+            try:
+                print(f"[Saturation] Plot-only mode active. Reading {raw_file}...")
+                df = pd.read_csv(raw_file, sep="\t")
+                self._generate_plots(df.to_dict('records'), outdir=self.base_outdir)
+            except Exception as e:
+                print(f"[Error] Failed to read {raw_file}: {e}")
+        else:
+            print(f"[Error] Cannot plot main saturation. Missing {raw_file}.")
+
+        if self.target_genes_files:
+            target_specs = self._get_unique_target_names(self.target_genes_files)
+            for tf, target_name in target_specs:
+                target_outdir = self.base_outdir / target_name
+                t_raw = target_outdir / "saturation_results_raw.tsv"
+                if t_raw.exists():
+                    try:
+                        print(f"[Saturation] [Target Genes: {target_name}] Reading {t_raw}...")
+                        tdf = pd.read_csv(t_raw, sep="\t")
+                        self._generate_plots(tdf.to_dict('records'), outdir=target_outdir)
+                    except Exception as e:
+                        print(f"[Error] Failed to read {t_raw}: {e}")
+                else:
+                    print(f"[Warn] Cannot plot target saturation for {target_name}. Missing {t_raw}.")
 
     def run(self):
         state_file = self.base_outdir / "run_state.json"
+        target_specs = self._get_unique_target_names(self.target_genes_files) if self.target_genes_files else []
 
         current_state = {
             "seed": self.seed,
@@ -251,7 +335,8 @@ class BatchOrchestrator:
             "mapman_file": str(self.mapman_file) if self.mapman_file else None,
             "go_file": str(self.go_file) if self.go_file else None,
             "do_auroc": self.do_auroc,
-            "do_aupr": self.do_aupr
+            "do_aupr": self.do_aupr,
+            "target_genes_files": [str(tf) for tf, _ in target_specs]
         }
 
         force_wipe_level = 0
@@ -481,5 +566,114 @@ class BatchOrchestrator:
                                     final_results.append(res_dict)
                             p_egad.update(1)
 
-            self._generate_plots(final_results)
+            self._generate_plots(final_results, outdir=self.base_outdir)
             (self.base_outdir / ".saturation.done").touch()
+
+        # Phase 4: Target Genes Sub-Workflows
+        if target_specs:
+            print(f"\n[Phase 4] Target Genes Workflows ({len(target_specs)} target files)...")
+            r_script = get_egad_script_path() if (self.mapman_file or self.go_file) else None
+
+            for tf, target_name in target_specs:
+                target_genes = self._read_target_genes(tf)
+                if not target_genes:
+                    print(f"[Warn] Target file {tf} is empty or unreadable. Skipping.")
+                    continue
+
+                target_outdir = self.base_outdir / target_name
+                target_outdir.mkdir(parents=True, exist_ok=True)
+
+                print(f"\n[Target Genes: {target_name}] Filtering step-batch networks for {len(target_genes)} target genes...")
+
+                for n_bps, iter_num, s_name in work_definitions:
+                    iter_dir = self.base_outdir / s_name / f"iter{iter_num}"
+                    orig_net = iter_dir / "network_saturation_edges.tsv"
+                    filtered_net = iter_dir / f"{target_name}_edges.tsv"
+
+                    if orig_net.exists():
+                        if self.force or not filtered_net.exists() or force_wipe_level > 0:
+                            self._filter_network(orig_net, target_genes, filtered_net)
+
+                if self.mapman_file or self.go_file:
+                    target_results = []
+                    target_egad_queue = []
+
+                    for n_bps, iter_num, s_name in work_definitions:
+                        iter_dir = self.base_outdir / s_name / f"iter{iter_num}"
+                        filtered_net = iter_dir / f"{target_name}_edges.tsv"
+                        target_iter_dir = target_outdir / s_name / f"iter{iter_num}"
+                        target_iter_dir.mkdir(parents=True, exist_ok=True)
+                        out_tsv = target_iter_dir / "egad_results.tsv"
+                        e_path = global_expr if n_bps == total_bps else iter_dir / "expression.tsv"
+
+                        item = {
+                            "n_bps": n_bps, "iter": iter_num, "dir": target_iter_dir,
+                            "net": filtered_net, "out": out_tsv, "expr": e_path
+                        }
+
+                        if (target_iter_dir / ".egad.done").exists() and out_tsv.exists() and not self.force and force_wipe_level == 0:
+                            try:
+                                df_check = pd.read_csv(out_tsv, sep="\t")
+                                if not df_check.empty:
+                                    if "Annotation_Source" in df_check.columns:
+                                        for src, group in df_check.groupby("Annotation_Source"):
+                                            valid_group = group[group["Term"] != "None"]
+                                            if valid_group.empty: continue
+                                            res_dict = {
+                                                'n_bps': item['n_bps'], 'iter': item['iter'],
+                                                'n_samples': self._count_samples_from_file(item["expr"]),
+                                                'source': src
+                                            }
+                                            if self.do_auroc and "AUC" in valid_group.columns:
+                                                res_dict['auc'] = valid_group["AUC"].mean()
+                                            if self.do_aupr and "AUPR" in valid_group.columns:
+                                                res_dict['aupr'] = valid_group["AUPR"].mean()
+                                            target_results.append(res_dict)
+                                    else:
+                                        res_dict = {
+                                            'n_bps': item['n_bps'], 'iter': item['iter'],
+                                            'n_samples': self._count_samples_from_file(item["expr"]),
+                                            'source': "Legacy"
+                                        }
+                                        if self.do_auroc and "AUC" in df_check.columns: res_dict['auc'] = df_check["AUC"].mean()
+                                        if self.do_aupr and "AUPR" in df_check.columns: res_dict['aupr'] = df_check["AUPR"].mean()
+                                        target_results.append(res_dict)
+                            except Exception as e:
+                                print(f"[Warn] Failed reading {out_tsv}: {e}")
+                                target_egad_queue.append(item)
+                        else:
+                            if filtered_net.exists():
+                                target_egad_queue.append(item)
+
+                    if target_egad_queue:
+                        with tqdm(total=len(work_definitions), initial=len(work_definitions) - len(target_egad_queue),
+                                  desc=f"EGAD [{target_name}]") as p_egad:
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                                f_map = {
+                                    executor.submit(
+                                        run_egad_task, network_file=i["net"], mapman_file=self.mapman_file,
+                                        go_file=self.go_file, out_file=i["out"], script_path=r_script,
+                                        log_path=i["dir"] / "egad.log", curves_prefix=None,
+                                        do_auroc=self.do_auroc, do_aupr=self.do_aupr
+                                    ): i for i in target_egad_queue
+                                }
+
+                                for f in concurrent.futures.as_completed(f_map):
+                                    it = f_map[f]
+                                    results_dict = f.result()
+                                    if results_dict:
+                                        (it["dir"] / ".egad.done").touch()
+                                        for src, mets in results_dict.items():
+                                            res_dict = {
+                                                'n_bps': it['n_bps'], 'iter': it['iter'],
+                                                'n_samples': self._count_samples_from_file(it["expr"]), 'source': src
+                                            }
+                                            if self.do_auroc and mets.get('macro_auc') is not None:
+                                                res_dict['auc'] = mets['macro_auc']
+                                            if self.do_aupr and mets.get('macro_aupr') is not None:
+                                                res_dict['aupr'] = mets['macro_aupr']
+                                            target_results.append(res_dict)
+                                    p_egad.update(1)
+
+                    self._generate_plots(target_results, outdir=target_outdir)
+                    (target_outdir / ".saturation.done").touch()

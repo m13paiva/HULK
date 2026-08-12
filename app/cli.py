@@ -1070,9 +1070,16 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
               default=None, help="BioMart GO export file (TSV) for EGAD.")
 @click.option("--metrics", type=click.Choice(['auroc', 'aupr', 'both'], case_sensitive=False),
               default='both', show_default=True, help="Which EGAD metrics to calculate.")
+@click.option(
+    "--target-genes",
+    "target_genes_files",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    help="File(s) containing target genes (one gene per line). Can be used multiple times.",
+)
 @click.option("--plot-only", is_flag=True, help="Skip processing and only regenerate plots from existing raw results.")
 def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threads, force, mapman, go_file, metrics,
-               plot_only):
+               target_genes_files, plot_only):
     """
     Executes a comprehensive data saturation check to infer correlation reliability as network subsets expand.
     """
@@ -1083,8 +1090,11 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
 
     if seed: click.secho(f"[Saturation] Seed: {seed}", fg="magenta")
 
+    target_files_list = list(target_genes_files) if target_genes_files else None
+
     try:
-        cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only, mapman_file=mapman, go_file=go_file)
+        cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only, mapman_file=mapman, go_file=go_file,
+                     target_genes_files=target_files_list)
         cfg.seidr_preset = seidr_preset.upper()
 
         dataset = Dataset.reconstruct_from_output(cfg)
@@ -1104,7 +1114,8 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
             go_file=go_file,
             force=force,
             num_steps=steps,
-            metrics=metrics.lower()
+            metrics=metrics.lower(),
+            target_genes_files=cfg.target_genes_files
         )
         orch.iterations = iterations
 
