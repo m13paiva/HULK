@@ -17,7 +17,7 @@ from .seidr import PRESETS, ALGO_MAP
 from .core import pipeline
 from .entities import Config, Dataset
 from .post_processing import run_postprocessing
-from .utils import transcriptome_suffixes, smash, generate_read_metrics_plot
+from .utils import transcriptome_suffixes, smash, generate_read_metrics_plot, setup_interrupt_handlers, kill_all_active_processes
 from .logo import LOGO
 from . import __version__
 
@@ -265,7 +265,7 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
 @click.option("-y", "--yes", is_flag=True, help="Skip prompts.")
 @click.option("-f", "--force", is_flag=True, help="Force re-run (overwrite processed data).")
 @click.option("-n", "--dry-run", is_flag=True, help="Validate and plan without running.")
-@click.option("-t,--tx2gene", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+@click.option("-t","--tx2gene", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="tx2gene map for gene-level counts.")
 @click.option("--no-bp-postprocessing", is_flag=True, help="Skip per-BioProject post-processing.")
 @click.option("--no-global-postprocessing", is_flag=True, help="Skip global (all samples) post-processing.")
@@ -1070,9 +1070,16 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
               default=None, help="BioMart GO export file (TSV) for EGAD.")
 @click.option("--metrics", type=click.Choice(['auroc', 'aupr', 'both'], case_sensitive=False),
               default='both', show_default=True, help="Which EGAD metrics to calculate.")
+@click.option(
+    "--target-genes",
+    "target_genes_files",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    multiple=True,
+    help="File(s) containing target genes (one gene per line). Can be used multiple times.",
+)
 @click.option("--plot-only", is_flag=True, help="Skip processing and only regenerate plots from existing raw results.")
 def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threads, force, mapman, go_file, metrics,
-               plot_only):
+               target_genes_files, plot_only):
     """
     Executes a comprehensive data saturation check to infer correlation reliability as network subsets expand.
     """
@@ -1083,8 +1090,11 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
 
     if seed: click.secho(f"[Saturation] Seed: {seed}", fg="magenta")
 
+    target_files_list = list(target_genes_files) if target_genes_files else None
+
     try:
-        cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only, mapman_file=mapman, go_file=go_file)
+        cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only, mapman_file=mapman, go_file=go_file,
+                     target_genes_files=target_files_list)
         cfg.seidr_preset = seidr_preset.upper()
 
         dataset = Dataset.reconstruct_from_output(cfg)
@@ -1104,7 +1114,8 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
             go_file=go_file,
             force=force,
             num_steps=steps,
-            metrics=metrics.lower()
+            metrics=metrics.lower(),
+            target_genes_files=cfg.target_genes_files
         )
         orch.iterations = iterations
 
@@ -1173,8 +1184,14 @@ def evaluate(output_dir, mapman_path, go_file_path, metrics, custom_network):
 
 def main():
     """Application entry point overriding standard terminal rendering bounds."""
+    setup_interrupt_handlers()
     os.environ.setdefault("COLUMNS", str(WIDE_HELP))
-    cli(standalone_mode=True)
+    try:
+        cli(standalone_mode=True)
+    except KeyboardInterrupt:
+        click.secho("\n[HULK] Ctrl+C received. Terminating all tasks...", fg="yellow")
+        kill_all_active_processes()
+        os._exit(130)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,25 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+app/__pycache__/
+
+# Git files
+.git/
+.gitignore
+
+# Documentation / Media
+README.md
+CHANGELOG.md
+hulk_scheme.png
+LICENSE
+
+# IDE / Editor configuration
+.idea/
+.vscode/
+
+# Local output / test files
+output/
+output*/
+*.log
+.hulk.json

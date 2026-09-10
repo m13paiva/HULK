@@ -1,13 +1,89 @@
-# utils.py
-
 import os
+import sys
 import math
+import signal
+import threading
 import subprocess
 from pathlib import Path
-from typing import List, Union, Iterable
+from typing import List, Union, Iterable, Optional, Dict, Any
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Process Management & Interrupt Handling
+# ─────────────────────────────────────────────────────────────────────────────
+_active_processes_lock = threading.Lock()
+_active_processes = set()
+
+def register_process(proc: subprocess.Popen) -> None:
+    """Registers an active subprocess so it can be killed on SIGINT / Ctrl+C."""
+    with _active_processes_lock:
+        _active_processes.add(proc)
+
+def unregister_process(proc: subprocess.Popen) -> None:
+    """Unregisters a completed subprocess."""
+    with _active_processes_lock:
+        _active_processes.discard(proc)
+
+def kill_all_active_processes() -> None:
+    """Force-terminates all tracked subprocesses and process groups immediately."""
+    with _active_processes_lock:
+        for proc in list(_active_processes):
+            try:
+                if proc.poll() is None:
+                    if hasattr(os, 'killpg'):
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except Exception:
+                            proc.kill()
+                    else:
+                        proc.kill()
+            except Exception:
+                pass
+        _active_processes.clear()
+
+def setup_interrupt_handlers() -> None:
+    """Configures SIGINT (Ctrl+C) and SIGTERM signal handlers to instantly terminate all child processes."""
+    def _on_signal(signum, frame):
+        print("\n[HULK] Signal received. Interrupting execution and killing processes...", file=sys.stderr, flush=True)
+        kill_all_active_processes()
+        os._exit(130)
+
+    try:
+        signal.signal(signal.SIGINT, _on_signal)
+        signal.signal(signal.SIGTERM, _on_signal)
+    except (ValueError, AttributeError):
+        pass
+
+def run_managed_subprocess(
+    cmd: list[str],
+    cwd: Path | str | None = None,
+    stdout=None,
+    stderr=None,
+    env: dict[str, str] | None = None,
+    check: bool = True
+) -> subprocess.Popen:
+    """
+    Spawns a subprocess in its own process group, tracks it, and waits for completion.
+    Guarantees child process termination if SIGINT / Ctrl+C is caught.
+    """
+    kwargs = {}
+    if hasattr(os, 'setsid'):
+        kwargs['start_new_session'] = True
+
+    proc = subprocess.Popen(
+        cmd, cwd=str(cwd) if cwd else None, stdout=stdout, stderr=stderr, env=env, text=True, **kwargs
+    )
+    register_process(proc)
+    try:
+        ret = proc.wait()
+        if check and ret != 0:
+            raise subprocess.CalledProcessError(ret, cmd)
+        return proc
+    finally:
+        unregister_process(proc)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -71,7 +147,7 @@ def run_cmd(cmd: list[str], cwd: Path | None, log_path: Path) -> None:
         f.write(f"## cwd: {cwd}\n")
         f.write(">> " + " ".join(map(str, cmd)) + "\n")
         f.flush()
-        subprocess.run(cmd, cwd=cwd, stdout=f, stderr=f, check=True)
+        run_managed_subprocess(cmd, cwd=cwd, stdout=f, stderr=f, check=True)
 
 def run_cmd_stream(cmd: list[str], cwd: Path | None, log_path: Path, side_log_path: Path | None = None) -> None:
     """
@@ -88,11 +164,16 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None, log_path: Path, side_log_pa
         flog.write(">> " + " ".join(map(str, cmd)) + "\n")
         flog.flush()
 
+        kwargs = {}
+        if hasattr(os, 'setsid'):
+            kwargs['start_new_session'] = True
+
         proc = subprocess.Popen(
             cmd, cwd=cwd,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1
+            text=True, bufsize=1, **kwargs
         )
+        register_process(proc)
         side = open(side_log_path, "w", buffering=1) if side_log_path is not None else None
         try:
             assert proc.stdout is not None
@@ -103,6 +184,7 @@ def run_cmd_stream(cmd: list[str], cwd: Path | None, log_path: Path, side_log_pa
         finally:
             if side is not None:
                 side.close()
+            unregister_process(proc)
 
         ret = proc.wait()
         if ret != 0:

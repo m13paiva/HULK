@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple, TYPE_CHECKING, Dict, Any
+from .utils import run_managed_subprocess
 
 if TYPE_CHECKING:
     from .entities import Config
@@ -71,19 +72,14 @@ def run_egad_task(
 
     with open(log_path, "a") as log:
         log.write(f"\n{'=' * 40}\n[EXEC] {' '.join(cmd)}\n")
+        log.flush()
 
-    try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True
-        )
-        with open(log_path, "a") as log:
-            log.write(result.stderr)
+        try:
+            run_managed_subprocess(cmd, stdout=log, stderr=log, check=True)
             log.write("[SUCCESS]\n")
-    except subprocess.CalledProcessError as e:
-        with open(log_path, "a") as log:
-            log.write(f"[ERROR] Output:\n{e.stderr}\n")
+        except subprocess.CalledProcessError as e:
             log.write(f"[FAILED] Exit Code: {e.returncode}\n")
-        return {}
+            return {}
 
     results = {}
     if out_file.exists():
@@ -211,7 +207,9 @@ def create_macro_boxplots(df, out_file, colors_dict):
     aupr_data = [df[(df["Annotation_Source"] == s) & (df["AUPR"].notnull())]["AUPR"].values for s in sources]
 
     if any(len(d) > 0 for d in auc_data):
-        bplot1 = ax1.boxplot(auc_data, labels=sources, patch_artist=True)
+        bplot1 = ax1.boxplot(auc_data, patch_artist=True)
+        ax1.set_xticks(np.arange(1, len(sources) + 1))
+        ax1.set_xticklabels(sources)
         for patch, src in zip(bplot1['boxes'], sources):
             patch.set_facecolor(colors_dict.get(src, "grey"))
             patch.set_alpha(0.8)
@@ -220,7 +218,9 @@ def create_macro_boxplots(df, out_file, colors_dict):
         ax1.grid(True, linestyle='--', alpha=0.6)
 
     if any(len(d) > 0 for d in aupr_data):
-        bplot2 = ax2.boxplot(aupr_data, labels=sources, patch_artist=True)
+        bplot2 = ax2.boxplot(aupr_data, patch_artist=True)
+        ax2.set_xticks(np.arange(1, len(sources) + 1))
+        ax2.set_xticklabels(sources)
         for patch, src in zip(bplot2['boxes'], sources):
             patch.set_facecolor(colors_dict.get(src, "grey"))
             patch.set_alpha(0.8)
