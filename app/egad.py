@@ -72,19 +72,14 @@ def run_egad_task(
 
     with open(log_path, "a") as log:
         log.write(f"\n{'=' * 40}\n[EXEC] {' '.join(cmd)}\n")
+        log.flush()
 
-    try:
-        proc = run_managed_subprocess(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True
-        )
-        with open(log_path, "a") as log:
-            if proc.stderr: log.write(proc.stderr)
+        try:
+            run_managed_subprocess(cmd, stdout=log, stderr=log, check=True)
             log.write("[SUCCESS]\n")
-    except subprocess.CalledProcessError as e:
-        with open(log_path, "a") as log:
-            if hasattr(e, 'stderr') and e.stderr: log.write(f"[ERROR] Output:\n{e.stderr}\n")
+        except subprocess.CalledProcessError as e:
             log.write(f"[FAILED] Exit Code: {e.returncode}\n")
-        return {}
+            return {}
 
     results = {}
     if out_file.exists():

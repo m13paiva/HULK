@@ -265,7 +265,7 @@ class HulkCommand(SpacedFormatterMixin, click.Command):
 @click.option("-y", "--yes", is_flag=True, help="Skip prompts.")
 @click.option("-f", "--force", is_flag=True, help="Force re-run (overwrite processed data).")
 @click.option("-n", "--dry-run", is_flag=True, help="Validate and plan without running.")
-@click.option("-t,--tx2gene", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
+@click.option("-t","--tx2gene", "tx2gene_path", type=click.Path(exists=True, dir_okay=False, path_type=Path),
               default=None, help="tx2gene map for gene-level counts.")
 @click.option("--no-bp-postprocessing", is_flag=True, help="Skip per-BioProject post-processing.")
 @click.option("--no-global-postprocessing", is_flag=True, help="Skip global (all samples) post-processing.")

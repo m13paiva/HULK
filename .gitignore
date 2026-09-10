@@ -1,0 +1,21 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+app/__pycache__/
+
+# Output directories & runtime configs
+output/
+output*/
+*.log
+.hulk.json
+
+# IDE / OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+.pytest_cache/
+.coverage
+htmlcov/

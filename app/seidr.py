@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 import pandas as pd
 from .entities import Config
+from .utils import run_managed_subprocess
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment Mapping
@@ -183,7 +184,7 @@ def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path
 
     try:
         proc = run_managed_subprocess(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV_OVERRIDES, check=True)
-        res_stdout = proc.stdout or ""
+        res_stdout = proc.stdout.read() if proc.stdout else ""
     except subprocess.CalledProcessError as e:
         print(f"[Seidr ERROR] Export failed: {e}", file=sys.stderr)
         return
@@ -297,12 +298,31 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
                     return None
                 cmd.extend(["-M", str(prerequisite_file.resolve())])
 
+            # Set OMP_NUM_THREADS to avoid thread explosion for correlation/pcor
+            task_env = ENV_OVERRIDES.copy()
+            task_env["OMP_NUM_THREADS"] = str(threads)
+            task_env["OPENBLAS_NUM_THREADS"] = str(threads)
+            task_env["MKL_NUM_THREADS"] = str(threads)
+
             print(f"[Seidr] Running {algo}...")
-            _run_direct_quiet(cmd, cwd=outdir, log_path=log_path)
+            
+            cmd_str = " ".join(cmd)
+            with open(log_path, "a") as f:
+                f.write(f"\n[EXEC] {cmd_str}\n")
+                f.flush()
+                try:
+                    run_managed_subprocess(cmd, cwd=outdir, stdout=f, stderr=subprocess.STDOUT, env=task_env, check=True)
+                except subprocess.CalledProcessError as e:
+                    print(f"[Seidr ERROR] {algo} Command failed. Check {log_path.name}.", file=sys.stderr)
+                    raise e
+                    
             return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, current_fmt, threads, log_path)
 
         except Exception as e:
-            print(f"[Seidr FAIL] {algo} crashed. See log.", file=sys.stderr)
+            err_msg = f"[Seidr FAIL] {algo} crashed: {type(e).__name__}: {e}"
+            print(err_msg, file=sys.stderr)
+            with open(log_path, "a") as f:
+                f.write(f"\n{err_msg}\n")
             return None
 
     # 1. MI (Sequential dependency blocks limiting execution variables limits array map indicators variable limits limit)
@@ -354,12 +374,20 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
     if force and bb_sf.exists():
         bb_sf.unlink()
 
+    out_edges = outdir / f"network_{label}_edges.tsv"
+
     try:
         _run_direct_quiet([seidr, "backbone", "-F", str(backbone), str(net_sf)], cwd=outdir, log_path=log_path)
         if bb_sf.exists():
             _export_results(outdir, algorithms, seidr, bb_sf, label, no_full, log_path)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Warn] Backbone failed for {label}: {e}", file=sys.stderr)
+
+    # Fallback: if backbone pruning produced no valid edge file, export aggregate network
+    if not out_edges.exists() or out_edges.stat().st_size == 0:
+        if net_sf.exists():
+            print(f"[Seidr] Backbone yielded no edges for {label}. Exporting aggregate network as fallback...", flush=True)
+            _export_results(outdir, algorithms, seidr, net_sf, label, no_full, log_path)
 
 
 def run_seidr(cfg: Config, force: bool = False) -> None:
@@ -427,7 +455,7 @@ def run_seidr_batch(cfg: Config, genes_file: Path, expression_file: Path, outdir
     _build_network_task(outdir, genes_file, expression_file, (threads or cfg.max_threads), 1, 1.28, "irp", algos, tools,
                         "saturation", False, None, True, log_path, True)
 
-    allowed_files = {"expression.tsv", "genes.txt", "network_saturation_edges.tsv", "network_edges.tsv", ".seidr.done"}
+    allowed_files = {"expression.tsv", "genes.txt", "network_saturation_edges.tsv", "network_edges.tsv", "seidr_batch.log", ".seidr.done"}
 
     for item in outdir.iterdir():
         if item.is_dir():
@@ -435,4 +463,9 @@ def run_seidr_batch(cfg: Config, genes_file: Path, expression_file: Path, outdir
         elif item.name not in allowed_files:
             item.unlink(missing_ok=True)
 
-    (outdir / ".seidr.done").touch()
+    expected_edges = outdir / "network_saturation_edges.tsv"
+    if expected_edges.exists() and expected_edges.stat().st_size > 0:
+        (outdir / ".seidr.done").touch()
+    else:
+        (outdir / ".seidr.done").unlink(missing_ok=True)
+        print(f"[Seidr ERROR] Batch in {outdir.name} did not yield valid edge table.", file=sys.stderr)

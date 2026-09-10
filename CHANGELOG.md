@@ -1,6 +1,22 @@
 # **HULK** Changelog
 ---
 
+## [2.0.1]
+
+### Added
+- **Target Genes List Option in Saturation (`hulk saturation --target-genes`)**:
+  - Added the `--target-genes` option to `hulk saturation`, allowing users to provide one or more target gene list files to evaluate network saturation and performance on specific gene subsets.
+
+### Fixed
+- **CLI Option Parsing (`--tx2gene`)**:
+  - Fixed a typo in `cli.py` (`"-t,--tx2gene"`) that prevented Click from properly parsing the flags, causing the `--tx2gene` option to misbehave.
+- **Saturation Analysis**:
+  - Fixed multiple issues in the saturation workflow: enhanced verification of completed Seidr/EGAD iterations to ensure corrupted, incomplete, or empty output files are safely detected, removed, and re-queued.
+  - Optimized Seidr execution in saturation batches by preventing thread over-allocation and memory spikes.
+  - Improved subprocess logging, error handling, and fallback network export when backbone pruning produces empty edge tables.
+
+---
+
 ## [2.0.0]
 This release marks a major architectural expansion, shifting the pipeline's capabilities beyond standard quantification and into gene co-expression network (GCN) inference and evaluation. 
 
@@ -138,6 +154,7 @@ In this patched version, `_detect_fastq_layout_` now recognizes a single FASTQ f
 - Initial public release of **HULK**.
 
 ---
+[2.0.1]: https://github.com/m13paiva/hulk/releases/tag/v2.0.1
 [2.0.0]: https://github.com/m13paiva/hulk/releases/tag/v2.0.0
 [1.3.0]: https://github.com/m13paiva/hulk/releases/tag/v1.3.0
 [1.2.0]: https://github.com/m13paiva/hulk/releases/tag/v1.2.0

@@ -488,9 +488,20 @@ class BatchOrchestrator:
                 pbar.update(1)
 
         print(f"\n[Phase 2] Seidr Inference...")
-        seidr_tasks = [i for i in seidr_queue if not (i[2] / ".seidr.done").exists()]
+        seidr_tasks = []
+        for i in seidr_queue:
+            iter_dir = i[2]
+            done_file = iter_dir / ".seidr.done"
+            edge_file = iter_dir / "network_saturation_edges.tsv"
+            if done_file.exists() and edge_file.exists() and edge_file.stat().st_size > 0:
+                continue
+            done_file.unlink(missing_ok=True)
+            seidr_tasks.append(i)
+
         if seidr_tasks:
-            threads = max(1, self.total_thread_budget // self.workers)
+            # Run Seidr sequentially (1 worker) but allocate ALL threads to the single instance.
+            # This prevents massive memory usage spikes / OOM killer when running multiple instances on large expression matrices.
+            threads = max(1, self.total_thread_budget)
             preset = getattr(self.config, "seidr_preset", "FAST")
             with tqdm(total=len(seidr_queue), initial=len(seidr_queue) - len(seidr_tasks), desc="Seidr Inf") as p_inf:
                 # Group tasks by step (n_bps) so lower steps complete sequentially
@@ -502,7 +513,7 @@ class BatchOrchestrator:
 
                 for step_name in sorted(step_groups.keys(), key=lambda x: int(x.replace('step', '')) if x.replace('step', '').isdigit() else x):
                     group = step_groups[step_name]
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=self.workers) as executor:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                         f_map = {executor.submit(run_seidr_batch, self.config, i[0], i[1], i[2], preset, threads): i for i in group}
                         for f in concurrent.futures.as_completed(f_map):
                             it = f_map[f]
@@ -519,9 +530,11 @@ class BatchOrchestrator:
             egad_tasks = []
 
             for item in egad_queue:
-                if (item["dir"] / ".egad.done").exists() and item["out"].exists():
+                out_file = item["out"]
+                done_file = item["dir"] / ".egad.done"
+                if done_file.exists() and out_file.exists() and out_file.stat().st_size > 0:
                     try:
-                        df_check = pd.read_csv(item["out"], sep="\t")
+                        df_check = pd.read_csv(out_file, sep="\t")
                         if not df_check.empty:
                             if "Annotation_Source" in df_check.columns:
                                 for src, group in df_check.groupby("Annotation_Source"):
@@ -545,9 +558,13 @@ class BatchOrchestrator:
                                 if self.do_aupr and "AUPR" in df_check.columns: res_dict['aupr'] = df_check["AUPR"].mean()
                                 final_results.append(res_dict)
                     except Exception as e:
-                        print(f"[Warn] Failed reading {item['out']}: {e}")
+                        print(f"[Warn] Failed reading {out_file}: {e}")
+                        done_file.unlink(missing_ok=True)
+                        if (item["dir"] / "network_saturation_edges.tsv").exists():
+                            egad_tasks.append(item)
                 else:
-                    if (item["dir"] / ".seidr.done").exists():
+                    done_file.unlink(missing_ok=True)
+                    if (item["dir"] / "network_saturation_edges.tsv").exists() and (item["dir"] / "network_saturation_edges.tsv").stat().st_size > 0:
                         egad_tasks.append(item)
 
             if final_results:
@@ -638,7 +655,7 @@ class BatchOrchestrator:
                             "net": filtered_net, "out": out_tsv, "expr": e_path
                         }
 
-                        if (target_iter_dir / ".egad.done").exists() and out_tsv.exists() and not self.force and force_wipe_level == 0:
+                        if (target_iter_dir / ".egad.done").exists() and out_tsv.exists() and out_tsv.stat().st_size > 0 and not self.force and force_wipe_level == 0:
                             try:
                                 df_check = pd.read_csv(out_tsv, sep="\t")
                                 if not df_check.empty:
@@ -667,9 +684,12 @@ class BatchOrchestrator:
                                         target_results.append(res_dict)
                             except Exception as e:
                                 print(f"[Warn] Failed reading {out_tsv}: {e}")
-                                target_egad_queue.append(item)
+                                (target_iter_dir / ".egad.done").unlink(missing_ok=True)
+                                if filtered_net.exists() and filtered_net.stat().st_size > 0:
+                                    target_egad_queue.append(item)
                         else:
-                            if filtered_net.exists():
+                            (target_iter_dir / ".egad.done").unlink(missing_ok=True)
+                            if filtered_net.exists() and filtered_net.stat().st_size > 0:
                                 target_egad_queue.append(item)
 
                     if target_results:
