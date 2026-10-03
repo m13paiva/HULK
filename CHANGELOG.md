@@ -1,6 +1,16 @@
 # **HULK** Changelog
 ---
 
+## [2.0.2]
+
+### Fixed
+- **SRA Prefetch Failure & Premature Pipeline Skip**:
+  - Fixed a critical bug where the pipeline failed to download SRA accessions, skipped processing steps iteratively across BioProjects, and emitted missing file errors (`no run.json found`, `no abundance.tsv found`).
+  - **Cause**: Modern SRA Toolkit (`prefetch 3.4.x`) deprecated the `--output-file` option with an exit error, causing all downloads to fail immediately. Orchestrator and dataset state tracking falsely treated failed samples as complete, immediately triggering BioProject post-processing and MultiQC on non-existent sample files.
+  - **Fix**: Switched prefetch to `--output-directory`, normalized nested directory structures, ensured directory existence, and prevented post-processing/MultiQC from executing when no samples succeed. Added resilient handling for zero-alignment exit codes in Kallisto.
+
+---
+
 ## [2.0.1]
 
 ### Added
@@ -154,6 +164,7 @@ In this patched version, `_detect_fastq_layout_` now recognizes a single FASTQ f
 - Initial public release of **HULK**.
 
 ---
+[2.0.2]: https://github.com/m13paiva/hulk/releases/tag/v2.0.2
 [2.0.1]: https://github.com/m13paiva/hulk/releases/tag/v2.0.1
 [2.0.0]: https://github.com/m13paiva/hulk/releases/tag/v2.0.0
 [1.3.0]: https://github.com/m13paiva/hulk/releases/tag/v1.3.0
