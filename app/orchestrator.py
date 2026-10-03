@@ -36,6 +36,11 @@ def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
         log(f"[{bp.id}] Skipping BioProject post-processing (MultiQC, R, Metrics) due to flag.", log_path)
         return
 
+    successful_samples = [s for s in bp.samples if s.status == "done" and s.is_done()]
+    if not successful_samples:
+        log(f"[{bp.id}] No completed samples found; skipping BioProject post-processing.", log_path)
+        return
+
     # 1. MultiQC Initialization
     try:
         mqc_data = run_multiqc(bp, cfg, modules=("kallisto", "fastp"))
@@ -156,14 +161,20 @@ def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: floa
                             bp.status = "done"
                             already_postprocessed.add(bp.id)
                         else:
-                            bp.status = "done"
-                            try:
-                                _finalize_bioproject(bp, cfg)
-                            except Exception as e:
-                                if hasattr(bp, 'log_path'):
-                                    log(f"[{bp.id}] Postprocessing failed: {e}", bp.log_path)
-                            finally:
+                            successful_samples = [s for s in bp.samples if s.status == "done" and s.is_done()]
+                            if not successful_samples:
+                                bp.status = "failed"
+                                log(f"[{bp.id}] No samples completed successfully. Skipping BP post-processing.", cfg.log)
                                 already_postprocessed.add(bp.id)
+                            else:
+                                bp.status = "done"
+                                try:
+                                    _finalize_bioproject(bp, cfg)
+                                except Exception as e:
+                                    if hasattr(bp, 'log_path'):
+                                        log(f"[{bp.id}] Postprocessing failed: {e}", bp.log_path)
+                                finally:
+                                    already_postprocessed.add(bp.id)
 
                     bp_bars[bp.id].close()
                     closed_bars.add(bp.id)
@@ -182,7 +193,8 @@ def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: floa
 
 def _cfg(cfg, name, default=None):
     """Simple wrapper enforcing attribute safe resolution."""
-    return getattr(cfg, name, default)
+    val = getattr(cfg, name, default)
+    return default if val is None else val
 
 
 def _clamp(v, lo, hi):
@@ -238,7 +250,11 @@ def _plan_threads(cfg) -> ThreadPlan:
     kallisto_cap = _cfg(cfg, "kallisto_cap", 32)
 
     default_pf = _clamp(max(4, logical // 8), 2, 24)
+    if user_max is not None:
+        default_pf = max(1, min(default_pf, user_max))
     pf_workers = int(_cfg(cfg, "prefetch_workers", default_pf))
+    if user_max is not None:
+        pf_workers = max(1, min(pf_workers, user_max))
 
     return ThreadPlan(
         bundle_concurrency=bundles,

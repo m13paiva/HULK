@@ -73,23 +73,32 @@ def prepare_mqc_inputs_for_bp(
     for s in sorted(bp.samples, key=lambda x: x.id):
         run_id = s.id
         run_dir = s.outdir
-        dst = tmp_root / run_id
-        dst.mkdir(parents=True, exist_ok=True)
 
         fjson = run_dir / "fastp.json"
         if not fjson.exists():
             hits = list(run_dir.glob("*fastp.json"))
             fjson = hits[0] if hits else None
 
+        runinfo = run_dir / "run_info.json"
+        has_abundance = any((run_dir / name).exists() for name in ("abundance.tsv", "abundance.h5"))
+
+        # Skip samples that never completed or produced any QC or alignment outputs
+        if not (fjson and fjson.exists()) and not runinfo.exists() and not has_abundance:
+            if s.status == "done" or s.is_done():
+                log(f"[{run_id}] Warning: Sample marked done but missing QC/alignment outputs", log_path)
+            continue
+
+        dst = tmp_root / run_id
+        dst.mkdir(parents=True, exist_ok=True)
+
         if fjson and fjson.exists():
             _safe_link_or_copy(fjson, dst / str(f"{run_id}.{fjson.name}"), log_path)
             n_fastp += 1
-        else:
-            print(f"[{run_id}] Missing fastp JSON; fastp totals may be absent in MultiQC")
+        elif s.status == "done" or s.is_done():
+            log(f"[{run_id}] Missing fastp JSON; fastp totals may be absent in MultiQC", log_path)
 
         have_k = False
 
-        runinfo = run_dir / "run_info.json"
         if runinfo.exists():
             _safe_link_or_copy(runinfo, dst / "run_info.json", log_path)
             have_k = True
@@ -104,16 +113,14 @@ def prepare_mqc_inputs_for_bp(
         if klog_path.exists():
             _safe_link_or_copy(klog_path, dst / klog_path.name, log_path)
             have_k = True
-        else:
-            print(f"[{run_id}] Missing per-sample kallisto log: {klog_path.name}")
 
         if have_k:
             n_kallisto += 1
-        else:
-            print(f"[{run_id}] Missing kallisto run_info.json and abundance file")
+        elif s.status == "done" or s.is_done():
+            log(f"[{run_id}] Missing kallisto run_info.json and abundance file", log_path)
 
     if (n_fastp + n_kallisto) == 0:
-        print(f"[MultiQC sanitize] No inputs prepared in {bioproject_dir}")
+        log(f"[MultiQC sanitize] No inputs prepared in {bioproject_dir}", log_path)
         shutil.rmtree(tmp_root, ignore_errors=True)
         return None
 
@@ -337,11 +344,10 @@ def run_multiqc(
             missing_msgs.append(f"{d.name}: missing {', '.join(reasons)}")
 
     if not sra_dirs:
-        print(
-            "[MultiQC sanitize] No complete SRR dirs under "
-            f"{inputs_root}.\n"
-            + ("\n".join(missing_msgs) if missing_msgs else ""),
-        )
+        msg = f"[MultiQC sanitize] No complete SRR dirs under {inputs_root}."
+        if missing_msgs:
+            msg += "\n" + "\n".join(missing_msgs)
+        log(msg, log_path)
         return None
 
     log(
