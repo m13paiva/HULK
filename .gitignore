@@ -3,10 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 app/__pycache__/
+*.egg-info/
 
 # Output directories & runtime configs
 output/
 output*/
+test_output/
+dummy_*
 *.log
 .hulk.json
 

@@ -26,8 +26,12 @@ if [ ! -w "$TARGET_DIR" ]; then
     *) echo "ℹ️ Adding ${TARGET_DIR} to PATH in your shell profile."
        SHELLRC="${HOME}/.bashrc"
        [ -n "${ZSH_VERSION:-}" ] && SHELLRC="${HOME}/.zshrc"
-       if ! grep -qs "export PATH=.*${TARGET_DIR}" "$SHELLRC"; then
-         echo "export PATH=\"${TARGET_DIR}:\$PATH\"" >> "$SHELLRC"
+       if [ -L "$SHELLRC" ] && [ ! -e "$SHELLRC" ]; then
+         rm -f "$SHELLRC"
+       fi
+       touch "$SHELLRC" 2>/dev/null || true
+       if ! grep -qs "export PATH=.*${TARGET_DIR}" "$SHELLRC" 2>/dev/null; then
+         echo "export PATH=\"${TARGET_DIR}:\$PATH\"" >> "$SHELLRC" 2>/dev/null || true
          echo "→ Restart your shell or 'source ${SHELLRC}' after install."
        fi
        ;;
@@ -57,7 +61,7 @@ fi
 
 # ---- pre-pull the image (optional) ----
 echo "👉 Pulling image: ${IMAGE} (engine: ${ENGINE})"
-${ENGINE} pull "${IMAGE}"
+${ENGINE} pull "${IMAGE}" || echo "⚠️ Could not pull ${IMAGE} (will use local image if present)."
 
 # ---- write wrapper (with installer-resolved image baked in) ----
 WRAPPER="${TARGET_DIR}/${APP_NAME}"
@@ -94,6 +98,8 @@ UIDGID="$(id -u):$(id -g)"
 exec "$ENGINE" run --rm $TTY_FLAGS \
   -u "$UIDGID" \
   -e HOME=/work \
+  -e PYTHONPATH=/app \
+  -e NCBI_VDB_PREFETCH_USES_OUTPUT_TO_FILE=1 \
   -e MULTIQC_CONFIG_PATH=/config/multiqc_config.yaml \
   -v "$PWD":/app \
   -v "$CONF_DIR":/config \

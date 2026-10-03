@@ -1,4 +1,5 @@
 from __future__ import annotations
+import os
 import shutil
 import subprocess
 import random
@@ -8,6 +9,8 @@ from typing import Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm.auto import tqdm
 from .utils import log, run_cmd, pad_desc
+
+os.environ.setdefault("NCBI_VDB_PREFETCH_USES_OUTPUT_TO_FILE", "1")
 
 try:
     from .cache_manager import CacheGate
@@ -26,24 +29,32 @@ POLL_SECS_DEFAULT = 3.0
 MAX_WORKERS_DEFAULT = 16
 
 
-def _normalize_sra_layout(cache_dir: Path, run_id: str) -> Path:
+def _normalize_sra_layout(target_dir: Path, run_id: str) -> Path:
     """
     Standardizes SRA output locations from nested structures created by `prefetch`.
 
     Args:
-        cache_dir (Path): The designated target cache path.
+        target_dir (Path): The designated target directory.
         run_id (str): The accession identifier determining expected file naming.
 
     Returns:
         Path: The absolute path to the properly structured SRA file.
     """
-    cache_dir = cache_dir.expanduser().resolve()
-    sra_file = cache_dir / f"{run_id}.sra"
-    alt_dir = cache_dir / run_id
+    target_dir = target_dir.expanduser().resolve()
+    sra_file = target_dir / f"{run_id}.sra"
+    alt_dir = target_dir / run_id
     alt_file = alt_dir / f"{run_id}.sra"
 
-    if (not sra_file.exists()) and alt_file.exists():
-        alt_file.replace(sra_file)
+    if not sra_file.exists():
+        if alt_file.exists():
+            alt_file.replace(sra_file)
+        elif alt_dir.is_dir():
+            candidates = list(alt_dir.glob(f"{run_id}*.sra*")) + list(alt_dir.glob("*.sra*"))
+            valid = [c for c in candidates if not c.name.endswith((".lock", ".tmp", ".prf"))]
+            if valid:
+                valid[0].replace(sra_file)
+
+    if alt_dir.exists():
         shutil.rmtree(alt_dir, ignore_errors=True)
     return sra_file
 
@@ -69,26 +80,24 @@ def prefetch_one(sample: "Sample", cache_dir: Path, *,
     Returns:
         Dict[str, str]: Dictionary mapping the target accession to completion status and path.
     """
-    cache_dir = cache_dir.expanduser().resolve()
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    if mode == "cache":
+        target_dir = cache_dir.expanduser().resolve()
+    else:
+        target_dir = sample.outdir.expanduser().resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
     run_id = sample.id
 
     if mode == "cache":
         CacheGate(
-            cache_dir,
+            target_dir,
             cache_high_gb * (1024 ** 3),
             cache_low_gb * (1024 ** 3),
             poll_secs,
         ).wait_for_window(lambda m: log(m, sample.log_path), run_id)
 
-    if mode == "cache":
-        sra_file = cache_dir / f"{run_id}.sra"
-    else:
-        run_dir = sample.outdir
-        run_dir.mkdir(parents=True, exist_ok=True)
-        sra_file = run_dir / f"{run_id}.sra"
+    sra_file = target_dir / f"{run_id}.sra"
 
-    if mode == "cache" and sra_file.exists() and not overwrite:
+    if sra_file.exists() and sra_file.stat().st_size > 0 and not overwrite:
         sample.sra_path = sra_file
         sample.status = "prefetched"
         log(f"[{run_id}] SKIP prefetch: already cached.", sample.log_path)
@@ -97,16 +106,17 @@ def prefetch_one(sample: "Sample", cache_dir: Path, *,
     if overwrite:
         try:
             if sra_file.exists(): sra_file.unlink()
-            alt_dir = cache_dir / run_id
+            alt_dir = target_dir / run_id
             if alt_dir.exists(): shutil.rmtree(alt_dir, ignore_errors=True)
         except Exception:
             pass
 
-    x_opt = ["-X", prefetch_max] if (mode == "cache" and prefetch_max) else []
+    x_opt = ["-X", prefetch_max] if prefetch_max else []
 
     strategies = [
-        ["prefetch", "--force", "all"] + x_opt +
-        ["--type", "sra", "--output-file", str(sra_file), run_id]
+        ["prefetch", "--force", "all"] + x_opt + ["--type", "sra", "--output-directory", str(target_dir), run_id],
+        ["prefetch", "--force", "all"] + x_opt + ["--output-directory", str(target_dir), run_id],
+        ["prefetch", "--force", "all"] + x_opt + ["--type", "sra", "--output-file", str(sra_file), run_id],
     ]
 
     attempt, last_err = 0, None
@@ -114,11 +124,12 @@ def prefetch_one(sample: "Sample", cache_dir: Path, *,
         attempt += 1
         for i, cmd in enumerate(strategies, 1):
             try:
+                target_dir.mkdir(parents=True, exist_ok=True)
                 log(f"[{run_id}] prefetch attempt {attempt}.{i} …", sample.log_path)
-                run_cmd(cmd, cache_dir, sample.log_path)
-                sra_file = _normalize_sra_layout(cache_dir, run_id)
-                if not sra_file.exists():
-                    raise FileNotFoundError(sra_file)
+                run_cmd(cmd, target_dir, sample.log_path)
+                sra_file = _normalize_sra_layout(target_dir, run_id)
+                if not sra_file.exists() or sra_file.stat().st_size == 0:
+                    raise FileNotFoundError(f"SRA file not found or empty at {sra_file} after prefetch")
                 sample.sra_path = sra_file
                 sample.status = "prefetched"
                 log(f"✅ Prefetched [{run_id}] → {sra_file.name}", sample.log_path)

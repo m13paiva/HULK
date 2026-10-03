@@ -84,8 +84,8 @@ def _bundle_srr(
             pre_res = prefetch_one(
                 sample,
                 outdir,
-                sample.log_path,
                 overwrite=True,
+                mode="local",
             )
             if pre_res.get("status") != "prefetched":
                 raise RuntimeError(f"Prefetch failed for {srr} in no-cache mode")
@@ -161,7 +161,13 @@ def _bundle_srr(
             if p is not None and p.exists():
                 _rm(p)
 
-        idx = Path(cfg.reference_path).resolve()
+        idx = None
+        if hasattr(sample, "metadata") and sample.metadata.get("kallisto_index"):
+            idx = Path(sample.metadata["kallisto_index"]).resolve()
+        if idx is None or not idx.exists():
+            idx = (cfg.shared / "transcripts.idx").resolve()
+        if not idx.exists():
+            idx = Path(cfg.reference_path).resolve()
         if not idx.exists():
             raise FileNotFoundError(f"kallisto index not found at {idx}")
 
@@ -191,7 +197,15 @@ def _bundle_srr(
                 bootstraps=bootstraps,
             )
 
-        run_cmd(qcmd, outdir, sample.log_path)
+        try:
+            run_cmd(qcmd, outdir, sample.log_path)
+        except subprocess.CalledProcessError as e:
+            abundance_f = outdir / "abundance.tsv"
+            run_info_f = outdir / "run_info.json"
+            if abundance_f.exists() and abundance_f.stat().st_size > 0 and run_info_f.exists():
+                log(f"[{srr}] Note: kallisto exited with code {e.returncode} but produced valid quantification outputs.", sample.log_path)
+            else:
+                raise
 
         if not getattr(cfg, "keep_fastq", False):
             for p in trimmed:
@@ -282,7 +296,13 @@ def _process_fastq(
 
         run_cmd(cmd, outdir, sample.log_path)
 
-        idx = Path(cfg.reference_path).resolve()
+        idx = None
+        if hasattr(sample, "metadata") and sample.metadata.get("kallisto_index"):
+            idx = Path(sample.metadata["kallisto_index"]).resolve()
+        if idx is None or not idx.exists():
+            idx = (cfg.shared / "transcripts.idx").resolve()
+        if not idx.exists():
+            idx = Path(cfg.reference_path).resolve()
         if not idx.exists():
             raise FileNotFoundError(f"kallisto index not found at {idx}")
 
@@ -310,7 +330,15 @@ def _process_fastq(
                 bootstraps=bootstraps,
             )
 
-        run_cmd(qcmd, outdir, sample.log_path)
+        try:
+            run_cmd(qcmd, outdir, sample.log_path)
+        except subprocess.CalledProcessError as e:
+            abundance_f = outdir / "abundance.tsv"
+            run_info_f = outdir / "run_info.json"
+            if abundance_f.exists() and abundance_f.stat().st_size > 0 and run_info_f.exists():
+                log(f"[FASTQ:{sid}] Note: kallisto exited with code {e.returncode} but produced valid quantification outputs.", sample.log_path)
+            else:
+                raise
 
         if not getattr(cfg, "keep_fastq", False):
             for p in trimmed:
@@ -432,6 +460,8 @@ def process(
         futures.add(fut)
         return True
 
+    last_finished = initial_offset
+
     try:
         while True:
             for f in list(futures):
@@ -440,7 +470,15 @@ def process(
                     sem.release()
                     res = f.result()
                     results[res["run_id"]] = res["status"]
-                    pbar.update(1)
+
+            current_finished = sum(
+                1 for s in dataset.samples
+                if getattr(s, "status", None) in {"done", "failed", "skipped"}
+            )
+            delta = current_finished - last_finished
+            if delta > 0:
+                pbar.update(delta)
+                last_finished = current_finished
 
             for s in dataset.to_do():
                 maybe_launch(s)
@@ -455,6 +493,10 @@ def process(
     finally:
         pool.shutdown(wait=True)
         pbar.close()
+
+    for s in dataset.samples:
+        if s.id not in results:
+            results[s.id] = getattr(s, "status", "unknown")
 
     ok = sum(1 for v in results.values() if v == "done")
     fail = sum(1 for v in results.values() if v == "failed")

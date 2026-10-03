@@ -133,12 +133,21 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
         log_path=log_path,
     )
 
+    # Re-evaluate dataset status after processing
+    data.update_status()
+    total_done = len(getattr(data, "done", lambda: [])())
+
+    if total_done == 0:
+        log("No samples were successfully processed. Skipping downstream global post-processing and network inference.", log_path)
+        print("\n[HULK] No samples were successfully processed. Skipping downstream analysis.")
+        return
+
     # Finalize MultiQC summarization
     if not cfg.no_global_postprocessing:
         try:
             log("Generating Global MultiQC report...", log_path)
             run_multiqc_global(outdir, shared, "multiqc_shared", log_path, modules=("kallisto", "fastp"))
-            generate_read_metrics_plot(data,cfg.shared / "plots", cfg.log)
+            generate_read_metrics_plot(data, cfg.shared / "plots", cfg.log)
         except Exception as e:
             print(f"Global MultiQC failed: {e}")
     else:
@@ -147,11 +156,12 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     # Invoke R dependency chains
     if getattr(cfg, "tx2gene", None) is not None:
         run__postprocessing(data, cfg, skip_bp=True)
-
-    try:
-        run_seidr(cfg)
-    except Exception as e:
-        print(f"[Seidr] Network pipeline failed: {e}")
+        try:
+            run_seidr(cfg)
+        except Exception as e:
+            print(f"[Seidr] Network pipeline failed: {e}")
+    else:
+        log("No tx2gene provided; skipping R steps and Seidr network inference.", log_path)
 
     log("Pipeline finished.", log_path)
 

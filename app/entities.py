@@ -94,7 +94,7 @@ class Config:
         self.input_path = Path(input_path).expanduser().resolve() if input_path is not None else None
         self.reference_path = Path(reference_path).expanduser().resolve() if reference_path is not None else None
         self.outdir = Path(outdir).expanduser().resolve()
-        self.min_threads = min_threads
+        self.min_threads = min(min_threads, max_threads) if max_threads is not None else min_threads
         self.max_threads = max_threads
         self.verbose = verbose
         self.force = force
@@ -441,7 +441,7 @@ class BioProject:
         """Reconciles parent project progression state via constituent child evaluations."""
         rem = self.remaining()
         if rem == 0:
-            self.status = "done"
+            self.status = "done" if self.done() > 0 else "failed"
         elif self.done() > 0:
             self.status = "active"
         else:
@@ -555,14 +555,14 @@ class Dataset:
             for s in self.samples:
                 if s.is_done():
                     s.status = "done"
-                else:
+                elif s.status != "failed":
                     s.status = "pending"
         else:
             for bp in self.bioprojects:
                 for s in bp.samples:
                     if s.is_done():
                         s.status = "done"
-                    else:
+                    elif s.status != "failed":
                         s.status = "pending"
                 bp.update_status()
 
