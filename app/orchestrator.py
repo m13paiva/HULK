@@ -82,6 +82,8 @@ def _finalize_bioproject(bp: "BioProject", cfg: "Config") -> None:
 def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: float = 0.5):
     """
     Allocates thread logic controlling CLI terminal bar outputs syncing standard events.
+    Only bars that have started (>0%) and not yet finished (<100%) are shown, maintaining
+    stable ordering that matches the pipeline workflow sequence.
 
     Args:
         dataset (Dataset): Target group logic array.
@@ -93,52 +95,73 @@ def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: floa
         tuple: (bp_bars, thread reference).
     """
     bioprojects = dataset.bioprojects
-    bp_bars = {}
-    last_done = {}
-    pos = start_position
+    bp_bars: Dict[str, Any] = {}
+    last_done: Dict[str, int] = {}
+    active_positions: Dict[str, int] = {}   # bp_id -> current tqdm position slot
+    closed_bars: set = set()
 
     terminal = {"done", "failed", "skipped"}
-    closed_bars = set()
 
-    # Create bars with initial offset mapping resolving previously completed jobs
+    # Pre-calculate initial completion counts so we can decide immediately
+    # whether a bar should start visible (already in-progress) or hidden.
+    initial_done: Dict[str, int] = {}
     for bp in bioprojects:
-        total = len(bp.samples)
-        if total == 0:
-            closed_bars.add(bp.id)
-            continue
+        cnt = sum(1 for s in bp.samples if getattr(s, "status", None) in terminal)
+        initial_done[bp.id] = cnt
 
+    next_pos = [start_position]   # mutable so the closure can update it
+
+    def _make_bar(bp_id: str, total: int, init: int) -> "tqdm":
+        pos = next_pos[0]
+        next_pos[0] += 1
+        active_positions[bp_id] = pos
         bar = tqdm(
             total=total,
-            desc=pad_desc(bp.id),
+            desc=pad_desc(bp_id),
             unit="Sample",
             position=pos,
             leave=True,
             mininterval=0,
         )
-
-        init = sum(
-            1 for s in bp.samples
-            if getattr(s, "status", None) in terminal
-        )
         if init:
             bar.update(init)
             bar.refresh()
+        return bar
 
-        bp_bars[bp.id] = bar
+    # Open bars immediately for BPs that are already in-progress (resuming a run)
+    for bp in bioprojects:
+        total = len(bp.samples)
+        if total == 0:
+            closed_bars.add(bp.id)
+            continue
+        init = initial_done[bp.id]
         last_done[bp.id] = init
-        pos += 1
+        if 0 < init < total:
+            # Already in-progress: show immediately
+            bp_bars[bp.id] = _make_bar(bp.id, total, init)
+        else:
+            # Not started yet (or already done): keep slot for later, bar created on demand
+            bp_bars[bp.id] = None   # placeholder
 
     def _monitor():
         """Isolates background thread logic probing array resolution dynamically."""
-        already_postprocessed = set()
+        already_postprocessed: set = set()
         force_run = getattr(cfg, "force", False)
 
         while True:
-            if len(closed_bars) == len(bp_bars):
+            all_closed = all(
+                bp.id in closed_bars or len(bp.samples) == 0
+                for bp in bioprojects
+            )
+            if all_closed:
                 break
 
             for bp in bioprojects:
-                if bp.id in closed_bars or bp.id not in bp_bars:
+                if bp.id in closed_bars:
+                    continue
+                total = len(bp.samples)
+                if total == 0:
+                    closed_bars.add(bp.id)
                     continue
 
                 done_now = sum(
@@ -148,11 +171,15 @@ def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: floa
                 delta = done_now - last_done[bp.id]
 
                 if delta > 0:
-                    bp_bars[bp.id].update(delta)
-                    bp_bars[bp.id].refresh()
+                    # If the bar hasn't been created yet (was at 0%), create it now
+                    if bp_bars.get(bp.id) is None and done_now < total:
+                        bp_bars[bp.id] = _make_bar(bp.id, total, done_now)
+                    elif bp_bars.get(bp.id) is not None:
+                        bp_bars[bp.id].update(delta)
+                        bp_bars[bp.id].refresh()
                     last_done[bp.id] = done_now
 
-                if done_now >= len(bp.samples):
+                if done_now >= total:
                     if bp.id not in already_postprocessed:
                         marker = bp.path / ".postprocessing_done"
 
@@ -176,13 +203,17 @@ def _start_bp_progress(dataset, cfg, *, start_position: int = 2, poll_secs: floa
                                 finally:
                                     already_postprocessed.add(bp.id)
 
-                    bp_bars[bp.id].close()
+                    # Close and remove the bar only if it was ever shown
+                    bar = bp_bars.get(bp.id)
+                    if bar is not None:
+                        bar.close()
                     closed_bars.add(bp.id)
 
             time.sleep(poll_secs)
 
+        # Ensure any remaining open bars are closed
         for bid, bar in bp_bars.items():
-            if bid not in closed_bars:
+            if bid not in closed_bars and bar is not None:
                 bar.close()
 
     t = Thread(target=_monitor, daemon=True)

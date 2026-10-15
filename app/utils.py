@@ -341,6 +341,9 @@ def generate_read_metrics_plot(dataset, out_dir: Path, log_path: Path) -> None:
     """
     log("Generating BioProject read metrics summary plot...", log_path)
 
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     data_list = []
 
     for bp in dataset.bioprojects:

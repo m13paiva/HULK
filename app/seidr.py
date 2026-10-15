@@ -18,6 +18,12 @@ ENV_OVERRIDES = os.environ.copy()
 ENV_OVERRIDES["LC_ALL"] = "C"
 ENV_OVERRIDES["LC_NUMERIC"] = "C"
 ENV_OVERRIDES["LANG"] = "C"
+# Prevent OpenBLAS/BLAS from spawning internal thread pools which compete or deadlock
+# when called from within OpenMP loops in Seidr algorithms (e.g. GLMNET in TIGRESS, CLP in NARROMI).
+ENV_OVERRIDES["OPENBLAS_NUM_THREADS"] = "1"
+ENV_OVERRIDES["BLAS_NUM_THREADS"] = "1"
+ENV_OVERRIDES["GOTO_NUM_THREADS"] = "1"
+ENV_OVERRIDES["MKL_NUM_THREADS"] = "1"
 
 ALGO_MAP = {
     "PEARSON": ("correlation", "-m", "pearson", "lm"),
@@ -78,7 +84,7 @@ def _resolve_binaries(needed_algos: List[str]) -> Dict[str, str]:
     return resolved
 
 
-def _run_direct_quiet(cmd: List[str], cwd: Path, log_path: Path):
+def _run_direct_quiet(cmd: List[str], cwd: Path, log_path: Path, env: Optional[Dict[str, str]] = None):
     """
     Executes a direct subprocess hook routing standard output securely against logs,
     surfacing errors globally.
@@ -87,8 +93,10 @@ def _run_direct_quiet(cmd: List[str], cwd: Path, log_path: Path):
         cmd (List[str]): Executable sequence.
         cwd (Path): Expected working directory.
         log_path (Path): File destination routing output.
+        env (Optional[Dict[str, str]]): Environment variables override.
     """
     cmd_str = " ".join(cmd)
+    run_env = env if env is not None else ENV_OVERRIDES
 
     with open(log_path, "a") as f:
         f.write(f"\n[EXEC] {cmd_str}\n")
@@ -100,7 +108,7 @@ def _run_direct_quiet(cmd: List[str], cwd: Path, log_path: Path):
                 cwd=str(cwd),
                 stdout=f,
                 stderr=subprocess.STDOUT,
-                env=ENV_OVERRIDES,
+                env=run_env,
                 check=True
             )
         except subprocess.CalledProcessError as e:
@@ -144,8 +152,11 @@ def _import_scores(seidr_bin: str, algo_name: str, outdir: Path, prefix: str,
     else:
         cmd.extend(["-r", "-z", "-O", str(threads)])
 
+    import_env = ENV_OVERRIDES.copy()
+    import_env["OMP_NUM_THREADS"] = str(threads)
+
     try:
-        _run_direct_quiet(cmd, cwd=outdir, log_path=log_path)
+        _run_direct_quiet(cmd, cwd=outdir, log_path=log_path, env=import_env)
     except subprocess.CalledProcessError:
         raise RuntimeError(f"Import failed for {algo_name}")
 
@@ -298,11 +309,15 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
                     return None
                 cmd.extend(["-M", str(prerequisite_file.resolve())])
 
-            # Set OMP_NUM_THREADS to avoid thread explosion for correlation/pcor
+            # Prevent OpenBLAS/MKL thread explosion inside OpenMP parallel regions:
+            # BLAS must be single-threaded (OPENBLAS_NUM_THREADS=1), while OpenMP
+            # (OMP_NUM_THREADS) provides the actual thread allocation for Seidr.
             task_env = ENV_OVERRIDES.copy()
+            task_env["OPENBLAS_NUM_THREADS"] = "1"
+            task_env["BLAS_NUM_THREADS"] = "1"
+            task_env["GOTO_NUM_THREADS"] = "1"
+            task_env["MKL_NUM_THREADS"] = "1"
             task_env["OMP_NUM_THREADS"] = str(threads)
-            task_env["OPENBLAS_NUM_THREADS"] = str(threads)
-            task_env["MKL_NUM_THREADS"] = str(threads)
 
             print(f"[Seidr] Running {algo}...")
             
@@ -313,8 +328,25 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
                 try:
                     run_managed_subprocess(cmd, cwd=outdir, stdout=f, stderr=subprocess.STDOUT, env=task_env, check=True)
                 except subprocess.CalledProcessError as e:
-                    print(f"[Seidr ERROR] {algo} Command failed. Check {log_path.name}.", file=sys.stderr)
-                    raise e
+                    # Fallback in case a specific binary build strictly restricts --threads
+                    if "-O" in cmd and str(threads) != "1":
+                        o_idx = cmd.index("-O")
+                        fallback_cmd = list(cmd)
+                        fallback_cmd[o_idx + 1] = "1"
+                        fallback_env = task_env.copy()
+                        fallback_env["OMP_NUM_THREADS"] = "1"
+                        retry_msg = f"[Seidr] {algo} failed with -O {threads}. Retrying with single thread (-O 1)..."
+                        print(retry_msg, flush=True)
+                        f.write(f"\n{retry_msg}\n[EXEC] {' '.join(fallback_cmd)}\n")
+                        f.flush()
+                        try:
+                            run_managed_subprocess(fallback_cmd, cwd=outdir, stdout=f, stderr=subprocess.STDOUT, env=fallback_env, check=True)
+                        except subprocess.CalledProcessError as e2:
+                            print(f"[Seidr ERROR] {algo} Command failed. Check {log_path.name}.", file=sys.stderr)
+                            raise e2
+                    else:
+                        print(f"[Seidr ERROR] {algo} Command failed. Check {log_path.name}.", file=sys.stderr)
+                        raise e
                     
             return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, current_fmt, threads, log_path)
 
