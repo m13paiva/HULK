@@ -157,6 +157,7 @@ def pipeline(data: "Dataset", cfg: "Config") -> None:
     if getattr(cfg, "tx2gene", None) is not None:
         run__postprocessing(data, cfg, skip_bp=True)
         try:
+            print("", flush=True)
             run_seidr(cfg)
         except Exception as e:
             print(f"[Seidr] Network pipeline failed: {e}")

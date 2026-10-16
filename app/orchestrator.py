@@ -396,9 +396,11 @@ def run_download_and_process(
     if t_pref:
         t_pref.join()
 
-    t_proc.join()
+    if t_proc:
+        t_proc.join()
 
     if t_bpmon:
         t_bpmon.join()
 
+    print("", flush=True)
     log("[orchestrator] all done", log_path)
