@@ -1,6 +1,29 @@
 # **HULK** Changelog
 ---
 
+## [2.1.0]
+
+### Fixed
+- **Seidr Algorithm Deadlock & Thread Contention (TIGRESS, NARROMI, GENIE3)**:
+  - Fixed a critical thread contention deadlock where Seidr algorithms (particularly TIGRESS using GLMNET and NARROMI using CLP) hung indefinitely during multi-threaded execution.
+  - **Cause**: OpenBLAS/MKL internal thread pools competed with OpenMP parallel loops inside Seidr (`Detect OpenMP Loop and this application may hang`).
+  - **Fix**: Restricted BLAS implementations (`OPENBLAS_NUM_THREADS="1"`, `BLAS_NUM_THREADS="1"`, `GOTO_NUM_THREADS="1"`, `MKL_NUM_THREADS="1"`) while preserving `OMP_NUM_THREADS` set to the allocated thread count. Added automatic single-thread fallback recovery (`-O 1`) if binary-specific thread validations fail.
+- **MultiQC Missing Plots Directory Crash**:
+  - Fixed a crash during global post-processing: `Global MultiQC failed: Cannot save file into a non-existent directory: '<outdir>/shared/plots'`.
+  - **Fix**: Ensured the target `shared/plots` directory is automatically created in `generate_read_metrics_plot` prior to saving summary figures.
+- **Seidr Tqdm Progress Stream & Log File Flooding**:
+  - Fixed an issue where Seidr algorithm progress updates (`|=   | XX% ...`) flooded `log.txt` with thousands of carriage-return lines instead of rendering live on the console.
+  - **Fix**: Added real-time output stream parsing in `_run_seidr_algo_stream` that displays live console `tqdm` progress bars with percentage, rate, and ETA, while stripping carriage-return progress spam from `log.txt` and preserving all standard log and diagnostic entries.
+  - Fixed regex parsing to prevent Seidr log lines (such as `[INFO] ... Writing data: ...`) from being mistakenly absorbed into the ETA string.
+- **Terminal Progress Bar Clutter & Overlapping Lines**:
+  - Overhauled BioProject progress tracking in `orchestrator.py` to only display active BioProjects (>0% and <100%), immediately closing completed bars to prevent terminal clutter.
+  - Resolved cursor collisions between pipeline stages by adding newline flushes between processing, post-processing, and Seidr inference.
+  - Assigned dedicated sequential line positions for concurrent Seidr algorithm bars, ensuring completed bars remain visible at `100% [Done]` without being overwritten.
+- **Deterministic Seidr Algorithm Caching**:
+  - Pre-checks existing `.sf` files in workflow order so skipped algorithms report status sequentially without thread pool race conditions, and prevents accidental drops of dependent algorithms (CLR, ARACNE).
+
+---
+
 ## [2.0.2]
 
 ### Fixed

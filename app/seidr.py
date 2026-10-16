@@ -7,9 +7,12 @@ import subprocess
 import concurrent.futures
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+import re
+import threading
 import pandas as pd
+from tqdm.auto import tqdm
 from .entities import Config
-from .utils import run_managed_subprocess
+from .utils import run_managed_subprocess, register_process, unregister_process, pad_desc
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment Mapping
@@ -18,6 +21,12 @@ ENV_OVERRIDES = os.environ.copy()
 ENV_OVERRIDES["LC_ALL"] = "C"
 ENV_OVERRIDES["LC_NUMERIC"] = "C"
 ENV_OVERRIDES["LANG"] = "C"
+# Prevent OpenBLAS/BLAS from spawning internal thread pools which compete or deadlock
+# when called from within OpenMP loops in Seidr algorithms (e.g. GLMNET in TIGRESS, CLP in NARROMI).
+ENV_OVERRIDES["OPENBLAS_NUM_THREADS"] = "1"
+ENV_OVERRIDES["BLAS_NUM_THREADS"] = "1"
+ENV_OVERRIDES["GOTO_NUM_THREADS"] = "1"
+ENV_OVERRIDES["MKL_NUM_THREADS"] = "1"
 
 ALGO_MAP = {
     "PEARSON": ("correlation", "-m", "pearson", "lm"),
@@ -78,7 +87,130 @@ def _resolve_binaries(needed_algos: List[str]) -> Dict[str, str]:
     return resolved
 
 
-def _run_direct_quiet(cmd: List[str], cwd: Path, log_path: Path):
+_seidr_pos_lock = threading.Lock()
+_seidr_current_pos = 0
+
+def _acquire_seidr_pos() -> int:
+    global _seidr_current_pos
+    with _seidr_pos_lock:
+        pos = _seidr_current_pos
+        _seidr_current_pos += 1
+        return pos
+
+def _reset_seidr_pos() -> None:
+    global _seidr_current_pos
+    with _seidr_pos_lock:
+        _seidr_current_pos = 0
+
+_SEIDR_PROGRESS_RE = re.compile(r"\|[=> -]+\|\s*([0-9.]+)%\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*([0-9:? -]+)")
+
+def _run_seidr_algo_stream(
+    cmd: List[str],
+    cwd: Path,
+    env: Dict[str, str],
+    log_path: Path,
+    algo: str,
+    threads: int
+) -> None:
+    """
+    Executes a Seidr inference algorithm subprocess, capturing stdout/stderr in real-time.
+    Progress updates (matching Seidr's progress bar format) are routed directly to a live
+    Python tqdm progress bar on the console and stripped from the log file.
+    Informational and diagnostic log lines are written cleanly to the log file.
+    """
+    cmd_str = " ".join(cmd)
+
+    with open(log_path, "a", buffering=1) as flog:
+        flog.write(f"\n[EXEC] {cmd_str}\n")
+        flog.flush()
+
+        pos = _acquire_seidr_pos()
+        desc_str = pad_desc(f"[Seidr] {algo}", 18)
+        pbar = tqdm(
+            total=100.0,
+            desc=desc_str,
+            unit="%",
+            position=pos,
+            leave=True,
+            bar_format="{desc}: {percentage:3.0f}%|{bar}| {n:.1f}% [{elapsed}{postfix}]",
+            mininterval=0.1,
+        )
+
+        def _execute_process(exec_cmd: List[str], exec_env: Dict[str, str]) -> int:
+            kwargs = {}
+            if hasattr(os, 'setsid'):
+                kwargs['start_new_session'] = True
+
+            proc = subprocess.Popen(
+                exec_cmd,
+                cwd=str(cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=exec_env,
+                text=True,
+                bufsize=1,
+                **kwargs
+            )
+            register_process(proc)
+
+            try:
+                assert proc.stdout is not None
+                for raw_line in proc.stdout:
+                    matches = list(_SEIDR_PROGRESS_RE.finditer(raw_line))
+                    if matches:
+                        last_m = matches[-1]
+                        pct, rate, elapsed, eta = last_m.groups()
+                        try:
+                            val = min(100.0, float(pct))
+                            pbar.n = val
+                            pbar.set_postfix_str(f"{rate.strip()} | ETA: {eta.strip()}")
+                            pbar.refresh()
+                        except Exception:
+                            pass
+
+                        cleaned = _SEIDR_PROGRESS_RE.sub("", raw_line).strip()
+                        if cleaned:
+                            flog.write(cleaned + "\n")
+                            flog.flush()
+                    else:
+                        flog.write(raw_line)
+                        flog.flush()
+            finally:
+                unregister_process(proc)
+
+            return proc.wait()
+
+        try:
+            ret = _execute_process(cmd, env)
+
+            # Defensive fallback: If tool failed with -O, retry with -O 1
+            if ret != 0 and "-O" in cmd and str(threads) != "1":
+                o_idx = cmd.index("-O")
+                fallback_cmd = list(cmd)
+                fallback_cmd[o_idx + 1] = "1"
+                fallback_env = env.copy()
+                fallback_env["OMP_NUM_THREADS"] = "1"
+                retry_msg = f"[Seidr] {algo} failed with -O {threads}. Retrying with single thread (-O 1)..."
+                flog.write(f"\n{retry_msg}\n[EXEC] {' '.join(fallback_cmd)}\n")
+                flog.flush()
+                pbar.set_postfix_str("Retrying -O 1...")
+                pbar.refresh()
+                ret = _execute_process(fallback_cmd, fallback_env)
+
+            if ret != 0:
+                pbar.set_postfix_str("FAILED")
+                pbar.refresh()
+                raise subprocess.CalledProcessError(ret, cmd)
+            else:
+                pbar.n = 100.0
+                pbar.set_postfix_str("Done")
+                pbar.refresh()
+
+        finally:
+            pbar.close()
+
+
+def _run_direct_quiet(cmd: List[str], cwd: Path, log_path: Path, env: Optional[Dict[str, str]] = None):
     """
     Executes a direct subprocess hook routing standard output securely against logs,
     surfacing errors globally.
@@ -87,8 +219,10 @@ def _run_direct_quiet(cmd: List[str], cwd: Path, log_path: Path):
         cmd (List[str]): Executable sequence.
         cwd (Path): Expected working directory.
         log_path (Path): File destination routing output.
+        env (Optional[Dict[str, str]]): Environment variables override.
     """
     cmd_str = " ".join(cmd)
+    run_env = env if env is not None else ENV_OVERRIDES
 
     with open(log_path, "a") as f:
         f.write(f"\n[EXEC] {cmd_str}\n")
@@ -100,7 +234,7 @@ def _run_direct_quiet(cmd: List[str], cwd: Path, log_path: Path):
                 cwd=str(cwd),
                 stdout=f,
                 stderr=subprocess.STDOUT,
-                env=ENV_OVERRIDES,
+                env=run_env,
                 check=True
             )
         except subprocess.CalledProcessError as e:
@@ -144,8 +278,11 @@ def _import_scores(seidr_bin: str, algo_name: str, outdir: Path, prefix: str,
     else:
         cmd.extend(["-r", "-z", "-O", str(threads)])
 
+    import_env = ENV_OVERRIDES.copy()
+    import_env["OMP_NUM_THREADS"] = str(threads)
+
     try:
-        _run_direct_quiet(cmd, cwd=outdir, log_path=log_path)
+        _run_direct_quiet(cmd, cwd=outdir, log_path=log_path, env=import_env)
     except subprocess.CalledProcessError:
         raise RuntimeError(f"Import failed for {algo_name}")
 
@@ -260,7 +397,19 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
 
     prefix = f"{label}_"
     seidr = tools["seidr"]
-    sf_files = []
+    _reset_seidr_pos()
+
+    sf_files: List[Path] = []
+    to_run: List[str] = []
+
+    # 1. Pre-check existing .sf files in workflow order
+    for algo in algorithms:
+        out_sf = outdir / f"{prefix}{algo.lower()}_scores.sf"
+        if out_sf.exists() and not force:
+            print(f"[Seidr] {algo} network already exists (.sf found). Skipping calculation.", flush=True)
+            sf_files.append(out_sf)
+        else:
+            to_run.append(algo)
 
     def run_algo_task(algo: str, prerequisite_file: Optional[Path] = None) -> Optional[Path]:
         try:
@@ -272,7 +421,6 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
             out_sf = outdir / f"{prefix}{algo.lower()}_scores.sf"
 
             if out_sf.exists() and not force:
-                print(f"[Seidr] {algo} network already exists (.sf found). Skipping calculation.", flush=True)
                 return out_sf
 
             if out_tsv.exists():
@@ -294,28 +442,18 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
 
             if algo in ["CLR", "ARACNE"]:
                 if not prerequisite_file or not prerequisite_file.exists():
-                    print(f"[Seidr ERROR] {algo} missing prerequisite.", file=sys.stderr)
+                    print(f"[Seidr ERROR] {algo} missing prerequisite {prerequisite_file}.", file=sys.stderr)
                     return None
                 cmd.extend(["-M", str(prerequisite_file.resolve())])
 
-            # Set OMP_NUM_THREADS to avoid thread explosion for correlation/pcor
             task_env = ENV_OVERRIDES.copy()
+            task_env["OPENBLAS_NUM_THREADS"] = "1"
+            task_env["BLAS_NUM_THREADS"] = "1"
+            task_env["GOTO_NUM_THREADS"] = "1"
+            task_env["MKL_NUM_THREADS"] = "1"
             task_env["OMP_NUM_THREADS"] = str(threads)
-            task_env["OPENBLAS_NUM_THREADS"] = str(threads)
-            task_env["MKL_NUM_THREADS"] = str(threads)
 
-            print(f"[Seidr] Running {algo}...")
-            
-            cmd_str = " ".join(cmd)
-            with open(log_path, "a") as f:
-                f.write(f"\n[EXEC] {cmd_str}\n")
-                f.flush()
-                try:
-                    run_managed_subprocess(cmd, cwd=outdir, stdout=f, stderr=subprocess.STDOUT, env=task_env, check=True)
-                except subprocess.CalledProcessError as e:
-                    print(f"[Seidr ERROR] {algo} Command failed. Check {log_path.name}.", file=sys.stderr)
-                    raise e
-                    
+            _run_seidr_algo_stream(cmd, outdir, task_env, log_path, algo, threads)
             return _import_scores(seidr, algo, outdir, prefix, out_tsv, genes_file, current_fmt, threads, log_path)
 
         except Exception as e:
@@ -325,14 +463,17 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
                 f.write(f"\n{err_msg}\n")
             return None
 
-    # 1. MI (Sequential dependency blocks limiting execution variables limits array map indicators variable limits limit)
-    mi_sf = None
-    if any(x in algorithms for x in ["MI", "CLR", "ARACNE"]):
+    # 2. Sequential MI if required as dependency or target
+    need_mi = ("MI" in to_run) or (any(a in to_run for a in ["CLR", "ARACNE"]) and not (outdir / f"{prefix}mi_scores.tsv").exists())
+    if need_mi:
         mi_sf = run_algo_task("MI")
-        if "MI" in algorithms and mi_sf: sf_files.append(mi_sf)
+        if mi_sf and "MI" in algorithms and mi_sf not in sf_files:
+            sf_files.append(mi_sf)
+        if "MI" in to_run:
+            to_run.remove("MI")
 
-    # 2. Parallel processing structure indicator mapping arrays limit strings properties mappings variables map arrays target bounds limits variables string indicators map variables arrays parameters properties bounds boolean limits map bounds target limit bounds variables bounds array map target limits parameter constraints variables strings properties targets limits variables limits mapping structures arrays variables targets arrays bounds variables string property map variable limitations properties strings bounds parameter targets target map variable indicator limit bounds strings variables map properties target limitation targets variables parameter properties target mapping limits bounds limit target bounds.
-    parallel_algos = [a for a in algorithms if a != "MI"]
+    # 3. Parallel processing for remaining algorithms
+    parallel_algos = [a for a in to_run if a != "MI"]
     safe_workers = int(max_workers) if max_workers else 1
 
     if parallel_algos:
@@ -343,12 +484,16 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
                 if algo in ["CLR", "ARACNE"]:
                     prereq = outdir / f"{prefix}mi_scores.tsv"
                     if not prereq.exists():
+                        print(f"[Seidr ERROR] {algo} missing prerequisite {prereq.name}.", file=sys.stderr)
                         continue
                 future_map[executor.submit(run_algo_task, algo, prereq)] = algo
 
             for future in concurrent.futures.as_completed(future_map):
                 res = future.result()
-                if res: sf_files.append(res)
+                if res and res not in sf_files:
+                    sf_files.append(res)
+
+        print("", flush=True)
 
     if not sf_files:
         print(f"[Seidr ERROR] Aborting {label}: No algorithms succeeded.", file=sys.stderr)
