@@ -300,8 +300,21 @@ def _safe_float(x: Any) -> float:
         return 0.0
 
 
+def _has_valid_edges(edge_path: Path) -> bool:
+    """Check if an exported edge file exists, is non-empty, and contains non-zero weights."""
+    if not edge_path.exists() or edge_path.stat().st_size == 0:
+        return False
+    try:
+        sample = pd.read_csv(edge_path, sep="\t", nrows=50)
+        if "Weight" in sample.columns:
+            return bool((sample["Weight"] != 0.0).any())
+        return True
+    except Exception:
+        return False
+
+
 def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path, label: str, no_full: bool,
-                    log_path: Path):
+                    log_path: Path, aggregate_mode: str = "borda"):
     """
     Processes final aggregated outputs directly into flat file components natively ready for ingestion
     into downstream standard analytical R packages (like EGAD).
@@ -314,35 +327,93 @@ def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path
         label (str): Operational descriptor indicating output grouping string limits.
         no_full (bool): Flag defining truncation of heavy matrices output arrays limits.
         log_path (Path): Logging routing indicator output format.
+        aggregate_mode (str): Aggregation method used (borda, irp, top1, top2).
     """
     print(f"[Seidr] Exporting {label} results...")
 
     cmd = [seidr, "view", "--column-headers", str(bb_sf)]
+    tmp_tsv = outdir / f".network_{label}_view.tmp"
 
     try:
-        proc = run_managed_subprocess(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV_OVERRIDES, check=True)
-        res_stdout = proc.stdout.read() if proc.stdout else ""
+        with open(tmp_tsv, "w") as f_out, open(log_path, "a") as f_log:
+            f_log.write(f"\n[EXEC] {' '.join(cmd)} > {tmp_tsv.name}\n")
+            f_log.flush()
+            run_managed_subprocess(cmd, stdout=f_out, stderr=f_log, env=ENV_OVERRIDES, check=True)
     except subprocess.CalledProcessError as e:
         print(f"[Seidr ERROR] Export failed: {e}", file=sys.stderr)
+        tmp_tsv.unlink(missing_ok=True)
+        return
+    except Exception as e:
+        print(f"[Seidr ERROR] Export failed unexpectedly: {e}", file=sys.stderr)
+        tmp_tsv.unlink(missing_ok=True)
         return
 
-    if not res_stdout.strip():
+    if not tmp_tsv.exists() or tmp_tsv.stat().st_size == 0:
         print(f"[Warn] No edges found in {bb_sf}.")
+        tmp_tsv.unlink(missing_ok=True)
         return
 
     try:
-        df = pd.read_csv(io.StringIO(res_stdout), sep="\t", engine="python")
+        df = pd.read_csv(tmp_tsv, sep="\t", engine="c", on_bad_lines="skip")
     except Exception as e:
         print(f"[Error] Failed to parse Seidr table: {e}")
+        tmp_tsv.unlink(missing_ok=True)
         return
 
-    numeric_cols = [c for c in df.columns if c not in ["Source", "Target"] and "interaction" not in c.lower()]
-    for c in numeric_cols: df[c] = df[c].apply(_safe_float)
+    if df.empty or len(df.columns) < 3:
+        print(f"[Warn] Empty or malformed Seidr table from {bb_sf}.")
+        tmp_tsv.unlink(missing_ok=True)
+        return
 
-    agg_col = df.columns[-1]
-    simple = df[["Source", "Target", agg_col]].copy().rename(columns={agg_col: "Weight"})
+    non_numeric = {"source", "target", "type", "interaction"}
+    numeric_cols = [c for c in df.columns if c.lower() not in non_numeric and "interaction" not in c.lower()]
+    for c in numeric_cols:
+        if pd.api.types.is_numeric_dtype(df[c]):
+            df[c] = df[c].fillna(0.0)
+        else:
+            df[c] = pd.to_numeric(df[c].astype(str).str.split(";").str[0], errors="coerce").fillna(0.0)
 
-    irp_col = next((c for c in df.columns if "IRP" in c.upper()), None)
+    agg_mode_lower = str(aggregate_mode).lower()
+
+    # Identify candidate consensus column
+    consensus_col = None
+    for c in df.columns:
+        c_clean = c.lower().split(";")[0].split("_")[0]
+        if c_clean == agg_mode_lower or agg_mode_lower in c.lower():
+            consensus_col = c
+            break
+
+    # Fallback 1: Any column containing "borda", "irp", "top1", "top2"
+    if not consensus_col:
+        for c in df.columns:
+            if any(m in c.lower() for m in ["borda", "irp", "top1", "top2"]):
+                consensus_col = c
+                break
+
+    # Fallback 2: Look for column right before backbone metrics (NC_score/NC_sdev)
+    if not consensus_col:
+        non_algo_cols = {"source", "target", "type", "interaction", "nc_score", "nc_sdev"}
+        upper_algos = {a.upper() for a in algorithms}
+        potential = [
+            c for c in df.columns
+            if c.lower() not in non_algo_cols
+            and not any(c.upper().startswith(a) for a in upper_algos)
+        ]
+        if potential:
+            consensus_col = potential[0]
+        else:
+            consensus_col = df.columns[-1]
+
+    score_label = f"{agg_mode_lower.upper()}_score"
+    simple = pd.DataFrame({
+        "Source": df["Source"],
+        "Target": df["Target"],
+        "Weight": df[consensus_col],
+        score_label: df[consensus_col]
+    })
+
+    # If IRP was also in df and distinct, keep it too
+    irp_col = next((c for c in df.columns if "IRP" in c.upper() and c != consensus_col), None)
     if irp_col:
         simple["IRP_score"] = df[irp_col]
 
@@ -357,6 +428,8 @@ def _export_results(outdir: Path, algorithms: List[str], seidr: str, bb_sf: Path
 
     df[keepers].to_csv(outdir / f"network_{label}_algs.tsv", sep="\t", index=False)
     if not no_full: df.to_csv(outdir / f"network_{label}_edges_full.tsv", sep="\t", index=False)
+
+    tmp_tsv.unlink(missing_ok=True)
 
 
 def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, threads: int, max_workers: int,
@@ -398,6 +471,18 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
     prefix = f"{label}_"
     seidr = tools["seidr"]
     _reset_seidr_pos()
+
+    out_edges = outdir / f"network_{label}_edges.tsv"
+    if out_edges.exists() and _has_valid_edges(out_edges) and not force:
+        print(f"[Seidr] {label} network edges already exist ({out_edges.name}). Skipping.", flush=True)
+        return
+
+    bb_sf = outdir / f"network_{label}.bb.sf"
+    if bb_sf.exists() and bb_sf.stat().st_size > 0 and not force:
+        print(f"[Seidr] Backbone network already exists ({bb_sf.name}). Resuming directly at export...", flush=True)
+        _export_results(outdir, algorithms, seidr, bb_sf, label, no_full, log_path, aggregate_mode)
+        if out_edges.exists() and _has_valid_edges(out_edges):
+            return
 
     sf_files: List[Path] = []
     to_run: List[str] = []
@@ -499,40 +584,49 @@ def _build_network_task(outdir: Path, genes_file: Path, expression_file: Path, t
         print(f"[Seidr ERROR] Aborting {label}: No algorithms succeeded.", file=sys.stderr)
         return
 
-    # 3. Aggregate
     net_sf = outdir / f"network_{label}.sf"
-    print(f"[Seidr] Aggregating {len(sf_files)} networks...")
-
-    if force and net_sf.exists():
-        net_sf.unlink()
-
-    try:
-        _run_direct_quiet([seidr, "aggregate", "-o", str(net_sf), "-m", aggregate_mode] + [str(s) for s in sf_files],
-                          cwd=outdir, log_path=log_path)
-    except Exception:
-        return
-
-    # 4. Backbone
-    print(f"[Seidr] Backbone pruning ({backbone})...")
     bb_sf = outdir / f"network_{label}.bb.sf"
-
-    if force and bb_sf.exists():
-        bb_sf.unlink()
-
     out_edges = outdir / f"network_{label}_edges.tsv"
 
-    try:
-        _run_direct_quiet([seidr, "backbone", "-F", str(backbone), str(net_sf)], cwd=outdir, log_path=log_path)
-        if bb_sf.exists():
-            _export_results(outdir, algorithms, seidr, bb_sf, label, no_full, log_path)
-    except Exception as e:
-        print(f"[Warn] Backbone failed for {label}: {e}", file=sys.stderr)
+    if out_edges.exists() and _has_valid_edges(out_edges) and not force:
+        print(f"[Seidr] {label} network edges already exist ({out_edges.name}). Skipping.", flush=True)
+        return
+
+    if bb_sf.exists() and bb_sf.stat().st_size > 0 and not force:
+        print(f"[Seidr] Backbone network already exists ({bb_sf.name}). Resuming directly at export...", flush=True)
+        _export_results(outdir, algorithms, seidr, bb_sf, label, no_full, log_path, aggregate_mode)
+    else:
+        # 3. Aggregate
+        if net_sf.exists() and net_sf.stat().st_size > 0 and not force:
+            print(f"[Seidr] Aggregate network already exists ({net_sf.name}). Skipping aggregation...", flush=True)
+        else:
+            print(f"[Seidr] Aggregating {len(sf_files)} networks...")
+            if force and net_sf.exists():
+                net_sf.unlink()
+
+            try:
+                _run_direct_quiet([seidr, "aggregate", "-o", str(net_sf), "-m", aggregate_mode] + [str(s) for s in sf_files],
+                                  cwd=outdir, log_path=log_path)
+            except Exception:
+                return
+
+        # 4. Backbone
+        print(f"[Seidr] Backbone pruning ({backbone})...")
+        if force and bb_sf.exists():
+            bb_sf.unlink()
+
+        try:
+            _run_direct_quiet([seidr, "backbone", "-F", str(backbone), str(net_sf)], cwd=outdir, log_path=log_path)
+            if bb_sf.exists():
+                _export_results(outdir, algorithms, seidr, bb_sf, label, no_full, log_path, aggregate_mode)
+        except Exception as e:
+            print(f"[Warn] Backbone failed for {label}: {e}", file=sys.stderr)
 
     # Fallback: if backbone pruning produced no valid edge file, export aggregate network
     if not out_edges.exists() or out_edges.stat().st_size == 0:
         if net_sf.exists():
             print(f"[Seidr] Backbone yielded no edges for {label}. Exporting aggregate network as fallback...", flush=True)
-            _export_results(outdir, algorithms, seidr, net_sf, label, no_full, log_path)
+            _export_results(outdir, algorithms, seidr, net_sf, label, no_full, log_path, aggregate_mode)
 
 
 def run_seidr(cfg: Config, force: bool = False) -> None:
@@ -581,7 +675,7 @@ def run_seidr(cfg: Config, force: bool = False) -> None:
         "outdir": outdir, "genes_file": Path(opts["genes_file"]),
         "expression_file": Path(opts["expression_file"]), "threads": cfg.max_threads,
         "max_workers": workers, "backbone": float(opts.get("backbone", 1.28)),
-        "aggregate_mode": opts.get("aggregate", "irp"), "algorithms": algos, "tools": tools,
+        "aggregate_mode": opts.get("aggregate", "borda"), "algorithms": algos, "tools": tools,
         "no_full": opts.get("no_full", False), "log_path": log_path,
         "force": (force or opts.get("force", False))
     }
@@ -596,8 +690,9 @@ def run_seidr_batch(cfg: Config, genes_file: Path, expression_file: Path, outdir
     log_path = outdir / "seidr_batch.log"
     algos = [a.upper() for a in PRESETS.get(preset.upper(), PRESETS["FAST"])]
     tools = _resolve_binaries(algos)
+    agg_mode = cfg.get_tool_opts("seidr").get("aggregate", "borda")
 
-    _build_network_task(outdir, genes_file, expression_file, (threads or cfg.max_threads), 1, 1.28, "irp", algos, tools,
+    _build_network_task(outdir, genes_file, expression_file, (threads or cfg.max_threads), 1, 1.28, agg_mode, algos, tools,
                         "saturation", False, None, True, log_path, True)
 
     allowed_files = {"expression.tsv", "genes.txt", "network_saturation_edges.tsv", "network_edges.tsv", "seidr_batch.log", ".seidr.done"}

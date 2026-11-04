@@ -77,7 +77,11 @@ def run_managed_subprocess(
     )
     register_process(proc)
     try:
-        ret = proc.wait()
+        if stdout == subprocess.PIPE or stderr == subprocess.PIPE:
+            out, err = proc.communicate()
+            ret = proc.returncode
+        else:
+            ret = proc.wait()
         if check and ret != 0:
             raise subprocess.CalledProcessError(ret, cmd)
         return proc

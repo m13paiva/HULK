@@ -471,7 +471,8 @@ def _print_config_summary(dataset: Dataset, cfg: Config) -> None:
 
     # --- Seidr ---
     seidr_status = "ENABLED" if getattr(cfg, "seidr_enabled", False) else "DISABLED"
-    print(f"Seidr (Network):      {seidr_status}")
+    seidr_agg = getattr(cfg, "seidr_aggregate", "borda").upper()
+    print(f"Seidr (Network):      {seidr_status} (Agg: {seidr_agg})")
 
     print("=====================================\n")
 
@@ -503,6 +504,7 @@ def _run_pipeline(
         iterations: int = 3,
         steps: int = 10,
         sat_seidr_preset: str = "FAST",
+        seidr_aggregate: str | None = None,
         seed: int | None = None,
         sat_workers: int = 4,
         plot_only: bool = False,
@@ -521,7 +523,7 @@ def _run_pipeline(
     ws = trim_cfg.get("window_size", 4)
     mq = trim_cfg.get("mean_quality", 20)
     align_method = (align_cfg.get("method") or "kallisto").lower()
-    kallisto_bootstrap = int(align_cfg.get("bootstrap", 100))
+    kallisto_bootstrap = int(align_cfg.get("bootstrap", 0))
 
     txi_mode = txi_cfg.get("mode") or "raw_counts"
     txi_ignore = bool(txi_cfg.get("ignore_tx_version", False))
@@ -570,6 +572,9 @@ def _run_pipeline(
         no_bp_postprocessing=no_bp_postprocessing,
         no_global_postprocessing=no_global_postprocessing,
     )
+
+    if seidr_aggregate:
+        cfg.seidr_aggregate = seidr_aggregate.lower()
 
     trans_suff = transcriptome_suffixes(reference_path)
     if trans_suff not in TRANSCRIPTOME_FORMATS:
@@ -683,6 +688,7 @@ def _run_pipeline(
             sat_cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only, mapman_file=mapman_path,
                              go_file=go_file_path)
             sat_cfg.seidr_preset = sat_seidr_preset.upper()
+            sat_cfg.seidr_aggregate = getattr(cfg, "seidr_aggregate", "borda")
             sat_dataset = Dataset.reconstruct_from_output(sat_cfg)
 
             orch = BatchOrchestrator(
@@ -777,7 +783,7 @@ def tximport(mode: str | None, ignore_tx_version: bool | None, reset_defaults: b
 @cli.command("align", cls=HulkCommand, help="Configure alignment/quantification.")
 @click.option("--method", type=click.Choice(["kallisto"], case_sensitive=False),
               default=None, show_default="kallisto")
-@click.option("-b", "--bootstrap", type=int, default=None, show_default="100")
+@click.option("-b", "--bootstrap", type=int, default=None, show_default="0")
 @click.option("--reset-defaults", is_flag=True)
 def align(method: str | None, bootstrap: int | None, reset_defaults: bool):
     """Saves pseudo-alignment defaults to persistent configuration storage."""
@@ -797,7 +803,7 @@ def align(method: str | None, bootstrap: int | None, reset_defaults: bool):
 
     print("\nCurrent Alignment Configuration:")
     print(f"  Method:     {align_cfg.get('method', 'kallisto')}")
-    print(f"  Bootstraps: {align_cfg.get('bootstrap', 100)}")
+    print(f"  Bootstraps: {align_cfg.get('bootstrap', 0)}")
 
 
 @cli.command("deseq2", cls=HulkCommand, help="Configure DESeq2 and variance filtering options.")
@@ -884,6 +890,9 @@ def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sam
               multiple=True, help="Manually select specific algorithms (overrides preset).")
 @click.option("-b", "--backbone", type=float, default=None, show_default="1.28",
               help="Backbone significance threshold (Fdr).")
+@click.option("-a", "--aggregate", type=click.Choice(["borda", "irp", "top1", "top2"], case_sensitive=False),
+              default=None, show_default="borda",
+              help="Aggregation algorithm used to merge individual networks (default: borda).")
 @click.option("-w", "--workers", type=int, default=None, show_default="2",
               help="Number of algorithms to run in parallel.")
 @click.option("-t", "--target", "targets", type=click.Path(exists=True, dir_okay=False, path_type=Path),
@@ -895,7 +904,7 @@ def plot(global_pca, global_heatmap, global_var_heatmap, bp_pca, bp_heatmap, sam
 @click.option("-f", "--force/--no-force", "force_setting", default=None,
               help="Persist a 'Force' preference. If True, Seidr always ignores cache.")
 @click.option("--reset-defaults", is_flag=True, help="Reset Seidr options to defaults.")
-def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, force_setting, reset_defaults):
+def seidr(enabled, preset, algorithms, backbone, aggregate, workers, targets, target_mode, force_setting, reset_defaults):
     """
     Configure defaults for the Seidr inference step.
     Use this to set up how networks are built when running 'hulk ...'.
@@ -921,6 +930,7 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
         if "preset" in seidr_cfg: del seidr_cfg["preset"]
 
     if backbone is not None: seidr_cfg["backbone"] = backbone
+    if aggregate: seidr_cfg["aggregate"] = aggregate.lower()
     if workers is not None: seidr_cfg["workers"] = workers
     if target_mode: seidr_cfg["target_mode"] = target_mode
 
@@ -940,6 +950,7 @@ def seidr(enabled, preset, algorithms, backbone, workers, targets, target_mode, 
         print(f"  Algorithms:  {', '.join(seidr_cfg['algorithms'])}")
     else:
         print(f"  Preset:      {seidr_cfg.get('preset', 'BALANCED')}")
+    print(f"  Aggregate:   {seidr_cfg.get('aggregate', 'borda').upper()}")
     print(f"  Backbone:    {seidr_cfg.get('backbone', 1.28)}")
     print(f"  Parallel:    {seidr_cfg.get('workers', 2)} workers")
     saved_targets = seidr_cfg.get("targets", [])
@@ -1058,6 +1069,9 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
 @click.option("--seidr-preset", type=click.Choice(list(PRESETS.keys()), case_sensitive=False),
               default="FAST", show_default=True,
               help="Seidr consensus algorithm preset.")
+@click.option("--seidr-aggregate", type=click.Choice(["borda", "irp", "top1", "top2"], case_sensitive=False),
+              default="borda", show_default=True,
+              help="Seidr consensus aggregation algorithm.")
 @click.option("--seed", type=int, default=None, help="Random seed for reproducibility.")
 @click.option("-w", "--workers", type=int, default=4, show_default=True,
               help="Number of concurrent jobs.")
@@ -1078,14 +1092,14 @@ def report(output_dir, tx2gene_path, target_genes_files, no_bp_postprocessing, n
     help="File(s) containing target genes (one gene per line). Can be used multiple times.",
 )
 @click.option("--plot-only", is_flag=True, help="Skip processing and only regenerate plots from existing raw results.")
-def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threads, force, mapman, go_file, metrics,
+def saturation(output_dir, iterations, steps, seidr_preset, seidr_aggregate, seed, workers, threads, force, mapman, go_file, metrics,
                target_genes_files, plot_only):
     """
     Executes a comprehensive data saturation check to infer correlation reliability as network subsets expand.
     """
     click.secho("\n[Saturation] Initializing Data Saturation Analysis...", fg="cyan", bold=True)
     click.secho(
-        f"[Saturation] Seidr: {seidr_preset} | Steps: {steps} | Iters: {iterations} | Force: {force} | Plot Only: {plot_only} | Metrics: {metrics.upper()}",
+        f"[Saturation] Seidr: {seidr_preset} (Agg: {seidr_aggregate.upper()}) | Steps: {steps} | Iters: {iterations} | Force: {force} | Plot Only: {plot_only} | Metrics: {metrics.upper()}",
         fg="cyan")
 
     if seed: click.secho(f"[Saturation] Seed: {seed}", fg="magenta")
@@ -1096,6 +1110,7 @@ def saturation(output_dir, iterations, steps, seidr_preset, seed, workers, threa
         cfg = Config(outdir=output_dir, tx2gene=None, plots_only_mode=plot_only, mapman_file=mapman, go_file=go_file,
                      target_genes_files=target_files_list)
         cfg.seidr_preset = seidr_preset.upper()
+        cfg.seidr_aggregate = seidr_aggregate.lower()
 
         dataset = Dataset.reconstruct_from_output(cfg)
         click.secho(f"[Saturation] Loaded {len(dataset)} samples from {output_dir}", fg="green")

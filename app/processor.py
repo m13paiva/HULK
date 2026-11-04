@@ -77,7 +77,7 @@ def _bundle_srr(
     tmp = (temp_dir / f"{srr}_tmp").resolve()
     tmp.mkdir(parents=True, exist_ok=True)
 
-    bootstraps = int(getattr(cfg, "kallisto_bootstrap", 100))
+    bootstraps = int(getattr(cfg, "kallisto_bootstrap", 0))
 
     if getattr(cfg, "no_cache", False):
         if getattr(sample, "sra_path", None) is None or not Path(sample.sra_path).exists():
@@ -138,7 +138,18 @@ def _bundle_srr(
 
         _rm(sra)
 
-        cmd = ["fastp", "-w", str(fastp_threads)]
+        ws = getattr(cfg, "trim_window_size", 4)
+        mq = getattr(cfg, "trim_mean_quality", 20)
+        trim_flags = [
+            "--cut_front",
+            "--cut_front_window_size", str(ws),
+            "--cut_front_mean_quality", str(mq),
+            "--cut_tail",
+            "--cut_tail_window_size", str(ws),
+            "--cut_tail_mean_quality", str(mq),
+        ]
+
+        cmd = ["fastp", "-w", str(fastp_threads)] + trim_flags
 
         if len(fqs) == 2:
             trimmed = [outdir / f"{srr}_1.trim.fastq", outdir / f"{srr}_2.trim.fastq"]
@@ -261,10 +272,21 @@ def _process_fastq(
     if not fqs:
         raise FileNotFoundError(f"No FASTQ paths registered for FASTQ sample '{sid}'")
 
-    bootstraps = int(getattr(cfg, "kallisto_bootstrap", 100))
+    bootstraps = int(getattr(cfg, "kallisto_bootstrap", 0))
 
     try:
         sample.status = "processing"
+
+        ws = getattr(cfg, "trim_window_size", 4)
+        mq = getattr(cfg, "trim_mean_quality", 20)
+        trim_flags = [
+            "--cut_front",
+            "--cut_front_window_size", str(ws),
+            "--cut_front_mean_quality", str(mq),
+            "--cut_tail",
+            "--cut_tail_window_size", str(ws),
+            "--cut_tail_mean_quality", str(mq),
+        ]
 
         if len(fqs) == 2:
             trimmed_r1 = outdir / f"{sid}_1.trim.fastq"
@@ -274,6 +296,7 @@ def _process_fastq(
             cmd = [
                 "fastp",
                 "-w", str(fastp_threads),
+            ] + trim_flags + [
                 "-i", str(fqs[0]),
                 "-I", str(fqs[1]),
                 "-o", str(trimmed_r1),
@@ -286,6 +309,7 @@ def _process_fastq(
             cmd = [
                 "fastp",
                 "-w", str(fastp_threads),
+            ] + trim_flags + [
                 "-i", str(fqs[0]),
                 "-o", str(trimmed_se),
             ]
