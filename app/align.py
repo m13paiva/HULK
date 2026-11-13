@@ -142,7 +142,7 @@ def kallisto_single_cmd(
         log_path: Path,
         error_warnings: list[str],
         *,
-        bootstraps: int = 100,
+        bootstraps: int = 0,
 ) -> list[str]:
     """
     Constructs the `kallisto quant` command array for single-end FASTQ data.
@@ -155,7 +155,7 @@ def kallisto_single_cmd(
         platform (str | None): Sequencing platform, used to infer fragment length parameters.
         log_path (Path): Path to the log file.
         error_warnings (list[str]): List reference to append warnings during file detection.
-        bootstraps (int, optional): Number of bootstrap samples. Defaults to 100.
+        bootstraps (int, optional): Number of bootstrap samples. Defaults to 0.
 
     Returns:
         list[str]: The complete Kallisto command array ready for subprocess execution.
@@ -164,16 +164,20 @@ def kallisto_single_cmd(
     fq = pick_fastq(run_dir, run_id, log_path, error_warnings)
     fl = get_frag_params(platform)
 
-    return [
+    cmd = [
         "kallisto", "quant",
         "--plaintext",
         "-i", str(Path(index_path).resolve()),
         "-o", str(run_dir.resolve()),
         "-t", str(threads),
-        "-b", str(int(bootstraps)),
+    ]
+    if int(bootstraps) > 0:
+        cmd.extend(["-b", str(int(bootstraps))])
+    cmd.extend([
         "--single", "-l", str(fl.mean), "-s", str(fl.sd),
         str(fq.resolve()),
-    ]
+    ])
+    return cmd
 
 
 def kallisto_paired_cmd(
@@ -184,7 +188,7 @@ def kallisto_paired_cmd(
         log_path: Path,
         error_warnings: list[str],
         *,
-        bootstraps: int = 100,
+        bootstraps: int = 0,
 ) -> list[str]:
     """
     Constructs the `kallisto quant` command array for paired-end FASTQ data.
@@ -196,7 +200,7 @@ def kallisto_paired_cmd(
         threads (int): Number of threads to allocate for the process.
         log_path (Path): Path to the log file.
         error_warnings (list[str]): List reference to append warnings during file detection.
-        bootstraps (int, optional): Number of bootstrap samples. Defaults to 100.
+        bootstraps (int, optional): Number of bootstrap samples. Defaults to 0.
 
     Returns:
         list[str]: The complete Kallisto command array ready for subprocess execution.
@@ -205,15 +209,17 @@ def kallisto_paired_cmd(
     r1 = pick_fastq(run_dir, f"{run_id}_1", log_path, error_warnings)
     r2 = pick_fastq(run_dir, f"{run_id}_2", log_path, error_warnings)
 
-    return [
+    cmd = [
         "kallisto", "quant",
         "--plaintext",
         "-i", str(Path(index_path).resolve()),
         "-o", str(run_dir.resolve()),
         "-t", str(threads),
-        "-b", str(int(bootstraps)),
-        str(r1.resolve()), str(r2.resolve()),
     ]
+    if int(bootstraps) > 0:
+        cmd.extend(["-b", str(int(bootstraps))])
+    cmd.extend([str(r1.resolve()), str(r2.resolve())])
+    return cmd
 
 
 # ─────────────────────────────────────────────────────────────────────────────

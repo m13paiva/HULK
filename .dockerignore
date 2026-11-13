@@ -21,5 +21,10 @@ LICENSE
 # Local output / test files
 output/
 output*/
+test_output/
+test_output*/
 *.log
 .hulk.json
+.Rhistory
+dummy_*
+*.egg-info/

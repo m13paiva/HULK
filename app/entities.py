@@ -60,7 +60,7 @@ class Config:
             trim_window_size: int = 4,
             trim_mean_quality: int = 20,
             align_method: str = "kallisto",
-            kallisto_bootstrap: int = 100,
+            kallisto_bootstrap: int = 0,
             tximport_mode: str = "raw_counts",
             tximport_ignore_tx_version: bool = False,
             cache_gb: Optional[int] = None,
@@ -177,6 +177,7 @@ class Config:
         self.seidr_backbone = float(seidr_cfg.get("backbone", 1.28))
         self.seidr_workers = int(seidr_cfg.get("workers", 2))
         self.seidr_target_mode = seidr_cfg.get("target_mode", "targeted_only")
+        self.seidr_aggregate = str(seidr_cfg.get("aggregate", "borda")).lower()
 
         self.seidr_force = bool(seidr_cfg.get("force", False))
 
@@ -257,7 +258,7 @@ class Config:
                 "genes_file": self.shared / "deseq2" / "genes.txt",
                 "expression_file": self.shared / "deseq2" / "expression.tsv",
                 "outdir": self.shared / "seidr",
-                "aggregate": "irp",
+                "aggregate": getattr(self, "seidr_aggregate", "borda"),
                 "no_full": False
             }
 

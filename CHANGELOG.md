@@ -1,6 +1,30 @@
 # **HULK** Changelog
 ---
 
+## [2.2.0]
+
+### Added
+- **Configurable Seidr Network Aggregation (`borda`, `irp`, `top1`, `top2`)**:
+  - Added `-a, --aggregate` CLI option to `hulk seidr` and `--seidr-aggregate` to `hulk saturation` (persisted in configuration storage), defaulting to `borda`.
+  - Added robust detection and parsing of consensus columns in Seidr export tables across different aggregation modes (`borda`, `irp`, `top1`, `top2`), including fallback detection preceding backbone scoring columns.
+- **Fastp Sliding-Window Quality Trimming Integration**:
+  - Connected `trim_window_size` (default: `4`) and `trim_mean_quality` (default: `20`) configured via `hulk trim` into `fastp` command execution for both SRR (`_bundle_srr`) and local FASTQ (`_process_fastq`) pipelines.
+  - Passes explicit `--cut_front` and `--cut_tail` window and mean quality flags (`--cut_front_window_size`, `--cut_front_mean_quality`, `--cut_tail_window_size`, `--cut_tail_mean_quality`) to ensure sliding-window quality trimming is active.
+
+### Changed
+- **Disabled Kallisto Bootstraps by Default**:
+  - Changed default `bootstrap` setting across CLI configuration (`hulk align -b`), `Config`, and execution handlers from `100` to `0` to disable bootstraps by default, significantly accelerating pseudo-alignment runtime.
+  - Updated command construction in `app/align.py` to omit the `-b` flag when `bootstraps <= 0`.
+
+### Fixed
+- **Pipe Deadlock in Subprocess Execution**:
+  - Updated `run_managed_subprocess` in `app/utils.py` to use `proc.communicate()` when standard output or error are directed to pipes (`subprocess.PIPE`), avoiding potential pipe buffer deadlocks compared to `proc.wait()`.
+- **Seidr Aggregation and Backbone Edge File Resumption**:
+  - Added `_has_valid_edges` validation to check edge files for non-zero weights before skipping or resuming aggregation/backbone stages.
+  - Streamed `seidr view` execution directly to disk via temporary file buffers to avoid memory bloat on large networks.
+
+---
+
 ## [2.1.0]
 
 ### Fixed
